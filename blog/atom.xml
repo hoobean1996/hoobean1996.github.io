@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://hoobean1996.github.io/blog</id>
-    <title>hebin Blog</title>
+    <title>He Bin Blog</title>
     <updated>2021-08-26T00:00:00.000Z</updated>
     <generator>https://github.com/jpmonette/feed</generator>
     <link rel="alternate" href="https://hoobean1996.github.io/blog"/>
-    <subtitle>hebin Blog</subtitle>
+    <subtitle>He Bin Blog</subtitle>
     <icon>https://hoobean1996.github.io/img/favicon.ico</icon>
     <entry>
         <title type="html"><![CDATA[Welcome]]></title>
