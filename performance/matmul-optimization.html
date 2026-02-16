@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>从 0.98 到 267 GFLOPS：矩阵乘法性能优化全记录 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="https://github.com/hoobean1996">GitHub</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>从 0.98 到 267 GFLOPS：矩阵乘法性能优化全记录</h2>
+            <time>2026-02-16</time>
+
+            <figure class="post-cover">
+                <img src="../images/escher-relativity.jpg" alt="Relativity by M.C. Escher">
+                <figcaption>M.C. Escher,《相对性》, 1953</figcaption>
+            </figure>
+
+            <h3>引言</h3>
+
+            <p>矩阵乘法（GEMM, General Matrix Multiply）是高性能计算中最核心的操作之一。神经网络的全连接层、卷积层、注意力机制，底层都是矩阵乘法。BLAS 库里的 <code>sgemm</code> 是被优化得最极致的函数之一，Intel MKL、OpenBLAS、BLIS 这些库的核心竞争力就在这里。</p>
+
+            <p>我想搞清楚，从一个教科书上的三重循环，到一个接近硬件理论峰值的实现，中间到底经历了什么。于是我用 C++ 从零开始，一步一步优化，把每一步的思路、效果、踩过的坑都记录下来。</p>
+
+            <h3>问题定义</h3>
+
+            <p>计算 C = A &times; B，其中 A 是 M&times;K 矩阵，B 是 K&times;N 矩阵，C 是 M&times;N 矩阵。所有矩阵都是行优先（row-major）存储的 float32。</p>
+
+            <p>硬件环境：</p>
+            <ul>
+                <li>CPU: Intel i7-14700KF (Raptor Lake, 14 核 / 20 线程)</li>
+                <li>L1d: 48 KB/core, L2: 2 MB/core, L3: 33 MB shared</li>
+                <li>支持 AVX2 + FMA，不支持 AVX-512</li>
+            </ul>
+
+            <p><strong>理论峰值是怎么算的？</strong></p>
+
+            <p>这里需要拆开讲。i7-14700KF 的单核睿频频率约为 5.5 GHz，意味着每秒执行 55 亿个时钟周期。关键问题是：每个周期能做多少次浮点运算？</p>
+
+            <p>这颗 CPU 支持 AVX2 指令集。AVX2 的寄存器宽度是 256 位（32 字节），能同时装 8 个 float32。它还支持 FMA（Fused Multiply-Add）指令——一条指令完成一次乘法和一次加法，也就是 <code>a * b + c</code>，算 2 次浮点运算。而 Raptor Lake 的每个核心有 2 个 FMA 执行单元，可以在同一个时钟周期内同时执行 2 条 FMA 指令。</p>
+
+            <p>所以单核每周期的浮点运算数 = 2 个 FMA 单元 &times; 8 个 float/FMA &times; 2 FLOP/FMA = <strong>32 FLOP/cycle</strong>。理论单核峰值：</p>
+
+<pre><code>5.5 GHz &times; 32 FLOP/cycle &asymp; 176 GFLOPS (单精度, 单核)</code></pre>
+
+            <p>多核理论峰值更高，但受限于内存带宽和共享缓存，实际能达到的性能取决于计算密度。后面我们会看到，单线程优化到 144 GFLOPS（峰值的 82%），已经是非常好的结果。</p>
+
+            <p>基准测试矩阵大小为 N=1024，即 1024&times;1024 的方阵相乘。矩阵乘法的计算量公式是 2&times;M&times;N&times;K（每个输出元素需要 K 次乘法和 K 次加法），所以总计算量为 2&times;1024&sup3; &asymp; 21.5 亿次浮点运算。</p>
+
+            <h3>总览</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>版本</th>
+                        <th>时间 (ms)</th>
+                        <th>GFLOPS</th>
+                        <th>相对 Baseline</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Baseline (i-j-k)</td>
+                        <td>2205</td>
+                        <td>0.98</td>
+                        <td>1&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Naive (i-k-j)</td>
+                        <td>61.0</td>
+                        <td>35.3</td>
+                        <td>36&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Tiled</td>
+                        <td>73.5</td>
+                        <td>29.3</td>
+                        <td>30&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Tiled + SIMD</td>
+                        <td>72.8</td>
+                        <td>29.3</td>
+                        <td>30&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Register Tiling</td>
+                        <td>16.9</td>
+                        <td>125.8</td>
+                        <td>128&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Packed</td>
+                        <td>14.8</td>
+                        <td>144.4</td>
+                        <td>147&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Parallel (OpenMP)</td>
+                        <td>8.24</td>
+                        <td>267.2</td>
+                        <td>273&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Optimized</td>
+                        <td>8.21</td>
+                        <td>266.3</td>
+                        <td>272&times;</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Step 0: 教科书写法 (i-j-k) &mdash; 0.98 GFLOPS</h3>
+
+            <p>所有人学线性代数时写的第一个版本：</p>
+
+<pre><code>void matmul_baseline(const float* A, const float* B, float* C,
+                     size_t M, size_t N, size_t K) {
+  std::memset(C, 0, M * N * sizeof(float));
+  for (size_t i = 0; i &lt; M; ++i) {
+    for (size_t j = 0; j &lt; N; ++j) {
+      for (size_t k = 0; k &lt; K; ++k) {
+        C[i * N + j] += A[i * K + k] * B[k * N + j];
+      }
+    }
+  }
+}</code></pre>
+
+            <p>0.98 GFLOPS，理论峰值的 1% 左右。慢得令人发指。</p>
+
+            <p>问题出在内层循环的内存访问模式。我们的矩阵是按行存储的（row-major），也就是说 <code>B[0][0], B[0][1], B[0][2], ...</code> 这些元素在内存中是连续的。但内层循环扫描 <code>k</code>，每次访问 <code>B[k * N + j]</code>——<code>k</code> 每增加 1，内存地址就跳了 N 个 float（4096 字节），相当于一行一行地跳。</p>
+
+            <p>现代 CPU 有一个重要的设计：当你从内存读一个数据时，CPU 不会只读那一个数，而是把它所在的一整条 <strong>cache line</strong>（通常 64 字节）都加载进来。对于 float32，一条 cache line 能装 16 个连续的 float。CPU 的假设是"你读了这个数，大概率接下来会读它旁边的数"——这叫空间局部性（spatial locality）。</p>
+
+            <p>但 i-j-k 循环完全违背了这个假设。每次加载一条 cache line（64 字节 = 16 个 float），我们只用了其中 1 个就跳走了。cache line 利用率只有 1/16 = 6.25%。Cachegrind 实测 D1 miss rate 高达 <strong>32.8%</strong>——每 3 次内存访问就有 1 次 cache miss。</p>
+
+            <h3>Step 1: 循环重排 (i-k-j) &mdash; 35.3 GFLOPS</h3>
+
+            <p>把 <code>k</code> 循环提到中间，让内层循环扫描 <code>j</code>：</p>
+
+<pre><code>void matmul_naive(const float* A, const float* B, float* C,
+                  size_t M, size_t N, size_t K) {
+  std::memset(C, 0, M * N * sizeof(float));
+  for (size_t i = 0; i &lt; M; ++i) {
+    for (size_t k = 0; k &lt; K; ++k) {
+      float a_ik = A[i * K + k];
+      for (size_t j = 0; j &lt; N; ++j) {
+        C[i * N + j] += a_ik * B[k * N + j];
+      }
+    }
+  }
+}</code></pre>
+
+            <p><strong>36 倍加速</strong>，仅仅靠交换两行循环。</p>
+
+            <p>现在内层循环里 <code>B[k*N+j]</code> 和 <code>C[i*N+j]</code> 都是沿着行连续访问的（stride-1）。每条 64 字节的 cache line 加载进来以后，里面 16 个 float 全部用到，cache line 利用率从 6.25% 提升到 100%。同时 <code>A[i*K+k]</code> 在内层循环中是常量，被提到循环外保存在一个局部变量 <code>a_ik</code> 里——这叫 scalar replacement，编译器通常也会自动做这件事。</p>
+
+            <p>Cachegrind 实测 D1 miss rate 从 32.8% 降到 <strong>4.8%</strong>。</p>
+
+            <p>这是整个项目中单步提升最大的优化。教训很简单：<strong>内存访问模式比算法复杂度更重要</strong>。两种写法的算术运算量完全一样（都是 2N&sup3; 次），但内存访问模式的差异造成了 36 倍的性能差距。</p>
+
+            <h3>Step 2: Cache Tiling &mdash; 29.3 GFLOPS</h3>
+
+            <p>教科书上的经典优化：把大矩阵分成小块（64&times;64&times;64），让每个块的数据量（64&times;64&times;4B = 16KB）能放进 48KB 的 L1d cache。这样在处理一个小块时，数据可以反复使用而不被换出 cache。</p>
+
+<pre><code>void matmul_tiled(const float* A, const float* B, float* C,
+                  size_t M, size_t N, size_t K) {
+  constexpr size_t BM = 64, BN = 64, BK = 64;
+  std::memset(C, 0, M * N * sizeof(float));
+
+  for (size_t i0 = 0; i0 &lt; M; i0 += BM) {
+    const size_t imax = std::min(i0 + BM, M);
+    for (size_t k0 = 0; k0 &lt; K; k0 += BK) {
+      const size_t kmax = std::min(k0 + BK, K);
+      for (size_t j0 = 0; j0 &lt; N; j0 += BN) {
+        const size_t jmax = std::min(j0 + BN, N);
+        for (size_t i = i0; i &lt; imax; ++i) {
+          for (size_t k = k0; k &lt; kmax; ++k) {
+            float a_ik = A[i * K + k];
+            for (size_t j = j0; j &lt; jmax; ++j) {
+              C[i * N + j] += a_ik * B[k * N + j];
+            }
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>结果：<strong>反而变慢了</strong>。从 35.3 降到 29.3 GFLOPS。</p>
+
+            <p>原因是编译器（GCC/Clang -O3）对简单的 i-k-j 循环已经做了很好的优化。分块引入了额外的循环控制开销和 <code>std::min</code> 边界计算，得不偿失。而且 i-k-j 本身的访问模式已经很友好——B 和 C 都是 stride-1 访问，tiling 的边际收益不大。</p>
+
+            <p>教训：<strong>Tiling 的价值要配合 register tiling 和 packing 才能显现</strong>。单独使用 tiling，现代编译器可能做得比你更好。</p>
+
+            <h3>Step 3: 手写 SIMD (AVX2 FMA) &mdash; 29.3 GFLOPS</h3>
+
+            <p>先解释一下 SIMD 是什么。SIMD（Single Instruction, Multiple Data）是一种并行计算方式——一条指令同时处理多个数据。普通标量指令一次只能对 1 个 float 做加法；而 AVX2 的 SIMD 指令可以一次对 8 个 float 同时做加法（因为 YMM 寄存器是 256 位宽，256 / 32 = 8 个 float）。</p>
+
+            <p>FMA（Fused Multiply-Add）更进一步：一条指令完成 <code>a * b + c</code>，也就是同时做乘法和加法，而且只有一次舍入误差（比先乘后加更精确）。对矩阵乘法来说，核心操作就是 <code>C[i][j] += A[i][k] * B[k][j]</code>，天然适合 FMA。</p>
+
+            <p>在 C/C++ 中，可以通过 intrinsics 函数直接调用这些指令，而不用写汇编：</p>
+
+<pre><code>// 内层循环核心
+__m256 va = _mm256_set1_ps(A[i * K + k]);     // 把 1 个 float 广播到 8 路
+size_t j = j0;
+for (; j + 8 &lt;= jmax; j += 8) {
+  __m256 vb = _mm256_loadu_ps(&amp;B[k * N + j]); // 一次加载 8 个连续 float
+  __m256 vc = _mm256_loadu_ps(&amp;C[i * N + j]); // 一次加载 8 个连续 float
+  vc = _mm256_fmadd_ps(va, vb, vc);            // 8 路并行: C += A * B
+  _mm256_storeu_ps(&amp;C[i * N + j], vc);         // 一次写回 8 个 float
+}</code></pre>
+
+            <p>这里每个 <code>_mm256</code> 开头的函数都对应一条 AVX2 指令。<code>_mm256_set1_ps</code> 把一个标量广播到 256 位寄存器的所有 8 个位置；<code>_mm256_loadu_ps</code> 从内存加载 8 个连续 float 到寄存器；<code>_mm256_fmadd_ps</code> 对 8 对数据同时执行 FMA。</p>
+
+            <p>结果：<strong>和 tiled 版本完全一样</strong>。</p>
+
+            <p>在 <code>-O3 -march=native -ffast-math</code> 下，编译器已经自动向量化（auto-vectorization）了内层循环。也就是说，编译器看到了这个简单的 <code>for j</code> 循环，自动把它转换成了 SIMD 指令——和我们手写的 intrinsics 做的事情一模一样。可以用 <code>-fopt-info-vec</code>（GCC）或 <code>-Rpass=loop-vectorize</code>（Clang）来确认编译器是否做了自动向量化。</p>
+
+            <p>教训：<strong>在现代编译器面前，简单循环的手写 SIMD 通常无法超越自动向量化</strong>。真正的收益来自编译器做不到的事——比如下一步的 register tiling，它需要程序员精确规划每个寄存器的用途。</p>
+
+            <h3>Step 4: Register Tiling &mdash; 125.8 GFLOPS（关键突破）</h3>
+
+            <p>前面所有版本都有一个根本问题：<strong>每做一次乘加，都要从内存（或 cache）读写 C</strong>。在 i-k-j 的内层循环中，<code>C[i*N+j] += a_ik * B[k*N+j]</code> 这行代码意味着每次都要读 C、做乘加、写回 C。即使 C 在 L1 cache 中，读写延迟也是存在的。</p>
+
+            <p>Register tiling 的思路：把 C 的一个小子块完全放在 CPU 寄存器里。寄存器是 CPU 中最快的存储——访问延迟为 0，不经过任何缓存层级。如果我们能让 C 的子块在整个 k 循环中都留在寄存器里，只在循环开始时加载一次、结束时存回一次，就能大幅减少内存访问。</p>
+
+            <p>关键问题是：子块能做多大？这取决于 CPU 有多少寄存器。</p>
+
+<pre class="diagram"><code>              NR=16 (2 &times; __m256)
+           +----------------------+
+     MR=6  | c00 c01              |  12 个 YMM 寄存器保存 C 的 6&times;16 子块
+    rows   | c10 c11              |
+     of C  | c20 c21              |  k 循环中:
+           | c30 c31              |    载入 2 个 B 向量 (b0, b1)
+           | c40 c41              |    广播 6 个 A 标量
+           | c50 c51              |    12 次 FMA
+           +----------------------+</code></pre>
+
+            <p>AVX2 提供了 16 个 YMM 寄存器（ymm0-ymm15），每个 256 位宽（8 个 float）。我们需要精打细算地分配它们：</p>
+            <ul>
+                <li>C 子块：6 行 &times; 2 个 __m256（每行 16 个 float）= <strong>12 个寄存器</strong></li>
+                <li>B 向量：每步 k 加载 2 个 __m256 = <strong>2 个寄存器</strong></li>
+                <li>A 广播：每步 k 把 1 个 A 元素广播到 __m256 = <strong>1 个寄存器</strong></li>
+                <li>临时：<strong>1 个寄存器</strong></li>
+                <li>总计：12 + 2 + 1 + 1 = <strong>16 个，恰好用满</strong></li>
+            </ul>
+
+            <p>为什么选 MR=6, NR=16 而不是其他组合？因为这个组合的<strong>计算密度</strong>最高。每步 k 做 12 次 FMA（6 行 &times; 2 个向量），只需从内存读 3 个值（2 个 B 向量 + 1 个 A 标量），计算密度为 12/3 = 4 FMA/load。如果用 4&times;24（也是 12 个 C 寄存器），则需要读 3 个 B + 1 个 A = 4 次，密度为 12/4 = 3 FMA/load，更低。</p>
+
+            <p>核心实现（micro-kernel）：</p>
+
+<pre><code>// 1. 加载 C 的 6&times;16 子块到 12 个寄存器（只做一次）
+__m256 c00 = _mm256_loadu_ps(&amp;C[0 * N + 0]);
+__m256 c01 = _mm256_loadu_ps(&amp;C[0 * N + 8]);
+__m256 c10 = _mm256_loadu_ps(&amp;C[1 * N + 0]);
+__m256 c11 = _mm256_loadu_ps(&amp;C[1 * N + 8]);
+// ... c20, c21, c30, c31, c40, c41, c50, c51
+
+// 2. k 循环中完全在寄存器里累加
+for (size_t k = 0; k &lt; K; ++k) {
+  __m256 b0 = _mm256_loadu_ps(&amp;B[k * N + 0]);  // 加载 B 的 16 个 float
+  __m256 b1 = _mm256_loadu_ps(&amp;B[k * N + 8]);
+
+  __m256 a;
+  a = _mm256_set1_ps(A[0 * lda + k]);  // 广播 A[0][k]
+  c00 = _mm256_fmadd_ps(a, b0, c00);   // c00 += a * b0
+  c01 = _mm256_fmadd_ps(a, b1, c01);   // c01 += a * b1
+
+  a = _mm256_set1_ps(A[1 * lda + k]);  // 广播 A[1][k]
+  c10 = _mm256_fmadd_ps(a, b0, c10);
+  c11 = _mm256_fmadd_ps(a, b1, c11);
+
+  // ... 同理处理第 2-5 行，共 12 次 FMA
+}
+
+// 3. k 循环结束，把 C 写回内存（只做一次）
+_mm256_storeu_ps(&amp;C[0 * N + 0], c00);
+_mm256_storeu_ps(&amp;C[0 * N + 8], c01);
+// ...</code></pre>
+
+            <p>Cachegrind 实测：D refs（数据访问总数）从 177M 降到 <strong>21M</strong>（减少 8.4 倍）。因为 C 不再在 k 循环中反复读写——以前每步 k 都要读写 C 的 6&times;16 = 96 个 float，现在整个 k 循环只在开头和结尾各一次。</p>
+
+            <p><strong>4.3 倍加速</strong>，从 29 GFLOPS 到 126 GFLOPS。这是除了循环重排之外最重要的单步优化。编译器做不了这种级别的寄存器编排——它不会主动把 C 的一大块保持在寄存器里跨越整个循环。这需要程序员对硬件资源有精确的理解。</p>
+
+            <h3>Step 5: Goto-style Packing &mdash; 144.4 GFLOPS</h3>
+
+            <p>Register tiling 的 micro-kernel 仍然通过 stride=K 访问 A、stride=N 访问 B。当矩阵很大时，相邻的 micro-kernel 调用之间，A 和 B 的数据在内存中不连续——中间隔着很多不需要的数据，浪费了 cache line 的空间。</p>
+
+            <p>解决方案来自 Kazushige Goto 在 2008 年的经典论文（GotoBLAS 的作者）：在执行 micro-kernel 之前，把 A 和 B 的数据重新排列（pack）到连续的内存区域中，让 micro-kernel 的每次内存读取都是完全连续的。</p>
+
+<pre class="diagram"><code>原始 A (stride = K):              pack_A 后 (stride = MR):
++------------------+              +---------+
+| a00 a01 a02 ...  |  MR=6 rows  | a00     |
+| a10 a11 a12 ...  |  --------&gt;  | a10     |  每 MR 个值连续
+| ...              |              | a20     |  微内核顺序读取
+| a50 a51 a52 ...  |              | ...     |
++------------------+              | a01     |
+                                  | a11     |
+                                  +---------+</code></pre>
+
+            <p>但仅仅 packing 还不够，还需要精心设计循环结构，让每层缓存都被充分利用。这就是 Goto-style 的三层循环嵌套：</p>
+
+<pre><code>for (size_t jc = 0; jc &lt; N; jc += NC) {       // 第 3 层: B panel 驻留 L3
+  for (size_t kc = 0; kc &lt; K; kc += KC) {     // 第 2 层: B slice 驻留 L2
+    pack_B(&amp;B[kc * N + jc], packed_B, kk, nc, N);
+
+    for (size_t ic = 0; ic &lt; M; ic += MC) {   // 第 1 层: A slice 驻留 L1
+      pack_A(&amp;A[ic * K + kc], packed_A, mc, kk, K);
+
+      // Macro-kernel: iterate over MR&times;NR micro-tiles.
+      for (size_t ir = 0; ir &lt; mc; ir += MR) {
+        for (size_t jr = 0; jr &lt; nc; jr += NR) {
+          microkernel_packed_6x16(
+              &amp;packed_A[ir * kk],
+              &amp;packed_B[jr * kk],
+              &amp;C[(ic + ir) * N + (jc + jr)],
+              kk, N);
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>每层 tile 的尺寸精确对应一级缓存：</p>
+            <ul>
+                <li><strong>MC&times;KC = 72&times;256 = 72KB</strong>：packed_A 的大小，驻留在 L1d cache（48KB）+ 少量 spill 到 L2</li>
+                <li><strong>KC&times;NC = 256&times;4096 = 4MB</strong>：packed_B 的大小，驻留在 L2（2MB）+ L3</li>
+                <li>MC 必须是 MR(6) 的倍数，NC 必须是 NR(16) 的倍数，确保 micro-kernel 不需要处理边界</li>
+            </ul>
+
+            <p>设计的核心思想：packed_B 在最外层循环被打包一次，然后被所有 MC-strip 共享重用。packed_A 在每个 MC-strip 被打包一次，然后在内层循环中被所有 NR-strip 共享重用。这样 packing 的开销被大量的 micro-kernel 计算摊销掉了。</p>
+
+            <p>单线程从 126 到 <strong>144 GFLOPS</strong>，15% 提升。大矩阵上提升更显著，因为大矩阵的数据在 cache 中不连续的问题更严重。</p>
+
+            <h3>Step 6: 多线程并行 (OpenMP) &mdash; 267.2 GFLOPS</h3>
+
+            <p>前面所有优化都是单线程的。i7-14700KF 有 14 核 20 线程——我们只用了其中一个核心。是时候把其他核心也用起来了。</p>
+
+            <p>OpenMP 是 C/C++/Fortran 中最常用的共享内存并行编程接口。它通过编译器指令（pragma）来控制并行化，而不是手动管理线程。只需在循环前加一行 <code>#pragma omp parallel for</code>，编译器就会自动把循环迭代分配到多个线程上执行。</p>
+
+<pre><code>#pragma omp parallel
+{
+  // 每线程私有的 packed_A buffer
+  float* packed_A = static_cast&lt;float*&gt;(
+      std::aligned_alloc(32, MC * KC * sizeof(float)));
+
+  #pragma omp for schedule(dynamic)
+  for (size_t ic = 0; ic &lt; M; ic += MC) {
+    const size_t mc = std::min(MC, M - ic);
+    pack_A(&amp;A[ic * K + kc], packed_A, mc, kk, K);
+
+    for (size_t ir = 0; ir &lt; mc; ir += MR) {
+      for (size_t jr = 0; jr &lt; nc; jr += NR) {
+        microkernel_packed_6x16(
+            &amp;packed_A[ir * kk],
+            &amp;packed_B[jr * kk],
+            &amp;C[(ic + ir) * N + (jc + jr)],
+            kk, N);
+      }
+    }
+  }
+
+  std::free(packed_A);
+}</code></pre>
+
+            <p>并行化的关键设计决策：</p>
+            <ul>
+                <li><strong>packed_B 共享</strong>：B panel 在并行区域之外被打包一次，所有线程只读共享，不需要加锁</li>
+                <li><strong>packed_A 私有</strong>：每个线程分配自己的 packed_A buffer。如果多个线程共享一个 buffer，就会产生 false sharing——不同线程写同一条 cache line，导致 cache line 在核心之间不断来回传递（cache ping-pong），严重影响性能</li>
+                <li><strong>并行粒度</strong>：在 MC-strip（即 ic 循环）层级上并行。每个 MC-strip 处理 C 矩阵中独立的 72 行，不同 strip 之间没有写冲突，不需要同步</li>
+                <li><strong><code>schedule(dynamic)</code></strong>：动态调度意味着空闲的线程会自动领取下一个待处理的 strip，适合负载不均匀的场景（比如矩阵行数不能被 MC 整除时，最后一个 strip 会比较小）</li>
+            </ul>
+
+            <p>从 144 到 <strong>267 GFLOPS</strong>，1.85 倍加速。没有达到理想的线性加速（14 核应该 14 倍），原因包括：内存带宽成为瓶颈、L3 cache 竞争、线程调度开销，以及 pack_B 仍然是单线程串行执行的。但在 N=1024 这个尺度上，267 GFLOPS 已经是相当好的结果了。</p>
+
+            <h3>Step 7: 微优化 (Unroll + Prefetch + Huge Pages) &mdash; 266.3 GFLOPS</h3>
+
+            <p>最后尝试三项微优化：</p>
+
+            <p><strong>1) k-unroll by 4</strong></p>
+
+            <p>把 micro-kernel 的 k 循环展开 4 次。不展开时，每次迭代结束都要执行比较、自增、跳转指令；展开后每 4 次迭代只需要一组控制指令，减少了循环开销。更重要的是，展开给了 CPU 更多指令可以同时执行——现代 CPU 是乱序执行的，它会在一条指令等待数据时先执行后面不依赖它的指令，展开暴露了更多这样的并行机会。</p>
+
+<pre><code>for (; k + 4 &lt;= kc; k += 4) {
+  _mm_prefetch(packed_A + 4 * MR, _MM_HINT_T0);
+  _mm_prefetch(packed_B + 4 * NR, _MM_HINT_T0);
+
+  MICRO_ITER(packed_A + 0 * MR, packed_B + 0 * NR);
+  MICRO_ITER(packed_A + 1 * MR, packed_B + 1 * NR);
+  MICRO_ITER(packed_A + 2 * MR, packed_B + 2 * NR);
+  MICRO_ITER(packed_A + 3 * MR, packed_B + 3 * NR);
+
+  packed_A += 4 * MR;
+  packed_B += 4 * NR;
+}</code></pre>
+
+            <p><strong>2) Software prefetch</strong></p>
+
+            <p>CPU 有硬件预取器（hardware prefetcher），能自动检测连续的内存访问模式并提前加载数据。但硬件预取器不是万能的——它只能识别简单的线性模式（比如连续递增），对于跳跃式访问或分支后的访问模式，它可能预测不准。</p>
+
+            <p>Software prefetch 通过 <code>_mm_prefetch</code> 指令，显式告诉 CPU："我过几步就要用这个地址的数据了，你现在就开始把它从内存加载到 cache 吧。" 这样等到代码真正需要这个数据时，它已经在 cache 里了，避免了等待内存的延迟（通常 50-100ns）。</p>
+
+            <p><code>_MM_HINT_T0</code> 表示加载到 L1 cache（最近、最快），<code>_MM_HINT_T1</code> 表示加载到 L2 cache。我们对下一个 B panel 用 <code>_MM_HINT_T1</code>，因为它比较大，放在 L2 更合适。</p>
+
+            <p><strong>3) Transparent Huge Pages</strong></p>
+
+            <p>这涉及到虚拟内存的一个关键组件：TLB（Translation Lookaside Buffer，页表缓存）。</p>
+
+            <p>现代操作系统使用虚拟内存——程序看到的内存地址不是真实的物理地址，需要通过页表（page table）翻译。这个翻译过程很慢（可能需要访问多级页表），所以 CPU 用 TLB 来缓存最近用过的地址翻译结果。TLB 的容量很小，典型的 L1 dTLB 只有 64-128 个条目。</p>
+
+            <p>默认的内存页大小是 4KB。如果 TLB 有 128 个条目，那它能覆盖的内存范围只有 128 &times; 4KB = 512KB。而我们的 packed_B 有 4MB——远超 TLB 的覆盖范围。当 micro-kernel 遍历 packed_B 时，大量的 TLB miss 会导致频繁的页表查询。</p>
+
+            <p>Huge pages 把页大小从 4KB 增大到 2MB。同样 128 个 TLB 条目可以覆盖 128 &times; 2MB = 256MB，轻松装下 4MB 的 packed_B。</p>
+
+<pre><code>// packed_B (~4MB) 使用 2MB huge pages, 减少 TLB miss
+void* ptr = std::aligned_alloc(2 * 1024 * 1024, aligned_bytes);
+madvise(ptr, aligned_bytes, MADV_HUGEPAGE);</code></pre>
+
+            <p><code>madvise</code> 是 Linux 系统调用，<code>MADV_HUGEPAGE</code> 告诉内核这段内存希望使用透明大页。注意 packed_A（每线程 72KB）太小了，使用 2MB 大页反而浪费，所以只对 packed_B 使用。</p>
+
+            <p>实际效果：在 N=1024 上 <strong>267 &rarr; 266 GFLOPS</strong>，几乎没有提升。在这个尺度上，硬件预取器本身已经做得不错了，packed 后的数据访问模式也很规则。这些微优化在更大矩阵（N=2048+）上收益更显著——数据量越大，TLB miss 和 prefetch 的影响越明显。</p>
+
+            <h3>Cachegrind 缓存分析</h3>
+
+            <p>Valgrind 是一个程序分析工具框架，其中的 cachegrind 模块专门用于分析程序的缓存行为。它通过模拟 CPU 的缓存层级，统计每一次内存访问是否命中了 L1/L2/L3 cache。</p>
+
+            <p>用法很简单：</p>
+
+<pre><code># 先编译出优化版本的可执行文件
+bazel build -c opt //bench:cache_profile
+
+# 在 cachegrind 下运行，指定要分析的版本和矩阵大小
+valgrind --tool=cachegrind ./bazel-bin/bench/cache_profile naive 512</code></pre>
+
+            <p>cachegrind 会输出详细的缓存统计。这里的关键指标：</p>
+            <ul>
+                <li><strong>D refs</strong>：数据访问总次数（包括读和写）。反映程序的内存访问频率</li>
+                <li><strong>D1 misses</strong>：L1 数据缓存未命中次数。每次 miss 意味着数据不在最快的 L1 cache 中，需要去更慢的 L2/L3 或主存取</li>
+                <li><strong>D1 miss rate</strong>：D1 misses / D refs。越低越好</li>
+            </ul>
+
+            <p>注意 cachegrind 会让程序运行慢 10-50 倍（因为它在模拟缓存），所以用 N=512 而不是 N=1024 来测：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>版本</th>
+                        <th>D refs</th>
+                        <th>D1 misses</th>
+                        <th>D1 miss rate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Baseline (i-j-k)</td>
+                        <td>177M</td>
+                        <td>58.1M</td>
+                        <td><strong>32.8%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Naive (i-k-j)</td>
+                        <td>177M</td>
+                        <td>8.5M</td>
+                        <td><strong>4.8%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Tiled</td>
+                        <td>179M</td>
+                        <td>1.6M</td>
+                        <td><strong>0.9%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Register Tiling</td>
+                        <td>21M</td>
+                        <td>1.6M</td>
+                        <td><strong>7.8%</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>这张表非常值得仔细看，因为它精确解释了每一步优化的机制：</p>
+
+            <ul>
+                <li><strong>Baseline &rarr; Naive</strong>：D refs 相同（177M），但 D1 misses 从 58.1M 降到 8.5M。访问次数没变，但 miss 大幅减少——这就是循环重排的威力，同样的计算量，换了个访问顺序，cache 命中率从 67% 提升到 95%。</li>
+                <li><strong>Naive &rarr; Tiled</strong>：D refs 基本不变（177M &rarr; 179M），但 D1 misses 从 8.5M 降到 1.6M，miss rate 从 4.8% 降到 0.9%。分块让数据在 cache 中被复用更多次（数据装进 cache 以后，在被换出之前被反复使用）。</li>
+                <li><strong>Tiled &rarr; Register Tiling</strong>：关键变化在 D refs——从 179M 降到 <strong>21M</strong>，减少了 8.5 倍！绝对 D1 miss 数持平（1.6M），但因为分母（D refs）大幅缩小，miss rate 反而上升到 7.8%。这正是 register tiling 的核心：不是减少了 miss，而是<strong>根本减少了对内存的访问</strong>——C 的读写全部在寄存器里完成了。</li>
+            </ul>
+
+            <h3>总结与思考</h3>
+
+            <p>这个项目最让我印象深刻的几个点：</p>
+
+            <p><strong>1. 内存访问模式是第一性能杀手。</strong> 仅靠循环重排就获得 36 倍加速。在现代硬件上，缓存友好的访问模式比任何高级优化都重要。两种写法的算术运算量完全相同，性能差了 36 倍。</p>
+
+            <p><strong>2. 不是所有"经典优化"都有效。</strong> Cache tiling 和手写 SIMD 在这个场景下都没有提升。现代编译器已经非常强了，不要低估 <code>-O3 -march=native -ffast-math</code> 的威力。做优化之前先看看编译器已经做了什么。</p>
+
+            <p><strong>3. Register tiling 是关键突破。</strong> 这是编译器做不到的优化——需要程序员精确理解硬件有多少寄存器、每个寄存器该放什么、计算密度怎么最大化。12 个 YMM 寄存器保持 C 的子块，消除了 k 循环中对 C 的反复读写，D refs 降了 8.5 倍。</p>
+
+            <p><strong>4. Packing 解决的是数据布局问题。</strong> 把 A 和 B 重新排列成 micro-kernel 友好的连续内存，让 cache line 的每个字节都被充分利用。Goto-style 的三层循环精确对应 L1/L2/L3 三级缓存，是工程和理论结合的典范。</p>
+
+            <p><strong>5. 微优化的边际收益递减。</strong> Unroll、prefetch、huge pages 这些优化在 N=1024 上几乎没有效果。性能优化遵循 Pareto 原则——80% 的收益来自 20% 的关键优化。</p>
+
+            <p>从 0.98 到 267 GFLOPS，<strong>273 倍的加速</strong>。这个过程让我真正理解了 Knuth 那句名言的前半句（人们往往只记得后半句）：</p>
+
+            <p><em>"We should forget about small efficiencies, say about 97% of the time: premature optimization is the root of all evil. Yet we should not pass up our opportunities in that critical 3%."</em></p>
+
+            <p>关键是找到那 3%。</p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+</body>
+</html>
