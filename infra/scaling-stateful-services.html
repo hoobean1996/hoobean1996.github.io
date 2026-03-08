@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>如何扩展有状态服务：从方法论到 Redis、Memcached、MySQL 实战 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>如何扩展有状态服务：从方法论到 Redis、Memcached、MySQL 实战</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../images/tempesta-rome-plan.jpg" alt="Plan of the City of Rome, Antonio Tempesta, 1645">
+                <figcaption>Antonio Tempesta,《罗马城市平面图》, 1645 — 一座庞大的城市被划分为若干区域（Regiones），每个区域有自己的边界和管辖范围。这和分布式系统的分片异曲同工：数据被划分到不同的 Slot，每个 Slot 有明确的归属节点。扩展一座城市和扩展一个有状态服务，面对的是同一个问题：如何在不停摆的前提下重新划分边界</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：扩展无状态服务很简单——加机器、挂到负载均衡器后面就行。但有状态服务（数据库、缓存、消息队列）的扩展是分布式系统中最难的问题之一：数据在哪台机器上？怎么搬过去？搬的过程中请求怎么办？这篇文章先给出一个可复用的五步方法论，然后用 Redis Cluster、Memcached 和 MySQL 三个真实系统说明每一步是怎么落地的。
+            </blockquote>
+
+            <h3>为什么有状态服务难扩展</h3>
+
+            <p>无状态服务的扩展模型：</p>
+
+<pre class="diagram"><code>  请求 ──► Load Balancer ──┬──► Server A
+                           ├──► Server B    任意一台都能处理
+                           └──► Server C    加机器就能扩容</code></pre>
+
+            <p>有状态服务的扩展模型：</p>
+
+<pre class="diagram"><code>  请求 (user_id=42)
+    │
+    │  这个请求只能去存着 user_id=42 数据的那台机器
+    │  不能随便发
+    ▼
+  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ Node A   │  │ Node B   │  │ Node C   │
+  │ id: 1-100│  │id:101-200│  │id:201-300│
+  └──────────┘  └──────────┘  └──────────┘
+
+  加一台 Node D：
+  - 谁的数据要搬过去？
+  - 搬的过程中读写怎么路由？
+  - 搬到一半崩溃了怎么办？</code></pre>
+
+            <p>本质问题是<strong>数据有归属</strong>。扩展有状态服务 = 在不停服的前提下，重新分配数据的归属权。</p>
+
+            <h3>方法论：五步扩展模型</h3>
+
+            <h4>第一步：分片策略——Key 到 Node 的映射</h4>
+
+            <p>最直觉的做法是 <code>hash(key) % N</code> 直接映射到 N 台机器。但加一台机器后 N 变成 N+1，<strong>几乎所有 key 的映射都会改变</strong>——这意味着全量数据迁移。</p>
+
+            <p>解法是加一层<strong>逻辑槽（Virtual Slot）</strong>：</p>
+
+<pre class="diagram"><code>  坏的设计：Key → Node（直接映射）
+  hash(key) % 3 = Node A
+  hash(key) % 4 = Node B  ← 加一台机器，几乎所有 key 都要搬
+
+  好的设计：Key → Slot → Node（两层映射）
+  hash(key) % 16384 = Slot 5742    ← 这层永远不变
+  Slot 5742 → Node A               ← 只需要移动 Slot 的归属
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Key Space                                               │
+  │  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐     │
+  │  │Slot │Slot │Slot │Slot │Slot │Slot │Slot │ ... │     │
+  │  │  0  │  1  │  2  │  3  │  4  │  5  │  6  │     │     │
+  │  └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴─────┘     │
+  │     │     │     │     │     │     │                      │
+  │     ▼     ▼     ▼     ▼     ▼     ▼                      │
+  │   Node A        Node B        Node C                     │
+  │  Slot 0,1,2    Slot 3,4      Slot 5,6                   │
+  └─────────────────────────────────────────────────────────┘
+
+  扩容：把 Slot 2 从 Node A 搬到 Node D
+  - Key 到 Slot 的映射不变
+  - 只改 Slot 到 Node 的映射
+  - 只搬 Slot 2 里的数据</code></pre>
+
+            <p>Slot 数量的选择：通常是机器数的 100 倍以上。太少则 Slot 粒度太粗，无法均匀分配；太多则元数据开销增大。Redis Cluster 选了 16384，是一个经过实践验证的平衡点。</p>
+
+            <h4>第二步：控制面——元数据存在哪</h4>
+
+            <p>"Slot X 在 Node A 上"这张路由表需要存在某个地方，并且所有参与者都能看到一致的版本。</p>
+
+            <table>
+                <thead>
+                    <tr><th>方案</th><th>原理</th><th>优势</th><th>劣势</th><th>典型系统</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Gossip</strong></td><td>节点间互相传播，最终一致</td><td>无单点、自愈</td><td>收敛慢、脑裂风险、难以做复杂调度</td><td>Redis Cluster</td></tr>
+                    <tr><td><strong>中心化存储</strong></td><td>etcd/ZooKeeper 存权威元数据</td><td>强一致、易于编排</td><td>多一个组件要维护</td><td>TiDB PD、Vitess</td></tr>
+                    <tr><td><strong>配置服务</strong></td><td>Mcrouter 从配置文件读路由表</td><td>极简、无运行时依赖</td><td>变更需要推送、不适合动态扩缩容</td><td>Memcached + Mcrouter</td></tr>
+                </tbody>
+            </table>
+
+            <p>2026 年的趋势：<strong>中心化控制面 + K8s Operator</strong> 是主流。etcd 提供强一致性元数据存储，Operator 自动化执行扩缩容、故障转移、数据迁移等操作。Gossip 协议仍然用于故障检测（快速发现节点挂了），但不再承担路由决策。</p>
+
+            <h4>第三步：路由层——请求怎么找到正确的节点</h4>
+
+<pre class="diagram"><code>  方案 A: Smart Client                方案 B: Proxy
+
+  ┌──────────┐                        ┌──────────┐
+  │  Client   │                        │  Client   │
+  │ 内置 Slot │                        │ 只知道    │
+  │  Map 缓存 │                        │ Proxy 地址│
+  └─────┬────┘                        └─────┬────┘
+        │ 直连目标节点                        │
+        │ 延迟: 1 hop                        ▼
+        │                             ┌──────────┐
+        │                             │  Proxy    │
+        │                             │ (Mcrouter │
+        │                             │  /Envoy)  │
+        │                             └─────┬────┘
+        │                                   │ 转发
+        ▼                                   ▼
+  ┌────────────────────────────────────────────┐
+  │  Node A    Node B    Node C    Node D      │
+  └────────────────────────────────────────────┘</code></pre>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Smart Client</th><th>Proxy</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>延迟</strong></td><td>最低（直连）</td><td>多一跳</td></tr>
+                    <tr><td><strong>客户端复杂度</strong></td><td>高（每种语言都要实现）</td><td>低（只需知道 Proxy 地址）</td></tr>
+                    <tr><td><strong>升级路由逻辑</strong></td><td>需要升级所有客户端</td><td>只升级 Proxy</td></tr>
+                    <tr><td><strong>附加能力</strong></td><td>无</td><td>限流、灰度、监控、连接池</td></tr>
+                    <tr><td><strong>适用场景</strong></td><td>语言统一、延迟敏感</td><td>多语言、运维优先</td></tr>
+                </tbody>
+            </table>
+
+            <p>大规模生产环境倾向于 Proxy 模式。当你有几十种编程语言的客户端时，不可能为每种语言维护一个复杂的智能客户端。Proxy 把路由逻辑集中管理，客户端只需要会说协议就行。</p>
+
+            <h4>第四步：副本与可用性——数据不能只有一份</h4>
+
+            <p>分片解决了容量问题，但每个分片仍然是单点。副本解决可用性：</p>
+
+<pre class="diagram"><code>  Slot 0-5461              Slot 5462-10922          Slot 10923-16383
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │ Master A     │         │ Master B     │         │ Master C     │
+  │ (读写)       │         │ (读写)       │         │ (读写)       │
+  └──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+         │ 异步复制                │ 异步复制                │ 异步复制
+         ▼                        ▼                        ▼
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │ Replica A'   │         │ Replica B'   │         │ Replica C'   │
+  │ (只读)       │         │ (只读)       │         │ (只读)       │
+  └──────────────┘         └──────────────┘         └──────────────┘</code></pre>
+
+            <p>故障转移（Failover）的标准流程：</p>
+            <ol>
+                <li>检测到 Master A 挂了（心跳超时 / Gossip 投票 / 控制面探活）</li>
+                <li>从副本中选出新 Master（选复制进度最接近的那个）</li>
+                <li><strong>关键步骤</strong>：更新控制面的元数据——Slot 0-5461 的 Owner 从 A 变成 A'</li>
+                <li>通知路由层（Proxy 更新路由表 / Client 刷新 Slot Map）</li>
+                <li>新 Master A' 开始接受读写</li>
+            </ol>
+
+            <p>复制模式的选择：</p>
+
+            <table>
+                <thead>
+                    <tr><th>模式</th><th>一致性</th><th>延迟</th><th>可用性</th><th>典型系统</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>异步复制</strong></td><td>可能丢数据</td><td>最低</td><td>最高</td><td>Redis、Memcached</td></tr>
+                    <tr><td><strong>半同步复制</strong></td><td>至少一个副本确认</td><td>中等</td><td>高</td><td>MySQL Semi-sync</td></tr>
+                    <tr><td><strong>Raft/Paxos</strong></td><td>多数派确认，强一致</td><td>较高</td><td>中等</td><td>TiKV、CockroachDB</td></tr>
+                </tbody>
+            </table>
+
+            <h4>第五步：数据迁移——在飞行中换引擎</h4>
+
+            <p>这是最难的一步。新增一台机器后，要把部分 Slot 从旧节点搬到新节点，<strong>同时不中断线上服务</strong>。</p>
+
+<pre class="diagram"><code>  迁移 Slot 3 从 Node A → Node D：
+
+  阶段 1: 标记迁移状态
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Slot 3:  │                    │ Slot 3:  │
+  │ MIGRATING│                    │ IMPORTING│
+  └──────────┘                    └──────────┘
+
+  阶段 2: 全量快照传输
+  ┌──────────┐  ══ 快照数据 ══►   ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ 继续服务  │                    │ 接收数据  │
+  └──────────┘                    └──────────┘
+
+  阶段 3: 增量追赶
+  ┌──────────┐  ── 增量日志 ──►   ┌──────────┐
+  │ Node A   │  (迁移期间的新写入) │ Node D   │
+  │ 继续服务  │                    │ 追赶中   │
+  └──────────┘                    └──────────┘
+
+  阶段 4: 原子切换 (关键时刻)
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ 暂停 Slot│  ← 短暂阻塞写入    │ 追平!    │
+  │ 3 的写入  │  (通常几毫秒)      │          │
+  └──────────┘                    └──────────┘
+       │
+       │  控制面更新: Slot 3 → Node D
+       │  路由层刷新
+       ▼
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ 删除 Slot│                    │ Slot 3:  │
+  │ 3 数据   │                    │ 正常服务  │
+  └──────────┘                    └──────────┘</code></pre>
+
+            <p>阶段 4 是整个流程中最危险的时刻。如果增量日志追不上（写入太快），阻塞时间会拉长，影响线上服务。两种应对策略：</p>
+
+            <ul>
+                <li><strong>限流写入</strong>：在追赶阶段对该 Slot 限流，降低写入速度让增量追赶能追上</li>
+                <li><strong>双写模式</strong>：切换期间同时写两个节点，不阻塞，但逻辑更复杂，需要处理冲突</li>
+            </ul>
+
+            <h3>实战：Redis Cluster 的扩展</h3>
+
+            <table>
+                <thead>
+                    <tr><th>步骤</th><th>Redis Cluster 的实现</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>分片</strong></td><td>16384 个 Slot，<code>CRC16(key) % 16384</code></td></tr>
+                    <tr><td><strong>控制面</strong></td><td>去中心化 Gossip。每个节点维护完整的 Slot Map，通过 Gossip 协议同步</td></tr>
+                    <tr><td><strong>路由</strong></td><td>Smart Client。客户端缓存 Slot Map，直连目标节点。如果发错了，节点返回 <code>MOVED</code> 重定向</td></tr>
+                    <tr><td><strong>副本</strong></td><td>每个 Master 配 1-N 个 Replica，异步复制。Failover 通过 Gossip 投票选举新 Master</td></tr>
+                    <tr><td><strong>迁移</strong></td><td><code>CLUSTER SETSLOT</code> + <code>MIGRATE</code> 命令，逐 Key 迁移</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Redis 迁移的细节</h4>
+
+<pre><code># 1. 标记迁移状态
+CLUSTER SETSLOT 3 MIGRATING target-node-id   # 在源节点标记
+CLUSTER SETSLOT 3 IMPORTING source-node-id   # 在目标节点标记
+
+# 2. 逐 Key 迁移（Redis 没有快照迁移，逐个搬）
+CLUSTER GETKEYSINSLOT 3 100                  # 获取 Slot 3 的 100 个 Key
+MIGRATE target-host 6379 "" 0 5000 KEYS key1 key2 key3 ...
+
+# 3. 完成切换
+CLUSTER SETSLOT 3 NODE target-node-id        # 所有节点都执行</code></pre>
+
+            <p>Redis 迁移的特点和局限：</p>
+            <ul>
+                <li><strong>逐 Key 迁移</strong>，不是快照。大 Key（如百万元素的 Hash）迁移时会阻塞源节点</li>
+                <li>迁移期间，源节点对 MIGRATING Slot 的处理：Key 还在本地 → 正常处理；Key 已经搬走 → 返回 <code>ASK</code> 重定向到目标节点</li>
+                <li>Gossip 收敛慢——大集群（200+ 节点）中，一次 Slot 变更可能需要几秒才能传播到所有节点</li>
+                <li><strong>没有增量日志</strong>：迁移 Key 是原子的（MIGRATE 是 DEL + RESTORE），不存在"迁移过程中 Key 被修改"的问题，但代价是大 Key 迁移会阻塞</li>
+            </ul>
+
+            <h4>Redis 扩容的实际操作</h4>
+
+<pre class="diagram"><code>  扩容前: 3 Master, 每个 ~5461 Slots
+
+  Master A: Slot 0-5460
+  Master B: Slot 5461-10922
+  Master C: Slot 10923-16383
+
+  加入 Master D，需要从 A/B/C 各搬一部分 Slot:
+
+  Master A: Slot 0-4095          (搬出 1366 个 Slot)
+  Master B: Slot 5461-9556       (搬出 1366 个 Slot)
+  Master C: Slot 10923-15017     (搬出 1366 个 Slot)
+  Master D: Slot 4096-5460,      (接收 4098 个 Slot)
+            9557-10922,
+            15018-16383
+
+  redis-cli --cluster reshard 自动完成上述过程</code></pre>
+
+            <h3>实战：Memcached 的扩展</h3>
+
+            <table>
+                <thead>
+                    <tr><th>步骤</th><th>Memcached 的实现</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>分片</strong></td><td>客户端一致性哈希（Consistent Hashing）。没有 Slot 概念，哈希环上的虚拟节点</td></tr>
+                    <tr><td><strong>控制面</strong></td><td>无。Memcached 服务器之间完全不通信，互相不知道对方存在</td></tr>
+                    <tr><td><strong>路由</strong></td><td>纯客户端路由。Mcrouter（Proxy 模式）或 libmemcached（Smart Client 模式）</td></tr>
+                    <tr><td><strong>副本</strong></td><td>默认没有。Mcrouter 可以配置 shadow/replica pool 做读副本</td></tr>
+                    <tr><td><strong>迁移</strong></td><td>不迁移。缓存 miss 后回源重建</td></tr>
+                </tbody>
+            </table>
+
+            <p>Memcached 的扩展哲学和 Redis 完全不同——它把自己定位为<strong>纯缓存</strong>，不是数据存储：</p>
+
+            <h4>一致性哈希：加机器时只影响相邻节点</h4>
+
+<pre class="diagram"><code>  哈希环 (0 ~ 2^32)
+
+        Node A                    Node A
+       ╱      ╲                  ╱      ╲
+      ╱   key1  ╲               ╱   key1  ╲
+  Node D ─── Node B    →    Node D ─── Node B
+      ╲        ╱               ╲    ↑   ╱
+       ╲      ╱                 ╲ Node E╱    ← 新加入
+        Node C                   Node C
+
+  加入 Node E：
+  - 只有 Node B 和 Node E 之间的 key 需要重新映射
+  - 其他 key 完全不受影响
+  - 不需要数据迁移——缓存 miss 后自然会回源写入 Node E</code></pre>
+
+            <h4>Mcrouter：Memcached 的"大脑"</h4>
+
+            <p>Memcached 本身无脑，所有智能都在 Mcrouter（Meta 开源的 Proxy）里：</p>
+
+            <ul>
+                <li><strong>一致性哈希路由</strong>：计算 key 应该去哪台 Memcached</li>
+                <li><strong>故障处理</strong>：节点挂了自动从环上摘除，key 自动重映射到下一个节点</li>
+                <li><strong>灰度切换</strong>：配置文件更新路由规则，可以逐步把流量切到新集群</li>
+                <li><strong>连接池</strong>：前端几千个客户端连接，复用为到 Memcached 的少量长连接</li>
+                <li><strong>冷启动预热</strong>：新集群上线时，读 miss 自动回源到旧集群读取，同时写入新集群</li>
+            </ul>
+
+<pre><code>// Mcrouter 路由配置示例
+{
+  "pools": {
+    "A": { "servers": ["mc1:11211", "mc2:11211", "mc3:11211"] },
+    "B": { "servers": ["mc4:11211", "mc5:11211", "mc6:11211"] }
+  },
+  "route": {
+    "type": "WarmUpRoute",          // 冷启动预热
+    "cold": "PoolRoute|B",          // 新集群
+    "warm": "PoolRoute|A",          // 旧集群（miss 时回源）
+    "exptime": 180
+  }
+}</code></pre>
+
+            <p>Memcached 扩容的核心思路：<strong>不搬数据，靠缓存自愈</strong>。加机器 → 更新 Mcrouter 配置 → 新 key 自动路由到新节点 → 旧 key 访问 miss 后回源重建。代价是扩容后短期内缓存命中率下降（冷启动），但对于缓存场景这是可接受的。</p>
+
+            <h3>实战：MySQL 的扩展</h3>
+
+            <table>
+                <thead>
+                    <tr><th>步骤</th><th>MySQL 的实现</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>分片</strong></td><td>应用层分片（ShardingSphere）或中间件分片（Vitess）。按 user_id 或 order_id 取模</td></tr>
+                    <tr><td><strong>控制面</strong></td><td>Vitess: etcd 存拓扑。ShardingSphere: ZooKeeper/etcd</td></tr>
+                    <tr><td><strong>路由</strong></td><td>Vitess: VTGate (Proxy)。ShardingSphere: 可选 Proxy 或 JDBC Driver (Smart Client)</td></tr>
+                    <tr><td><strong>副本</strong></td><td>InnoDB 半同步复制 / Group Replication / Raft (TiDB)</td></tr>
+                    <tr><td><strong>迁移</strong></td><td>基于 Binlog 的增量复制 + 原子切换</td></tr>
+                </tbody>
+            </table>
+
+            <p>MySQL 的扩展比 Redis 和 Memcached 复杂得多，因为它涉及<strong>事务、JOIN、外键</strong>等关系型语义。</p>
+
+            <h4>Vitess：YouTube 验证过的 MySQL 扩展方案</h4>
+
+<pre class="diagram"><code>  Application
+      │
+      ▼
+  ┌──────────┐     ┌───────────────┐
+  │ VTGate   │────►│ Topology      │  etcd 存储:
+  │ (Proxy)  │     │ Server (etcd) │  - Keyspace → Shard 映射
+  └────┬─────┘     └───────────────┘  - Shard → Tablet 映射
+       │                               - Tablet 角色 (Master/Replica)
+       │  SQL 路由
+       │
+  ┌────┼──────────────────────────────────────────┐
+  │    │  Keyspace: user_db                        │
+  │    │                                           │
+  │    ├──► Shard -80     ──► vttablet ──► MySQL A │  user_id < 0x80
+  │    │    (Master)                                │
+  │    │    Shard -80     ──► vttablet ──► MySQL A' │  (Replica)
+  │    │                                           │
+  │    └──► Shard 80-     ──► vttablet ──► MySQL B │  user_id >= 0x80
+  │         (Master)                                │
+  │         Shard 80-     ──► vttablet ──► MySQL B' │  (Replica)
+  └────────────────────────────────────────────────┘</code></pre>
+
+            <h4>MySQL 分片迁移：基于 Binlog</h4>
+
+            <p>MySQL 的数据迁移本质上和 PG 的流复制是同一个模式——<strong>全量快照 + 增量日志追赶</strong>：</p>
+
+            <ol>
+                <li><strong>全量快照</strong>：对源 Shard 做 <code>mysqldump</code> 或 Xtrabackup 物理快照，传输到新节点</li>
+                <li><strong>增量追赶</strong>：从快照时的 Binlog 位点开始，持续消费 Binlog，应用到新节点。这一步和 PG 的 WAL replay 异曲同工</li>
+                <li><strong>校验</strong>：对比源和目标的数据一致性（VDiff in Vitess）</li>
+                <li><strong>原子切换</strong>：短暂禁写 → 等 Binlog 追平 → 更新拓扑 → 恢复写入</li>
+            </ol>
+
+            <p>Vitess 的 <code>Reshard</code> 命令自动化这个流程。关键在于 <code>VReplication</code> 引擎——它不是简单地重放 Binlog，而是<strong>按分片规则过滤</strong>：只把属于目标 Shard 的行变更应用过去。</p>
+
+            <h4>MySQL 扩展的特殊挑战</h4>
+
+            <ul>
+                <li><strong>跨 Shard JOIN</strong>：<code>SELECT * FROM orders JOIN users ON orders.user_id = users.id</code>，如果 orders 和 users 在不同 Shard 上，Proxy 需要分别查询再合并。性能急剧下降</li>
+                <li><strong>跨 Shard 事务</strong>：需要两阶段提交（2PC），Vitess 通过 VTGate 协调，但性能和可靠性都不如单 Shard 事务</li>
+                <li><strong>分片键的选择</strong>：一旦选定（如 user_id），几乎不可能更改。选错了（如按 order_id 分片但经常按 user_id 查询）会导致大量跨 Shard 查询</li>
+                <li><strong>热点问题</strong>：如果一个大客户（user_id=1）的数据量远超其他用户，它所在的 Shard 会成为热点。解法：进一步分裂该 Shard，或者做应用层的特殊处理</li>
+            </ul>
+
+            <h3>三个系统的对比</h3>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Redis Cluster</th><th>Memcached + Mcrouter</th><th>MySQL + Vitess</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>定位</strong></td><td>数据存储 + 缓存</td><td>纯缓存</td><td>持久化数据存储</td></tr>
+                    <tr><td><strong>分片方式</strong></td><td>16384 Slot</td><td>一致性哈希</td><td>Range 或 Hash 分片</td></tr>
+                    <tr><td><strong>控制面</strong></td><td>Gossip (去中心化)</td><td>无 (配置驱动)</td><td>etcd (中心化)</td></tr>
+                    <tr><td><strong>路由</strong></td><td>Smart Client + MOVED</td><td>Mcrouter (Proxy)</td><td>VTGate (Proxy)</td></tr>
+                    <tr><td><strong>迁移方式</strong></td><td>逐 Key 搬运</td><td>不迁移，缓存自愈</td><td>快照 + Binlog 增量</td></tr>
+                    <tr><td><strong>迁移对业务影响</strong></td><td>大 Key 阻塞</td><td>短期 miss 率上升</td><td>短暂禁写 (毫秒级)</td></tr>
+                    <tr><td><strong>扩容复杂度</strong></td><td>中等</td><td>低</td><td>高</td></tr>
+                    <tr><td><strong>数据丢失风险</strong></td><td>异步复制可能丢</td><td>本来就是缓存</td><td>半同步/Raft 保证</td></tr>
+                </tbody>
+            </table>
+
+            <h3>总结</h3>
+
+            <p>扩展有状态服务的五步模型：</p>
+
+            <ol>
+                <li><strong>分片</strong>：Key → Slot → Node 两层映射，Slot 数量 = 机器数 × 100+</li>
+                <li><strong>控制面</strong>：路由表存在哪、谁是权威来源。趋势是 etcd + Operator</li>
+                <li><strong>路由</strong>：Smart Client（低延迟）vs Proxy（易运维）。多语言环境选 Proxy</li>
+                <li><strong>副本</strong>：异步（快但可能丢）vs 半同步（平衡）vs Raft（强一致但慢）</li>
+                <li><strong>迁移</strong>：全量快照 + 增量日志 + 原子切换。关键是切换那一刻的处理策略</li>
+            </ol>
+
+            <p>三个不同层次的实践：</p>
+
+            <ul>
+                <li><strong>Memcached</strong>：最简单——不搬数据，缓存 miss 自愈。适合纯缓存场景</li>
+                <li><strong>Redis</strong>：中等复杂——逐 Key 迁移，Gossip 协调。适合既做缓存又做轻量存储</li>
+                <li><strong>MySQL</strong>：最复杂——快照 + Binlog 增量，还要处理跨 Shard JOIN 和事务。适合持久化关系型数据</li>
+            </ul>
+
+            <p>不管具体系统怎么变，五步模型是通用的。下次遇到一个新的有状态系统需要扩展，先问这五个问题：怎么分片、元数据存哪、请求怎么路由、副本怎么做、数据怎么搬。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../js/toc.js"></script>
+</body>
+</html>
