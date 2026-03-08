@@ -27,6 +27,11 @@
             <h2>用 OCaml 写一个 URL Router：一个有趣的过度工程</h2>
             <time>2026-03-08</time>
 
+            <figure class="post-cover">
+                <img src="../images/piranesi-carceri.jpg" alt="Le Carceri d'Invenzione by Giovanni Battista Piranesi">
+                <figcaption>Giovanni Battista Piranesi,《想象的监狱》(Le Carceri d'Invenzione), c. 1761 — 层层叠叠的拱门和阶梯，像极了过度工程的路由系统</figcaption>
+            </figure>
+
             <h3>起因</h3>
 
             <p>事情的起因很简单：我在做一个类 Next.js 的 SSR 框架实验，需要一个路由匹配器。正常人会用正则表达式或者 <code>path-to-regexp</code> 这样的库，十行代码搞定。但我当时正好在学 OCaml，就想：能不能用 ocamllex + menhir 写一个"正经的"路由解析器？</p>

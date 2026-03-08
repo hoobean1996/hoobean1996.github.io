@@ -27,6 +27,11 @@
             <h2>手搓 SSR Server：为 GraphQL 应用构建自定义服务端渲染</h2>
             <time>2026-03-08</time>
 
+            <figure class="post-cover">
+                <img src="../images/hokusai-great-wave.jpg" alt="The Great Wave off Kanagawa by Katsushika Hokusai">
+                <figcaption>葛饰北斋,《神奈川冲浪里》, c. 1831 — 汹涌的浪潮，如同流式渲染中数据的奔涌</figcaption>
+            </figure>
+
             <h3>背景</h3>
 
             <p>Next.js 是好东西，但它和 Relay（Meta 的 GraphQL 客户端）的集成一直不太顺畅。Relay 有自己的一套数据预加载哲学——EntryPoint 模式，它希望在路由匹配时就开始 fetch 数据，而不是等组件渲染时才发请求。这和 Next.js 的 <code>getServerSideProps</code> / Server Components 的模型有微妙的冲突。</p>
