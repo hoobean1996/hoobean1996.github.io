@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>用 JSON Schema 驱动表单：从配置到渲染的完整链路 - 雾海上的旅人</title>
+    <title>Schema 驱动表单（上）：数据模型与渲染器 - 雾海上的旅人</title>
     <link rel="stylesheet" href="../css/style.css">
 </head>
 <body>
@@ -24,7 +24,7 @@
 
     <main>
         <article class="post-content">
-            <h2>用 JSON Schema 驱动表单：从配置到渲染的完整链路</h2>
+            <h2>Schema 驱动表单（上）：数据模型与渲染器</h2>
             <time>2026-03-08</time>
 
             <figure class="post-cover">
@@ -554,6 +554,12 @@ func (Question) Fields() []ent.Field {
             <p>Schema 驱动表单的本质是一个古老的软件工程思想的具体应用：<strong>数据和行为分离</strong>。表单的结构（数据）用 Schema 描述，表单的渲染和校验（行为）用通用代码处理。这让非开发者可以创建和修改表单，让开发者可以用一套代码服务所有表单场景。</p>
 
             <p>这个模式不仅限于表单。配置页面、审批流程、数据看板——任何"结构可变但行为固定"的场景，都可以用 Schema 驱动的方式来实现。核心永远是：定义一个好的 Schema，写一个好的渲染器。</p>
+
+            <p>但到目前为止，我们的 Schema 还只能描述扁平的表单字段。如果需要条件渲染、动态表达式、布局嵌套、交互动作呢？下一篇我们来把 Schema 的能力扩展到整个 UI 树。</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>下篇：</strong><a href="schema-driven-ui.html">Schema 驱动表单（下）：表达式引擎与通用 UI 渲染</a>
+            </p>
 
         </article>
     </main>

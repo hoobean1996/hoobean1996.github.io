@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Schema 驱动 UI：用 JSON 描述整个界面 - 雾海上的旅人</title>
+    <title>Schema 驱动表单（下）：表达式引擎与通用 UI 渲染 - 雾海上的旅人</title>
     <link rel="stylesheet" href="../css/style.css">
 </head>
 <body>
@@ -24,17 +24,17 @@
 
     <main>
         <article class="post-content">
-            <h2>Schema 驱动 UI：用 JSON 描述整个界面</h2>
+            <h2>Schema 驱动表单（下）：表达式引擎与通用 UI 渲染</h2>
             <time>2026-03-08</time>
 
             <figure class="post-cover">
-                <img src="../images/klee-highways-byways.jpg" alt="Highways and Byways by Paul Klee">
-                <figcaption>Paul Klee,《大路与小路》(Highways and Byways), 1929 — 用简单的几何色块和规则排列，构建出丰富的视觉世界。Schema 驱动 UI 的理念如出一辙</figcaption>
+                <img src="../images/patchwork-quilt.jpg" alt="Patchwork Quilt, 1870-1900, Metropolitan Museum of Art">
+                <figcaption>拼布被（Patchwork Quilt），1870–1900 — 每一块独立的布片按照规则拼接，组成完整的图案。Schema 驱动 UI 也是如此：独立的组件通过结构化描述组合成完整界面</figcaption>
             </figure>
 
             <h3>从表单到界面</h3>
 
-            <p>上一篇文章讨论了用 JSON Schema 驱动表单渲染。但如果仔细想想，表单不过是 UI 的一个子集。一个表单里不只有输入框——还有布局（分栏、卡片、Tab 切换）、展示组件（文字、图片、Badge）、交互逻辑（点击按钮触发动作、根据选项显示/隐藏字段）。</p>
+            <p><a href="form-builder.html">上一篇</a>讨论了用 JSON Schema 驱动表单渲染——数据模型、渲染器、校验策略。但如果仔细想想，表单不过是 UI 的一个子集。一个表单里不只有输入框——还有布局（分栏、卡片、Tab 切换）、展示组件（文字、图片、Badge）、交互逻辑（点击按钮触发动作、根据选项显示/隐藏字段）。</p>
 
             <p>如果我们把 Schema 的能力从"描述表单字段"扩展到"描述整个 UI 树"，就得到了一个更强大的系统：<strong>Schema 驱动 UI</strong>。一份 JSON 不仅定义数据输入，还定义布局、条件渲染、校验规则、交互动作——前端只需要一个通用的 <code>SchemaRenderer</code>，就能渲染出完整的页面。</p>
 
@@ -162,7 +162,7 @@ interface FormSchema {
 "@role == 'admin' OR @role == 'super_admin'"   // 多条件
 "@items > 0"                                    // 数值比较</code></pre>
 
-            <p>表达式引擎的实现不需要很复杂。一个简单的递归下降 parser 就够了，或者直接用现成的库（如 <a href="https://github.com/nicolo-ribaudo/tc39-proposal-pattern-matching">expr-eval</a>）。关键是：<strong>表达式的求值上下文必须和表单状态同步</strong>。每次表单值变化时，表达式引擎能拿到最新的值来重新求值。</p>
+            <p>表达式引擎的实现不需要很复杂。一个简单的递归下降 parser 就够了——tokenize 表达式字符串，解析成 AST，然后递归求值。关键是：<strong>表达式的求值上下文必须和表单状态同步</strong>。每次表单值变化时，表达式引擎能拿到最新的值来重新求值。</p>
 
             <p>实现方式是用 React Context 把表单值注入到表达式引擎：</p>
 
@@ -532,6 +532,10 @@ FormResponse (JSON)
             <p>四个部分各自独立，组合起来就能渲染任意复杂度的 UI。Schema 负责"是什么"，Registry 负责"长什么样"，Expression Engine 负责"什么时候"，FormContext 负责"当前状态是什么"。</p>
 
             <p>这不是一个新想法——从 WinForms 的 XML 描述到 SwiftUI 的声明式语法，"用数据描述 UI"是一个反复出现的主题。JSON Schema 驱动 UI 只是这个思想在 Web 前端、特别是 B 端产品中的一个具体实例。它的价值不在于技术上有多先进，而在于：<strong>它把 UI 的创建权从开发者转移给了业务人员</strong>。</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>上篇：</strong><a href="form-builder.html">Schema 驱动表单（上）：数据模型与渲染器</a>
+            </p>
 
         </article>
     </main>
