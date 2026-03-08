@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用 React 开发 Google Workspace 插件：架构、限制与 Workaround - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../linux/">Linux</a></li>
+                <li><a href="../cpp/">C++</a></li>
+                <li><a href="./">Misc</a></li>
+                <li><a href="https://github.com/hoobean1996">GitHub</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>用 React 开发 Google Workspace 插件：架构、限制与 Workaround</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../images/celestial-globe-clockwork.jpg" alt="Celestial Globe with Clockwork, Metropolitan Museum of Art">
+                <figcaption>罗马马赛克地板，公元2世纪 — 在严格的框架限制下，用有限的材料拼出精美的图案。在 GSuite 的沙箱里用现代前端技术栈开发插件，也是如此</figcaption>
+            </figure>
+
+            <h3>背景</h3>
+
+            <p>Google Workspace（原 GSuite）的插件生态有一个尴尬的现实：<strong>AppScript 是唯一的官方开发方式</strong>。你的后端逻辑必须用 AppScript 写，前端 UI 必须是 <code>HtmlService</code> 生成的 HTML，没有 npm，没有构建工具，没有模块系统。</p>
+
+            <p>但用户期待的是现代 Web 应用的交互体验——组件化、状态管理、类型安全。在 GSuite 的沙箱里写原生 HTML + jQuery，开发体验和产品质量都很痛苦。</p>
+
+            <p>这篇文章分享一个实际的方案：<strong>用 React + TypeScript + Webpack 开发 GSuite 插件的 sidebar 和 dialog，编译成符合 GSuite 安全要求的自包含 HTML 文件</strong>。</p>
+
+            <h3>GSuite 插件的运行模型</h3>
+
+            <p>首先要理解 GSuite 插件是怎么跑的：</p>
+
+<pre><code>┌──────────────────────────────────────────┐
+│           Google Docs / Sheets / ...      │
+│                                           │
+│   ┌─────────────┐    ┌───────────────┐   │
+│   │   Sidebar    │    │    Dialog     │   │
+│   │  (HTML/JS)   │    │  (HTML/JS)   │   │
+│   │              │    │              │   │
+│   │  ← iframe →  │    │  ← iframe → │   │
+│   └──────┬───────┘    └──────┬───────┘   │
+│          │                    │           │
+│          │  google.script.run │           │
+│          ▼                    ▼           │
+│   ┌──────────────────────────────────┐   │
+│   │        AppScript (服务端)         │   │
+│   │  - 访问 Drive / Gmail / Sheets   │   │
+│   │  - 操作文档内容                    │   │
+│   │  - 发送邮件                       │   │
+│   └──────────────────────────────────┘   │
+└──────────────────────────────────────────┘</code></pre>
+
+            <p>关键约束：</p>
+
+            <ul>
+                <li><strong>Sidebar 和 Dialog 运行在 iframe 沙箱里</strong>，不能加载外部脚本（CSP 限制），所有 JS/CSS 必须内联在 HTML 里</li>
+                <li><strong>前端和 AppScript 之间通过 <code>google.script.run</code> 通信</strong>，这是一个异步 RPC 调用——前端调用服务端函数，通过 <code>withSuccessHandler</code> / <code>withFailureHandler</code> 拿结果</li>
+                <li><strong>一个插件可以运行在多个 GSuite 产品里</strong>（Docs、Sheets、Slides、Forms），但每个产品的 API 不同（<code>DocumentApp</code> vs <code>SpreadsheetApp</code> vs <code>SlidesApp</code>）</li>
+            </ul>
+
+            <h3>项目结构</h3>
+
+<pre><code>omni_assistant/
+├── src/
+│   ├── sidebar/           # 主 sidebar 组件
+│   │   ├── App.tsx
+│   │   └── index.tsx
+│   └── dialogs/           # dialog 组件（自动发现）
+│       ├── about/
+│       │   ├── App.tsx
+│       │   └── index.tsx
+│       └── settings/
+│           ├── App.tsx
+│           └── index.tsx
+├── appscript/
+│   └── shared.gs          # AppScript 服务端代码
+├── clasp/
+│   └── docs/
+│       ├── .clasp.json    # clasp 部署配置
+│       └── appsscript.json
+├── webpack.config.js
+└── package.json</code></pre>
+
+            <p>构建后的输出结构：</p>
+
+<pre><code>dist/
+├── docs/
+│   ├── sidebar.html       # 自包含 HTML（JS/CSS 全内联）
+│   ├── about.html
+│   ├── settings.html
+│   └── appscript/
+│       └── shared.gs
+├── sheets/
+│   ├── sidebar.html       # 同样的文件，部署到 Sheets
+│   └── ...
+├── slides/
+│   └── ...
+└── forms/
+    └── ...</code></pre>
+
+            <h3>核心问题：CSS/JS 必须内联</h3>
+
+            <p>GSuite 的 iframe 沙箱禁止加载外部资源。正常的 Webpack 构建会生成独立的 <code>.js</code> 和 <code>.css</code> 文件，通过 <code>&lt;script src&gt;</code> 引用——这在 GSuite 里不工作。</p>
+
+            <p>解决方案是 <code>html-inline-script-webpack-plugin</code>，它把 Webpack 输出的 JS bundle 直接内联到 HTML 的 <code>&lt;script&gt;</code> 标签里：</p>
+
+<pre><code>// webpack.config.js
+const HtmlInlineScriptPlugin = require("html-inline-script-webpack-plugin");
+
+module.exports = {
+  plugins: [
+    new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: "docs/sidebar.html",
+      chunks: ["sidebar"],
+      inject: "body",
+    }),
+    new HtmlInlineScriptPlugin(),  // 把 JS 内联进 HTML
+  ],
+};</code></pre>
+
+            <p>CSS 用 <code>style-loader</code> 处理，它会把 CSS 注入到 <code>&lt;style&gt;</code> 标签里。最终每个 HTML 文件是完全自包含的——零外部依赖，直接丢给 <code>HtmlService.createHtmlOutputFromFile()</code> 就能用。</p>
+
+            <h3>自动发现 Dialog</h3>
+
+            <p>添加新 dialog 不应该需要改构建配置。Webpack 配置在启动时自动扫描 <code>src/dialogs/</code> 目录：</p>
+
+<pre><code>function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(item => item.isDirectory())
+    .filter(dir => {
+      // 只有包含 index.tsx 的目录才算
+      return fs.existsSync(path.join(dialogsPath, dir.name, "index.tsx"));
+    })
+    .map(dir => dir.name);
+}
+
+// 动态生成 entry points
+const entries = { sidebar: "./src/sidebar/index.tsx" };
+discoverDialogs().forEach(name => {
+  entries[name] = `./src/dialogs/${name}/index.tsx`;
+});</code></pre>
+
+            <p>然后为每个 GSuite 产品 × 每个 entry 生成一个 HTML：</p>
+
+<pre><code>const GSUITE_PRODUCTS = ["docs", "slides", "sheets", "forms"];
+
+GSUITE_PRODUCTS.forEach(product => {
+  // sidebar
+  htmlPlugins.push(new HtmlWebpackPlugin({
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+  }));
+
+  // 每个 dialog
+  dialogs.forEach(name => {
+    htmlPlugins.push(new HtmlWebpackPlugin({
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+    }));
+  });
+});</code></pre>
+
+            <p>4 个产品 × 4 个组件 = 16 个 HTML 文件，全自动生成。加一个新 dialog？在 <code>src/dialogs/</code> 下建个文件夹就行。</p>
+
+            <h3>前端和 AppScript 的通信</h3>
+
+            <p><code>google.script.run</code> 是唯一的通信通道。它的 API 设计很原始——callback-based，没有 Promise，没有类型：</p>
+
+<pre><code>// AppScript 侧（服务端）
+function getGoogleSheets() {
+  var files = DriveApp.getFilesByType(MimeType.GOOGLE_SHEETS);
+  var sheets = [];
+  while (files.hasNext()) {
+    var file = files.next();
+    sheets.push({
+      id: file.getId(),
+      name: file.getName(),
+      url: file.getUrl(),
+    });
+  }
+  return { success: true, sheets: sheets };
+}
+
+// React 侧（客户端）
+google.script.run
+  .withSuccessHandler((result) => {
+    if (result.success) {
+      setGoogleSheets(result.sheets);
+    }
+  })
+  .withFailureHandler((error) => {
+    console.error("Error:", error);
+  })
+  .getGoogleSheets();</code></pre>
+
+            <p>在 React 里，每个 AppScript 调用都封装成一个 <code>useEffect</code>：</p>
+
+<pre><code>// 组件挂载时加载 Google Sheets 列表
+useEffect(() => {
+  if (typeof google !== "undefined" && google.script) {
+    google.script.run
+      .withSuccessHandler((result) => {
+        if (result.success) setGoogleSheets(result.sheets);
+        setLoadingSheets(false);
+      })
+      .withFailureHandler((error) => {
+        console.error(error);
+        setLoadingSheets(false);
+      })
+      .getGoogleSheets();
+  } else {
+    // 开发模式——用 mock 数据
+    setLoadingSheets(false);
+  }
+}, []);</code></pre>
+
+            <p>注意 <code>typeof google !== "undefined"</code> 的检查——本地开发时 <code>google.script.run</code> 不存在，需要 fallback 到 mock 数据。这让你可以在浏览器里直接开发和调试 UI，不需要每次都部署到 GSuite。</p>
+
+            <h3>跨产品适配</h3>
+
+            <p>同一个插件要跑在 Docs、Sheets、Slides、Forms 里，但每个产品的 API 对象不一样。AppScript 没有"当前是哪个产品"的 API，只能用 try/catch 链来检测：</p>
+
+<pre><code>function showSidebar() {
+  var html = HtmlService.createHtmlOutputFromFile("sidebar")
+    .setTitle("Omni Assistant")
+    .setWidth(320);
+
+  try {
+    DocumentApp.getUi().showSidebar(html);
+  } catch (err) {
+    try {
+      SpreadsheetApp.getUi().showSidebar(html);
+    } catch (err) {
+      try {
+        SlidesApp.getUi().showSidebar(html);
+      } catch (err) {
+        try {
+          FormApp.getUi().showSidebar(html);
+        } catch (err) {
+          Logger.log("Error showing sidebar: " + err);
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>这段代码很丑，但这是 AppScript 的现实——没有 <code>getActiveApp()</code> 这样的统一 API。每个需要调用 UI 的函数都要写这个 try/catch 链。可以封装成 helper：</p>
+
+<pre><code>function getUi() {
+  try { return DocumentApp.getUi(); } catch(e) {}
+  try { return SpreadsheetApp.getUi(); } catch(e) {}
+  try { return SlidesApp.getUi(); } catch(e) {}
+  try { return FormApp.getUi(); } catch(e) {}
+  return null;
+}
+
+function showSidebar() {
+  var ui = getUi();
+  if (!ui) return;
+  var html = HtmlService.createHtmlOutputFromFile("sidebar")
+    .setTitle("Omni Assistant").setWidth(320);
+  ui.showSidebar(html);
+}</code></pre>
+
+            <h3>实际案例：Mail Merge</h3>
+
+            <p>用这套架构做一个 Mail Merge（邮件合并）功能——从 Google Sheets 读收件人列表，用 Google Docs 做邮件模板，批量发送个性化邮件：</p>
+
+<pre><code>用户操作流程（4 步向导）：
+
+Step 1: 选数据源
+  → 列出用户 Drive 里的 Google Sheets
+  → 选择文件 → 选择 sheet tab
+  → 预览 headers 和行数
+
+Step 2: 选模板
+  → 列出用户 Drive 里的 Google Docs
+  → 预览模板内容（HTML 格式）
+
+Step 3: 配置
+  → 输入邮件主题（支持 {{Name}} 合并字段）
+  → 可选 reply-to 地址
+  → 显示可用的合并字段列表
+
+Step 4: 执行
+  → 汇总确认
+  → Test mode（只发给自己）
+  → 执行并显示结果</code></pre>
+
+            <p>前端是标准的 React 多步表单，每一步的数据通过 <code>google.script.run</code> 从 AppScript 获取。AppScript 负责所有和 Google 服务的交互：</p>
+
+<pre><code>// 读 Sheets 数据
+function getSelectedSheetData(spreadsheetId, worksheetName) {
+  var spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = spreadsheet.getSheetByName(worksheetName);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0];
+  return {
+    success: true,
+    headers: headers,
+    dataRowCount: values.length - 1,
+  };
+}
+
+// 读 Docs 内容（导出为 HTML，保留格式）
+function getDocumentHtml(docId) {
+  var url = "https://docs.google.com/feeds/download/documents/export/Export"
+          + "?id=" + docId + "&exportFormat=html";
+  var response = UrlFetchApp.fetch(url, {
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() }
+  });
+  return { success: true, html: response.getContentText() };
+}
+
+// 合并字段替换
+function replaceMergeFields(text, data) {
+  return text.replace(/\{\{([^}]+)\}\}/g, function(match, field) {
+    return data[field.trim()] || match;
+  });
+}
+
+// 发送邮件
+function sendMergeEmail(recipient, subject, htmlBody, replyTo) {
+  GmailApp.sendEmail(recipient, subject, "", {
+    htmlBody: htmlBody,
+    replyTo: replyTo || undefined,
+  });
+}</code></pre>
+
+            <p>完整的 Mail Merge 流程：遍历 Sheets 每一行 → 用行数据替换模板里的 <code>{{Field}}</code> → 调用 Gmail API 发送。支持 test mode（所有邮件发给自己）、quota 检查（Gmail 有日发送量限制）、错误收集。</p>
+
+            <h3>TypeScript 类型安全</h3>
+
+            <p><code>google.script.run</code> 没有类型定义。需要手动声明：</p>
+
+<pre><code>declare const google: {
+  script: {
+    run: {
+      withSuccessHandler: (cb: (result: any) => void) => {
+        withFailureHandler: (cb: (error: any) => void) => {
+          getGoogleSheets: () => void;
+          getWorksheets: (id: string) => void;
+          getSelectedSheetData: (id: string, name: string) => void;
+          getDocumentHtml: (id: string) => void;
+          sendMailMerge: (
+            spreadsheetId: string,
+            worksheetName: string,
+            docId: string,
+            subject: string,
+            replyTo: string,
+            testMode: boolean
+          ) => void;
+        };
+      };
+    };
+  };
+};</code></pre>
+
+            <p>这样至少能在 TypeScript 层面保证调用参数的类型正确。返回值还是 <code>any</code>——因为 AppScript 是动态类型的，没法在编译时知道返回什么。</p>
+
+            <h3>部署流程</h3>
+
+            <p>用 Google 的 <code>clasp</code> CLI 把构建产物推到 AppScript 项目：</p>
+
+<pre><code># 1. 构建
+npm run build    # → dist/docs/sidebar.html, dist/docs/about.html, ...
+
+# 2. 推送到 AppScript
+cd clasp/docs
+clasp push       # 上传 HTML + .gs 文件到 Google Apps Script
+
+# 3. 在 GSuite 里测试
+# 打开任意 Google Doc → 扩展程序 → Omni Assistant → Start</code></pre>
+
+            <p><code>.clasp.json</code> 里配置了 AppScript 项目 ID 和 root 目录。<code>clasp push</code> 会把目录下的所有 <code>.html</code> 和 <code>.gs</code> 文件上传。</p>
+
+            <h3>开发体验的痛点和解法</h3>
+
+            <ul>
+                <li><strong>本地开发</strong>：<code>google.script.run</code> 在浏览器里不存在。解法：检测 <code>typeof google</code>，不存在时用 mock 数据。这样可以在本地用 webpack-dev-server 开发 UI，不需要每次部署。</li>
+                <li><strong>调试</strong>：GSuite iframe 里的 console.log 很难看到。解法：AppScript 侧用 <code>Logger.log()</code>，在 Apps Script 编辑器的执行日志里查看。前端的错误可以通过 <code>withFailureHandler</code> 捕获。</li>
+                <li><strong>Bundle 大小</strong>：每个 HTML 文件约 1.1MB（因为 React 被内联进去了）。4 个产品 × 4 个组件 = ~18MB 总产物。解法：用 TerserPlugin 压缩、<code>drop_console</code> 移除日志。如果还嫌大，可以用 Preact 替代 React。</li>
+                <li><strong>AppScript 的 6 分钟执行限制</strong>：长时间运行的操作（如发送 1000 封邮件）会超时。解法：在循环里加 <code>Utilities.sleep(100)</code> 控制速率，检查 <code>MailApp.getRemainingDailyQuota()</code> 提前终止。</li>
+                <li><strong>没有 hot reload</strong>：每次改 AppScript 都要 <code>clasp push</code> + 刷新 GSuite 页面。这是最大的开发体验问题，目前没有好的解法。</li>
+            </ul>
+
+            <h3>这个方案的适用场景</h3>
+
+            <ul>
+                <li><strong>适合</strong>：需要在 GSuite sidebar/dialog 里放一个交互复杂的 UI（多步表单、实时预览、条件渲染）。用原生 HTML 写这些会很痛苦，React 的组件化和状态管理在这里有明显优势。</li>
+                <li><strong>不适合</strong>：简单的插件（一两个按钮、一个输入框）。引入 React + Webpack 的构建复杂度不值得。直接写 HTML + 几行 JavaScript 就够了。</li>
+                <li><strong>也不适合</strong>：需要大量和文档内容交互的插件（如实时协同编辑工具）。这类插件的核心逻辑在 AppScript 侧，前端只是触发器，React 的优势不明显。</li>
+            </ul>
+
+            <h3>总结</h3>
+
+            <p>在 GSuite 的沙箱里开发现代前端应用，核心挑战是两个世界的碰撞：<strong>现代前端工具链</strong>（React、TypeScript、Webpack、npm）和<strong>AppScript 的原始运行环境</strong>（全局函数、callback-based RPC、no module system、try/catch 检测产品类型）。</p>
+
+            <p>这套方案的关键决策：</p>
+
+            <ul>
+                <li>用 <code>HtmlInlineScriptPlugin</code> 把 JS 内联到 HTML，满足 CSP 限制</li>
+                <li>用文件系统扫描自动发现 dialog，消除构建配置的维护成本</li>
+                <li>为每个 GSuite 产品生成独立的文件夹，用 <code>clasp</code> 分别部署</li>
+                <li>用 <code>typeof google</code> 检测实现本地开发和 GSuite 环境的兼容</li>
+            </ul>
+
+            <p>不完美，但可用。在 Google 提供更好的插件开发体验之前，这大概是能做到的最好了。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../js/toc.js"></script>
+</body>
+</html>
