@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>一个请求的旅程：数据中心网络全景 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>一个请求的旅程：数据中心网络全景</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../images/cezanne-viaduct.jpg" alt="Mont Sainte-Victoire and the Viaduct of the Arc River Valley, Paul Cézanne, 1882-85">
+                <figcaption>Paul Cézanne,《圣维克多山与弧形河谷高架桥》, 1882-85 — 高架桥连接两岸，如同骨干网连接数据中心。基础设施的美在于它消失在风景中，却支撑着一切</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：大多数后端工程师知道请求从浏览器发出、到服务器处理、再返回响应。但中间经过了什么？PoP 节点、骨干网光纤、Clos 交换矩阵、eBPF 四层负载均衡、VXLAN 容器网络——这些基础设施决定了你的系统能做到什么、不能做到什么。这篇文章追踪一个请求从用户手机到数据中心服务器的完整旅程，沿途拆解每一层的关键技术。
+            </blockquote>
+
+            <h3>全局视角：三层架构</h3>
+
+            <p>任何大规模互联网公司的网络基础设施都是三层结构：</p>
+
+            <table>
+                <thead>
+                    <tr><th>层</th><th>职责</th><th>例子</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Edge / PoP</strong></td><td>用户流量入口，TLS 终止，地理路由</td><td>东京 PoP 接收日本用户的请求</td></tr>
+                    <tr><td><strong>Backbone</strong></td><td>数据中心之间的高速私有光纤，运行 SR/MPLS</td><td>新加坡 DC ↔ 美国 DC，~120ms RTT</td></tr>
+                    <tr><td><strong>DC Internal</strong></td><td>Clos 交换矩阵连接 DC 内所有服务器</td><td>Leaf-Spine-Core 三层交换</td></tr>
+                </tbody>
+            </table>
+
+            <p>一个东京用户打开 Instagram：手机 DNS 解析到最近的东京 PoP IP → PoP 终止 TLS，静态内容直接从 CDN 返回 → 动态请求走骨干网（SR/MPLS）到新加坡 DC → 进入 DC 后经过 Katran（L4 LB）→ Proxygen（L7 LB）→ 应用服务器 → 如果需要美国 DC 的数据，再走一次跨洋骨干网 → 响应通过 DSR 直接返回用户，绕过 L4 LB。</p>
+
+            <p>接下来沿着这条路径，逐层拆解。</p>
+
+            <h3>DC 内部：Clos 架构</h3>
+
+            <p>一台大型交换机无法扩展到数十万台服务器。Clos 拓扑用大量便宜的小交换机组合成一个无阻塞、可水平扩展的网络。</p>
+
+            <h4>三层结构</h4>
+
+            <table>
+                <thead>
+                    <tr><th>层</th><th>名称</th><th>职责</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Layer 1</td><td><strong>Leaf (ToR)</strong></td><td>机架顶部交换机，直连服务器。每个机架一台</td></tr>
+                    <tr><td>Layer 2</td><td><strong>Spine</strong></td><td>连接同一 Pod 内所有 Leaf，全网状连接</td></tr>
+                    <tr><td>Layer 3</td><td><strong>Core</strong></td><td>连接不同 Pod，跨 Pod 流量经过 Core</td></tr>
+                </tbody>
+            </table>
+
+            <p>流量路径的跳数：</p>
+            <ul>
+                <li><strong>同机架</strong>：Leaf 本地交换，0 跳</li>
+                <li><strong>同 Pod 不同机架</strong>：Leaf → Spine → Leaf，2 跳</li>
+                <li><strong>跨 Pod</strong>：Leaf → Spine → Core → Spine → Leaf，4 跳</li>
+            </ul>
+
+            <h4>Pod：可重复的构建单元</h4>
+
+            <p>Pod 是一组 Leaf + 对应的 Spine，是 DC 扩展的基本单位。要扩容？加一个 Pod，连到 Core 就行。</p>
+
+            <p>用 64 端口交换机算一下规模：</p>
+
+<pre><code>Leaf：32 端口朝下连服务器 → 每机架 32 台服务器
+Pod： 32 个 Leaf              → 32 × 32 = 1,024 台服务器
+DC：  32 个 Pod               → 32 × 1,024 = 32,768 台服务器</code></pre>
+
+            <p>需要更多？加一层（5-stage Clos / Super Spine），可以支撑数十万台服务器。Meta 的 F16 Fabric 就是这种多级 Clos 设计。</p>
+
+            <h4>ECMP：等价多路径</h4>
+
+            <p>Clos 架构的核心设计原则。当 Leaf 1 发包到 Leaf 4，有多条等价路径经过不同的 Spine。交换机对五元组（源 IP、目的 IP、源端口、目的端口、协议）做哈希，均匀分发到所有路径。</p>
+
+            <p>ECMP 的意义：</p>
+            <ul>
+                <li><strong>无瓶颈</strong>：流量均匀分散，没有单链路过载</li>
+                <li><strong>容错</strong>：一台 Spine 挂了，流量自动重分布到剩余 Spine</li>
+                <li><strong>线性扩展</strong>：需要更多带宽？加 Spine 就行</li>
+            </ul>
+
+            <h4>Oversubscription：超卖比</h4>
+
+            <p>Leaf 交换机的下行带宽（面向服务器）和上行带宽（面向 Spine）的比值。</p>
+
+            <table>
+                <thead>
+                    <tr><th>比例</th><th>含义</th><th>场景</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>1:1</strong></td><td>无阻塞，所有服务器可以同时全速通信</td><td>延迟敏感（DB 集群、ML 训练）</td></tr>
+                    <tr><td><strong>3:1</strong></td><td>只有 1/3 的服务器带宽可以同时上行</td><td>通用计算（统计上够用）</td></tr>
+                    <tr><td><strong>4:1+</strong></td><td>更高超卖，便宜但有风险</td><td>冷存储、批处理</td></tr>
+                </tbody>
+            </table>
+
+            <p>实际影响：设计服务时，把频繁通信的服务放在同一个机架或 Pod 里，避免超卖瓶颈。这就是为什么 HDFS 把一个副本放在同机架、另一个放在跨机架。</p>
+
+            <h3>骨干网：Segment Routing</h3>
+
+            <p>数据中心之间通过私有骨干网连接。传统 MPLS 需要每个中间路由器维护转发状态（通过 LDP/RSVP）。Segment Routing（SR）是它的进化：<strong>把完整路径编码在包头里</strong>，中间路由器只需要读取下一条指令。</p>
+
+<pre><code>MPLS 类比：坐出租车，每个路口都要问路
+SR 类比：  出发前拿到完整 GPS 导航，每个路口只看下一步指令</code></pre>
+
+            <p>两种 Segment ID：</p>
+            <ul>
+                <li><strong>Node SID</strong>：走最短路径到某个路由器——"去路由器 D"</li>
+                <li><strong>Adjacency SID</strong>：走某条特定物理链路——"走 B→C 这条线"</li>
+            </ul>
+
+            <p>SRv6 是 Google 和 Meta 在推的方向。128 位的 SID 可以同时编码目的地和操作（比如"解封装"、"查 VPN 表"），比 SR-MPLS 的 20 位标签灵活得多。</p>
+
+            <h3>负载均衡：L4 + L7 两层</h3>
+
+            <p>数据中心里有两种本质不同的"负载均衡"协同工作。很多人把它们混为一谈，但它们解决的问题完全不同：</p>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>ECMP（网络层）</th><th>应用负载均衡器</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>回答的问题</strong></td><td>这个包走哪条物理路径？</td><td>这个请求由哪台服务器处理？</td></tr>
+                    <tr><td><strong>决策依据</strong></td><td>五元组哈希</td><td>健康检查、负载、Session、URL、Header</td></tr>
+                    <tr><td><strong>应用感知</strong></td><td>零</td><td>完全感知</td></tr>
+                    <tr><td><strong>所在层</strong></td><td>L3/L4（交换机）</td><td>L4/L7（软件）</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Katran：Meta 的 L4 负载均衡器</h4>
+
+            <p>Katran 不是一个独立设备——它是一个 <strong>eBPF/XDP 程序</strong>，直接跑在每台 L7 LB 服务器的网卡上。</p>
+
+<pre><code>请求到达 DC：
+
+1. 路由器通过 ECMP + Anycast 把流量分发到多台服务器
+2. Katran（XDP）在网卡驱动层拦截包——在内核协议栈之前
+3. 一致性哈希决定这个连接应该由哪台服务器处理
+4. 如果是本机 → 交给 Proxygen（L7 LB）
+   如果是其他机器 → 封装转发</code></pre>
+
+            <p>三个关键设计决策：</p>
+
+            <ul>
+                <li><strong>XDP/eBPF</strong>：包在网卡驱动层处理，不经过内核网络栈。单机可以达到数百万 PPS</li>
+                <li><strong>一致性哈希</strong>：同一个 TCP 连接始终映射到同一个后端。后端变化时，只有小部分连接需要重映射</li>
+                <li><strong>DSR（Direct Server Return）</strong>：响应从后端服务器直接返回用户，<strong>绕过 Katran</strong>。因为响应比请求大得多（想想一个 HTTP 请求 vs 一个带图片的页面），DSR 避免了 LB 成为带宽瓶颈</li>
+            </ul>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>硬件 LB (F5)</th><th>LVS/IPVS</th><th>Katran (eBPF)</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>性能</strong></td><td>高但有上限</td><td>中高</td><td>数百万 PPS</td></tr>
+                    <tr><td><strong>成本</strong></td><td>$100K+ / 台</td><td>免费</td><td>免费</td></tr>
+                    <tr><td><strong>单点故障</strong></td><td>是</td><td>看部署方式</td><td>否（每台服务器都跑）</td></tr>
+                    <tr><td><strong>扩展方式</strong></td><td>买更多设备</td><td>加服务器</td><td>加服务器</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Overlay 网络：容器怎么通信</h3>
+
+            <p>你的代码跑在容器里，容器有虚拟 IP，物理网络不认识这些 IP。Overlay 网络桥接这个鸿沟。</p>
+
+            <h4>Underlay vs Overlay</h4>
+
+            <table>
+                <thead>
+                    <tr><th>层</th><th>是什么</th><th>IP</th><th>设备</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Underlay</strong></td><td>Clos 物理交换矩阵</td><td>192.168.x.x（宿主机 IP）</td><td>Leaf, Spine, Core</td></tr>
+                    <tr><td><strong>Overlay</strong></td><td>容器虚拟网络</td><td>10.244.x.x（Pod IP）</td><td>veth, bridge, VXLAN</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Linux 虚拟网络设备</h4>
+
+            <ul>
+                <li><strong>veth pair</strong>：一根虚拟网线连接两个网络命名空间。Docker/K8s 创建一对：一端进容器（eth0），一端留在宿主机连到 bridge</li>
+                <li><strong>bridge</strong>：宿主机上的虚拟二层交换机。同主机的容器通过它通信，不经过物理网络</li>
+                <li><strong>VXLAN device (VTEP)</strong>：容器要访问另一台主机上的容器时，VXLAN 设备把原始帧封装在 UDP 包（端口 4789）里，用宿主机 IP 作为外层地址。物理网络正常用 ECMP 路由，目的主机的 VXLAN 设备解封装后交给目标容器</li>
+            </ul>
+
+            <h4>一个包的完整旅程：跨主机容器通信</h4>
+
+<pre><code>Container A (10.244.1.5) → Container B (10.244.3.8)，不同主机
+
+1. Container A 发包（src: 10.244.1.5, dst: 10.244.3.8）
+2. 包经过 veth pair 到宿主机 bridge
+3. Bridge 发现目的地不在本机，路由到 VXLAN 设备
+4. VXLAN 封装：
+   外层: src 192.168.1.10 → dst 192.168.2.20, UDP:4789
+   VNI: 100
+   内层: 原始包不变
+5. 物理网卡发出，走 Clos 网络（Leaf → Spine → Leaf）
+   ECMP 基于外层 IP 做路由
+6. 目的主机的 VXLAN 设备解封装
+7. 经过 bridge + veth 交付给 Container B</code></pre>
+
+            <p>为什么用 VXLAN 而不是 VLAN？VLAN 只支持 4,096 个 ID（12 位）。VXLAN 用 24 位 VNI，支持 1600 万个虚拟网络——多租户 DC 环境必需的。</p>
+
+            <h4>K8s CNI 插件对比</h4>
+
+            <table>
+                <thead>
+                    <tr><th>CNI</th><th>方式</th><th>性能</th><th>复杂度</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Flannel (VXLAN)</strong></td><td>VXLAN 封装</td><td>好（有封装开销）</td><td>简单</td></tr>
+                    <tr><td><strong>Calico (IPIP)</strong></td><td>IP-in-IP 封装</td><td>更好（更轻的封装）</td><td>中等</td></tr>
+                    <tr><td><strong>Calico (BGP)</strong></td><td>直接路由，无封装</td><td>最好（原生路由）</td><td>需要支持 BGP 的交换机</td></tr>
+                    <tr><td><strong>Cilium (eBPF)</strong></td><td>eBPF，绕过 bridge/iptables</td><td>优秀</td><td>中等</td></tr>
+                </tbody>
+            </table>
+
+            <p>Meta 和 Google 大概率用的是类似 Calico BGP 的直接路由方案——物理交换机知道容器子网的路由，不需要封装，性能最好，但需要网络基础设施的深度集成。</p>
+
+            <h3>DC 内部 vs 公网：两个完全不同的世界</h3>
+
+            <p>这是最反直觉的部分。教科书上的 TCP/IP 是为公网设计的——高延迟、高丢包、未知带宽。DC 内部是一个<strong>完全不同的环境</strong>，需要在每一层做不同的优化。</p>
+
+            <table>
+                <thead>
+                    <tr><th>属性</th><th>公网</th><th>DC 内部</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>RTT</strong></td><td>10-200ms</td><td>10-100μs（低 1000 倍）</td></tr>
+                    <tr><td><strong>丢包率</strong></td><td>1-5%</td><td>&lt;0.001%</td></tr>
+                    <tr><td><strong>带宽</strong></td><td>未知、可变</td><td>已知（25G/100G/400G）</td></tr>
+                    <tr><td><strong>跳数</strong></td><td>10-20</td><td>2-4</td></tr>
+                    <tr><td><strong>信任</strong></td><td>不可信</td><td>完全可控</td></tr>
+                </tbody>
+            </table>
+
+            <h4>传输层的差异</h4>
+
+            <table>
+                <thead>
+                    <tr><th>公网做法</th><th>DC 做法</th><th>为什么</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>TCP：丢包就砍半窗口</td><td>DCTCP：基于 ECN 的细粒度速率调整</td><td>丢包信号太粗暴；ECN 提供早期、按比例的拥塞反馈</td></tr>
+                    <tr><td>每个请求建 TCP 连接</td><td>连接池 + gRPC/HTTP2 多路复用</td><td>百万级服务间调用，握手开销不可接受</td></tr>
+                    <tr><td>什么都用 TCP</td><td>ML 训练用 RDMA/RoCE</td><td>GPU 梯度交换需要 &lt;2μs 延迟，绕过 CPU</td></tr>
+                </tbody>
+            </table>
+
+            <h4>内核绕过技术</h4>
+
+            <p>内核网络栈通过上下文切换和协议处理增加延迟。DC 工作负载直接绕过它：</p>
+
+            <table>
+                <thead>
+                    <tr><th>技术</th><th>原理</th><th>用途</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>DPDK</strong></td><td>用户态包处理，完全绕过内核</td><td>高性能 LB、NFV</td></tr>
+                    <tr><td><strong>RDMA/RoCE</strong></td><td>网卡直接读写远端内存，CPU 不参与</td><td>GPU 训练、分布式存储</td></tr>
+                    <tr><td><strong>XDP/eBPF</strong></td><td>在网卡驱动层拦截包（内核最早的 hook 点）</td><td>Katran LB、Cilium</td></tr>
+                    <tr><td><strong>io_uring</strong></td><td>异步 I/O，减少系统调用开销</td><td>高性能存储引擎</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Incast：DC 特有的拥塞模式</h4>
+
+            <p>一个请求扇出到 N 台服务器（比如分布式查询），N 台同时响应，<strong>瞬间压垮请求方 Leaf 交换机的缓冲区</strong>。结果：丢包、TCP 重传、延迟飙升。</p>
+
+            <p>解法：</p>
+            <ul>
+                <li><strong>ECN</strong>：交换机缓冲区到达阈值（比如 30%）时标记包，发送方在丢包发生前就降速</li>
+                <li><strong>DCTCP</strong>：根据 ECN 标记包的比例按比例降速，而不是二元的"砍半"</li>
+                <li><strong>应用层错开</strong>：给响应时间加 jitter，避免同步爆发</li>
+            </ul>
+
+            <h3>完整的请求路径</h3>
+
+            <p>现在把所有层串起来：</p>
+
+<pre><code>用户（东京）
+  ↓ DNS 解析到最近的 Anycast IP
+PoP（东京）
+  ↓ TLS 终止，静态内容走 CDN
+  ↓ 动态请求走骨干网
+Backbone（SR/MPLS，私有光纤）
+  ↓ ~120ms 到新加坡
+DC Border Router
+  ↓ ECMP 分发到服务器
+Katran（L4 LB，XDP/eBPF）
+  ↓ 一致性哈希选后端
+Proxygen（L7 LB）
+  ↓ TLS 终止，URL 路由，健康检查
+Application Server
+  ↓ 处理请求，可能跨 Pod 调用其他服务
+  ↓ 跨主机容器通信走 VXLAN overlay
+Response
+  ↓ DSR：响应直接返回用户，绕过 Katran</code></pre>
+
+            <p>从用户发出请求到收到响应，经过了 DNS、CDN、PoP、骨干网、边界路由、ECMP、eBPF 四层 LB、七层 LB、容器 overlay 网络——每一层都在解决一个特定的问题，每一层的设计都受限于物理定律（光速、带宽、缓冲区大小）。</p>
+
+            <h3>总结</h3>
+
+            <p>几个值得记住的关键直觉：</p>
+
+            <ul>
+                <li><strong>Clos + ECMP</strong>：用便宜的小交换机组合成大网络，通过哈希均匀分发流量。DC 网络的物理基础</li>
+                <li><strong>Katran + DSR</strong>：eBPF 在网卡层做负载均衡，响应绕过 LB 直接回用户。解决了传统 LB 的带宽瓶颈和单点故障</li>
+                <li><strong>DC RTT 比公网低 1000 倍</strong>：这个数量级差异改变了所有假设。公网的 TCP 拥塞控制、连接管理、安全模型在 DC 内部都不适用，需要专门的方案（DCTCP、RDMA、Zero Trust）</li>
+                <li><strong>Overlay 网络是胶水</strong>：容器的虚拟 IP 通过 VXLAN/BGP 映射到物理网络。理解这层封装/解封装，就理解了为什么跨主机容器通信比同主机慢</li>
+                <li><strong>Oversubscription 决定了服务部署策略</strong>：频繁通信的服务放同一个机架或 Pod，不是"优化"，而是避免超卖瓶颈的必要措施</li>
+            </ul>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../js/toc.js"></script>
+</body>
+</html>
