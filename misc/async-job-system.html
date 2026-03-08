@@ -32,11 +32,29 @@
                 <figcaption>Gerhard Emmoser,《天球仪》, c. 1579 — 精密的齿轮机构驱动天体运行，如同调度系统驱动任务的准时执行</figcaption>
             </figure>
 
-            <h3>背景</h3>
+            <h3>为什么每家公司都在造异步任务轮子</h3>
+
+            <p>几乎每个达到一定规模的后端系统都会遇到同一个问题：有些事情不能在用户请求里同步做完。</p>
+
+            <p>用户下单后，你需要在 30 分钟后检查是否付款、没付就取消。用户注册后，你需要异步发一封欢迎邮件。每天凌晨，你需要跑一次对账。每小时，你需要同步一次外部数据。这些"稍后再做"的事情，就是异步任务。</p>
+
+            <p>问题在于，"稍后再做"听起来简单，做起来一点都不简单：</p>
+
+            <ul>
+                <li><strong>可靠性</strong>：服务重启了，任务还在吗？网络抖动了，任务会丢吗？</li>
+                <li><strong>延迟控制</strong>："30 分钟后执行"——谁来计时？精度多少？</li>
+                <li><strong>并发控制</strong>：10 个实例同时运行，怎么保证同一个任务不会被执行两次？</li>
+                <li><strong>失败处理</strong>：任务执行失败了，重试几次？重试间隔多久？重试到什么时候放弃？</li>
+                <li><strong>可观测性</strong>：现在有多少任务在排队？平均延迟多少？哪些任务失败了？</li>
+            </ul>
+
+            <p>这就是为什么 Celery、Sidekiq、Bull、Temporal 这些项目存在——它们解决的都是同一个问题。但在大公司里，通用方案往往不够用：你需要和内部 RPC 框架集成、需要适配公司的部署平台、需要和已有的监控体系打通。所以几乎每家有一定规模的公司都会自己造一个。</p>
+
+            <h3>Shopee 的情况</h3>
 
             <p>2019 年我加入 Shopee 的平台团队，负责面向业务开发团队的中间件服务。当时各业务线都有自己的"异步任务"方案——有人用 crontab + 脚本，有人写个死循环轮询数据库，有人直接在业务代码里起 goroutine 然后祈祷它不会丢。</p>
 
-            <p>问题显而易见：没有统一的任务管理、没有监控、没有重试、任务丢了没人知道。平台团队决定从零构建一套分布式异步任务队列系统，提供标准化的异步任务能力。</p>
+            <p>问题显而易见：没有统一的任务管理、没有监控、没有重试、任务丢了没人知道。更要命的是，每个团队都在重复踩同样的坑——重试没做幂等导致重复扣款，crontab 机器挂了没人发现导致对账断了一周。平台团队决定从零构建一套分布式异步任务队列系统，提供标准化的异步任务能力。</p>
 
             <p>这篇文章记录这个系统从设计到落地的完整过程。三年间它从 0 做到 10+ 业务接入、QPS 从 2K 增长到 25K+、双十一峰值 50K。</p>
 
@@ -82,37 +100,63 @@
 
             <h3>系统架构</h3>
 
-<pre><code>                    ┌─────────────────────────────────────┐
-                    │            业务服务                    │
-                    │   (Go SDK / Python SDK)               │
-                    └──────────┬──────────────────────────┘
-                               │ 提交任务 (RPC)
+<pre class="diagram"><code>
+  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+  │  Order Svc   │   │  Payment Svc │   │  Report Svc  │    业务服务
+  │  (Go SDK)    │   │  (Go SDK)    │   │ (Python SDK) │
+  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+         │                  │                   │
+         └──────────────────┼───────────────────┘
+                            │ Submit (RPC)
+                            ▼
+               ┌───────────────────────────┐
+               │        API Server         │
+               │  ┌─────────┐ ┌─────────┐ │
+               │  │ 参数校验 │ │延迟路由  │ │
+               │  └─────────┘ └─────────┘ │
+               └─────┬─────────────┬───────┘
+                     │             │
+        delay ≤ 10m  │             │  delay > 10m / Cron
+                     ▼             ▼
+            ┌──────────────┐ ┌──────────────┐
+            │    Kafka     │ │    MySQL     │
+            │              │ │              │
+            │ topic-order  │ │ async_tasks  │    持久化层
+            │ topic-pay    │ │ cron_registry│
+            │ topic-report │ │              │
+            └──────┬───────┘ └──────┬───────┘
+                   │                │
+                   ▼                ▼
+            ┌─────────────────────────────────────────┐
+            │            Dispatcher (N 实例)            │
+            │                                          │
+            │  ┌────────────┐  ┌───────────────────┐  │
+            │  │   Kafka    │  │   MySQL Poller     │  │
+            │  │  Consumer  │  │   (秒级扫描)        │  │
+            │  └─────┬──────┘  └────────┬──────────┘  │
+            │        │                  │              │
+            │        ▼                  ▼              │
+            │  ┌──────────────────────────────────┐   │
+            │  │    ETA Priority Queue (Heap)      │   │    调度层
+            │  │    按触发时间排序，到期即 dispatch   │   │
+            │  └───────────────┬──────────────────┘   │
+            │                  │                       │
+            └──────────────────┼───────────────────────┘
+                               │ Dispatch (RPC)
                                ▼
-                    ┌─────────────────────────────────────┐
-                    │          API Server                   │
-                    │   - 任务接收 & 参数校验                │
-                    │   - 延迟计算 & 路由                    │
-                    └──────┬────────────┬─────────────────┘
-                           │            │
-              短延迟/即时    │            │  长延迟/Cron
-                           ▼            ▼
-                    ┌────────────┐  ┌────────────────────┐
-                    │   Kafka    │  │      MySQL          │
-                    │  (消息队列) │  │  (延迟任务存储)      │
-                    └─────┬──────┘  └──────┬─────────────┘
-                          │                │
-                          ▼                ▼
-                    ┌─────────────────────────────────────┐
-                    │          Dispatcher                   │
-                    │   - Kafka Consumer                    │
-                    │   - MySQL Poller (秒级扫描)            │
-                    │   - Cron Scheduler                    │
-                    └──────────────┬──────────────────────┘
-                                   │ 触发执行 (RPC)
-                                   ▼
-                    ┌─────────────────────────────────────┐
-                    │          业务服务 (执行器)             │
-                    └─────────────────────────────────────┘</code></pre>
+            ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+            │  Order Svc   │ │ Payment Svc  │ │  Report Svc  │    执行器
+            │  (Executor)  │ │  (Executor)  │ │  (Executor)  │
+            └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+                   │                │                 │
+                   └────────────────┼─────────────────┘
+                                    │ 结果回调 (RPC)
+                                    ▼
+            ┌─────────────────────────────────────────┐
+            │           Prometheus + Grafana           │    可观测性
+            │  延迟 · 吞吐 · 成功率 · 队列深度 · 重试   │
+            └─────────────────────────────────────────┘
+</code></pre>
 
             <h3>为什么是 Kafka + MySQL，而不是纯 Kafka 或纯 Redis</h3>
 
@@ -125,44 +169,94 @@
             <p><strong>最终方案</strong>：Kafka 处理即时和短延迟任务（≤ 10 分钟），MySQL 处理长延迟和 Cron 任务。</p>
 
             <ul>
-                <li><strong>Kafka</strong>：吞吐量高，天然支持消费者组和 partition 级并行。短延迟通过消费端 sleep 或 timer wheel 实现。</li>
+                <li><strong>Kafka</strong>：吞吐量高，天然支持消费者组和 partition 级并行。短延迟任务消费后放入内存中的 ETA 优先队列（最小堆），到期后触发执行。</li>
                 <li><strong>MySQL</strong>：ACID 保证任务不丢。长延迟任务写入时带上触发时间，Dispatcher 每秒扫描到期任务。Cron 任务由 Scheduler 提前计算下一次触发时间写入。</li>
             </ul>
 
-            <h3>短延迟任务：Timer Wheel</h3>
+            <h3>短延迟任务：ETA Priority Queue</h3>
 
-            <p>短延迟任务从 Kafka 消费后，不是直接 sleep 等待，而是放入一个 Hierarchical Timer Wheel：</p>
+            <p>短延迟任务从 Kafka 消费后，不是直接 sleep 等待，而是放入一个基于最小堆的优先队列，按 ETA（Expected Time of Arrival，预期触发时间）排序：</p>
 
-<pre><code>// 简化版 timer wheel
-type TimerWheel struct {
-    tick     time.Duration       // 最小精度，如 100ms
-    slots    int                 // 每层槽位数，如 256
-    wheels   [][]*list.List      // 多层时间轮
-    current  []int               // 每层当前指针
+<pre><code>// ETA Priority Queue —— 基于 container/heap
+type Task struct {
+    ID        string
+    Type      string
+    Payload   string
+    ETA       time.Time  // 预期触发时间
+    Priority  int        // 业务优先级（用于同 ETA 的 tiebreak）
+    index     int        // heap 内部索引
 }
 
-func (tw *TimerWheel) Add(task *Task, delay time.Duration) {
-    ticks := int(delay / tw.tick)
-    level := 0
-    for ticks >= tw.slots {
-        ticks /= tw.slots
-        level++
+type ETAQueue []*Task
+
+func (q ETAQueue) Len() int { return len(q) }
+func (q ETAQueue) Less(i, j int) bool {
+    if q[i].ETA.Equal(q[j].ETA) {
+        return q[i].Priority > q[j].Priority  // 同 ETA，高优先级先出
     }
-    slot := (tw.current[level] + ticks) % tw.slots
-    tw.wheels[level][slot].PushBack(task)
+    return q[i].ETA.Before(q[j].ETA)
 }
-
-func (tw *TimerWheel) Tick() []*Task {
-    // 推进最低层指针，到期任务弹出执行
-    // 高层到期时，任务降级到低层（cascade）
+func (q ETAQueue) Swap(i, j int) {
+    q[i], q[j] = q[j], q[i]
+    q[i].index = i
+    q[j].index = j
+}
+func (q *ETAQueue) Push(x any) {
+    t := x.(*Task)
+    t.index = len(*q)
+    *q = append(*q, t)
+}
+func (q *ETAQueue) Pop() any {
+    old := *q
+    n := len(old)
+    t := old[n-1]
+    old[n-1] = nil
+    t.index = -1
+    *q = old[:n-1]
+    return t
 }</code></pre>
 
-            <p>Timer Wheel 的优势：</p>
+            <p>Dispatcher 的调度循环：</p>
+
+<pre><code>func (d *Dispatcher) Run() {
+    pq := &ETAQueue{}
+    heap.Init(pq)
+
+    for {
+        // 1. 从 Kafka 消费新任务，推入堆
+        for _, task := range d.consumeBatch() {
+            heap.Push(pq, task)
+        }
+
+        // 2. 弹出所有已到期的任务
+        now := time.Now()
+        for pq.Len() > 0 && (*pq)[0].ETA.Before(now) {
+            task := heap.Pop(pq).(*Task)
+            go d.dispatch(task)  // 异步执行
+        }
+
+        // 3. 计算下次唤醒时间：堆顶的 ETA 或兜底 100ms
+        var sleepUntil time.Duration
+        if pq.Len() > 0 {
+            sleepUntil = time.Until((*pq)[0].ETA)
+            if sleepUntil < 0 {
+                sleepUntil = 0
+            }
+        } else {
+            sleepUntil = 100 * time.Millisecond
+        }
+        time.Sleep(sleepUntil)
+    }
+}</code></pre>
+
+            <p>为什么选堆而不是 Timer Wheel：</p>
 
             <ul>
-                <li>O(1) 的添加和删除（对比 <code>time.AfterFunc</code> 的堆结构 O(log n)）</li>
-                <li>内存占用可控——不需要为每个任务创建一个 goroutine 或 timer</li>
-                <li>精度够用——100ms 的 tick 对秒级延迟场景绰绰有余</li>
+                <li><strong>语义直观</strong>：每个任务有一个 ETA，堆顶永远是最近要触发的任务。代码逻辑清晰，不需要理解 cascade、tick 这些概念。</li>
+                <li><strong>精度灵活</strong>：Timer Wheel 的精度受限于 tick 粒度（比如 100ms 一格），堆没有这个限制——ETA 精确到纳秒。</li>
+                <li><strong>天然支持优先级</strong>：<code>Less</code> 函数里可以同时比较 ETA 和业务优先级。同一秒内到期的任务，高优先级的先执行。</li>
+                <li><strong>O(log n) 够用</strong>：堆的插入和弹出是 O(log n)，对于我们的场景（堆内通常几千到几万个任务），性能完全不是瓶颈。Timer Wheel 的 O(1) 优势只在百万级任务时才体现。</li>
+                <li><strong>Go 标准库自带</strong>：<code>container/heap</code> 已经提供了完整的接口，不需要引入额外依赖。</li>
             </ul>
 
             <h3>长延迟任务：MySQL Poller</h3>
