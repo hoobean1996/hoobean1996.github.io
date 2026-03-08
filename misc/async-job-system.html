@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>从零构建分布式异步任务队列：在 Shopee 的实战经验 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../linux/">Linux</a></li>
+                <li><a href="../cpp/">C++</a></li>
+                <li><a href="./">Misc</a></li>
+                <li><a href="https://github.com/hoobean1996">GitHub</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>从零构建分布式异步任务队列：在 Shopee 的实战经验</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../images/emmoser-celestial-globe.jpg" alt="Celestial Globe with Clockwork by Gerhard Emmoser">
+                <figcaption>Gerhard Emmoser,《天球仪》, c. 1579 — 精密的齿轮机构驱动天体运行，如同调度系统驱动任务的准时执行</figcaption>
+            </figure>
+
+            <h3>背景</h3>
+
+            <p>2019 年我加入 Shopee 的平台团队，负责面向业务开发团队的中间件服务。当时各业务线都有自己的"异步任务"方案——有人用 crontab + 脚本，有人写个死循环轮询数据库，有人直接在业务代码里起 goroutine 然后祈祷它不会丢。</p>
+
+            <p>问题显而易见：没有统一的任务管理、没有监控、没有重试、任务丢了没人知道。平台团队决定从零构建一套分布式异步任务队列系统，提供标准化的异步任务能力。</p>
+
+            <p>这篇文章记录这个系统从设计到落地的完整过程。三年间它从 0 做到 10+ 业务接入、QPS 从 2K 增长到 25K+、双十一峰值 50K。</p>
+
+            <h3>需求分析</h3>
+
+            <p>和各业务团队聊下来，异步任务的需求大致分三类：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>类型</th>
+                        <th>场景举例</th>
+                        <th>延迟要求</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>短延迟任务</td>
+                        <td>订单超时取消、优惠券过期、消息推送</td>
+                        <td>秒级～分钟级</td>
+                    </tr>
+                    <tr>
+                        <td>长延迟任务</td>
+                        <td>T+1 对账、周报生成、数据归档</td>
+                        <td>小时级～天级</td>
+                    </tr>
+                    <tr>
+                        <td>Cron 定时任务</td>
+                        <td>每日凌晨跑批、每小时数据同步、心跳检测</td>
+                        <td>按 cron 表达式</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>除了功能需求，还有几个硬性约束：</p>
+
+            <ul>
+                <li><strong>至少一次投递</strong>：任务可以重复执行（业务做幂等），但绝对不能丢</li>
+                <li><strong>多语言支持</strong>：业务团队用 Go 和 Python，必须提供两种 SDK</li>
+                <li><strong>和内部 RPC 平台集成</strong>：任务触发通过公司内部的 RPC 框架调用业务服务，不能引入额外的网络协议</li>
+                <li><strong>可观测性</strong>：每个任务的状态、耗时、重试次数都要能查到</li>
+            </ul>
+
+            <h3>系统架构</h3>
+
+<pre><code>                    ┌─────────────────────────────────────┐
+                    │            业务服务                    │
+                    │   (Go SDK / Python SDK)               │
+                    └──────────┬──────────────────────────┘
+                               │ 提交任务 (RPC)
+                               ▼
+                    ┌─────────────────────────────────────┐
+                    │          API Server                   │
+                    │   - 任务接收 & 参数校验                │
+                    │   - 延迟计算 & 路由                    │
+                    └──────┬────────────┬─────────────────┘
+                           │            │
+              短延迟/即时    │            │  长延迟/Cron
+                           ▼            ▼
+                    ┌────────────┐  ┌────────────────────┐
+                    │   Kafka    │  │      MySQL          │
+                    │  (消息队列) │  │  (延迟任务存储)      │
+                    └─────┬──────┘  └──────┬─────────────┘
+                          │                │
+                          ▼                ▼
+                    ┌─────────────────────────────────────┐
+                    │          Dispatcher                   │
+                    │   - Kafka Consumer                    │
+                    │   - MySQL Poller (秒级扫描)            │
+                    │   - Cron Scheduler                    │
+                    └──────────────┬──────────────────────┘
+                                   │ 触发执行 (RPC)
+                                   ▼
+                    ┌─────────────────────────────────────┐
+                    │          业务服务 (执行器)             │
+                    └─────────────────────────────────────┘</code></pre>
+
+            <h3>为什么是 Kafka + MySQL，而不是纯 Kafka 或纯 Redis</h3>
+
+            <p>这是设计阶段讨论最多的决策。</p>
+
+            <p><strong>纯 Kafka 方案</strong>的问题：Kafka 不支持任意延迟投递。虽然可以用多个 topic 模拟不同延迟级别（1s/5s/30s/1min/...），但粒度太粗，且 topic 数量爆炸。对于"3 天后触发"这种长延迟，Kafka 完全不合适——消息堆积在 broker 上，浪费资源且 rebalance 时有风险。</p>
+
+            <p><strong>纯 Redis 方案</strong>（Sorted Set + ZRANGEBYSCORE）：延迟任务用 score 存触发时间，定时扫描到期任务。问题是 Redis 的持久化不够可靠——RDB 有时间窗口，AOF 在高 QPS 下性能下降。对于"至少一次投递"的硬性要求，Redis 作为唯一存储太冒险。</p>
+
+            <p><strong>最终方案</strong>：Kafka 处理即时和短延迟任务（≤ 10 分钟），MySQL 处理长延迟和 Cron 任务。</p>
+
+            <ul>
+                <li><strong>Kafka</strong>：吞吐量高，天然支持消费者组和 partition 级并行。短延迟通过消费端 sleep 或 timer wheel 实现。</li>
+                <li><strong>MySQL</strong>：ACID 保证任务不丢。长延迟任务写入时带上触发时间，Dispatcher 每秒扫描到期任务。Cron 任务由 Scheduler 提前计算下一次触发时间写入。</li>
+            </ul>
+
+            <h3>短延迟任务：Timer Wheel</h3>
+
+            <p>短延迟任务从 Kafka 消费后，不是直接 sleep 等待，而是放入一个 Hierarchical Timer Wheel：</p>
+
+<pre><code>// 简化版 timer wheel
+type TimerWheel struct {
+    tick     time.Duration       // 最小精度，如 100ms
+    slots    int                 // 每层槽位数，如 256
+    wheels   [][]*list.List      // 多层时间轮
+    current  []int               // 每层当前指针
+}
+
+func (tw *TimerWheel) Add(task *Task, delay time.Duration) {
+    ticks := int(delay / tw.tick)
+    level := 0
+    for ticks >= tw.slots {
+        ticks /= tw.slots
+        level++
+    }
+    slot := (tw.current[level] + ticks) % tw.slots
+    tw.wheels[level][slot].PushBack(task)
+}
+
+func (tw *TimerWheel) Tick() []*Task {
+    // 推进最低层指针，到期任务弹出执行
+    // 高层到期时，任务降级到低层（cascade）
+}</code></pre>
+
+            <p>Timer Wheel 的优势：</p>
+
+            <ul>
+                <li>O(1) 的添加和删除（对比 <code>time.AfterFunc</code> 的堆结构 O(log n)）</li>
+                <li>内存占用可控——不需要为每个任务创建一个 goroutine 或 timer</li>
+                <li>精度够用——100ms 的 tick 对秒级延迟场景绰绰有余</li>
+            </ul>
+
+            <h3>长延迟任务：MySQL Poller</h3>
+
+            <p>长延迟任务存在 MySQL 里，核心表结构：</p>
+
+<pre><code>CREATE TABLE async_tasks (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_type   VARCHAR(128) NOT NULL,
+    payload     TEXT NOT NULL,
+    trigger_at  DATETIME NOT NULL,    -- 触发时间
+    status      TINYINT DEFAULT 0,    -- 0=pending, 1=dispatched, 2=success, 3=failed
+    retry_count INT DEFAULT 0,
+    max_retries INT DEFAULT 3,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_trigger (status, trigger_at)
+);</code></pre>
+
+            <p>Dispatcher 的 poller 每秒执行：</p>
+
+<pre><code>SELECT id, task_type, payload
+FROM async_tasks
+WHERE status = 0 AND trigger_at &lt;= NOW()
+ORDER BY trigger_at
+LIMIT 1000
+FOR UPDATE SKIP LOCKED;</code></pre>
+
+            <p><code>FOR UPDATE SKIP LOCKED</code> 是关键——多个 Dispatcher 实例并行扫描时，已经被其他实例锁住的行会被跳过，避免了分布式锁的复杂性。这是 MySQL 8.0 引入的特性，完美适合这个场景。</p>
+
+            <p>扫描到的任务立即更新状态为 <code>dispatched</code>，然后通过 RPC 调用业务服务的执行器。如果 RPC 失败或超时，任务状态回退为 <code>pending</code>，<code>retry_count</code> 加一，<code>trigger_at</code> 设为当前时间加上退避延迟（指数退避 + 抖动）。</p>
+
+            <h3>Cron 定时任务</h3>
+
+            <p>Cron 任务的实现分两层：</p>
+
+            <ol>
+                <li><strong>Cron Scheduler</strong>：解析 cron 表达式，计算下一次触发时间，写入 MySQL 的 <code>async_tasks</code> 表。本质上是把 Cron 任务转化为长延迟任务。</li>
+                <li><strong>Cron Registry</strong>：存储 cron 规则的元信息（cron 表达式、关联的 task_type、负责人等）。</li>
+            </ol>
+
+<pre><code>// Cron Scheduler 核心循环
+func (s *CronScheduler) Run() {
+    for {
+        rules := s.loadActiveRules()  // 从 cron_registry 加载
+        for _, rule := range rules {
+            next := rule.NextTriggerTime()
+            if !s.taskExistsForTime(rule.TaskType, next) {
+                s.createTask(rule.TaskType, rule.Payload, next)
+            }
+        }
+        time.Sleep(10 * time.Second)  // 每 10 秒检查一次
+    }
+}</code></pre>
+
+            <p>这个设计的好处是 Cron Scheduler 是无状态的——它只负责"确保下一次触发的任务存在于 MySQL 中"。即使 Scheduler 挂了重启，也不会丢任务，因为它是幂等的（检查是否已存在再创建）。</p>
+
+            <h3>SDK 设计</h3>
+
+            <p>Go SDK 和 Python SDK 是业务团队直接使用的接口。设计原则：尽可能简单，隐藏底层复杂性。</p>
+
+<pre><code>// Go SDK - 提交任务
+client := asyncd.NewClient(asyncd.WithServiceName("order-service"))
+
+// 即时任务
+err := client.Submit(ctx, &asyncd.Task{
+    Type:    "cancel_expired_order",
+    Payload: `{"order_id": 12345}`,
+})
+
+// 延迟任务
+err := client.SubmitDelayed(ctx, &asyncd.Task{
+    Type:    "send_review_reminder",
+    Payload: `{"user_id": 67890}`,
+}, 3 * 24 * time.Hour)  // 3 天后
+
+// 注册执行器
+client.RegisterExecutor("cancel_expired_order", func(ctx context.Context, payload string) error {
+    var req CancelOrderRequest
+    json.Unmarshal([]byte(payload), &req)
+    return orderService.Cancel(ctx, req.OrderID)
+})</code></pre>
+
+            <p>SDK 内部做了几件事：</p>
+
+            <ul>
+                <li><strong>序列化</strong>：payload 统一用 JSON 字符串，避免跨语言的序列化兼容问题</li>
+                <li><strong>RPC 集成</strong>：通过公司内部 RPC 框架注册服务，Dispatcher 调用执行器时走标准 RPC 链路（服务发现、负载均衡、超时控制都由框架处理）</li>
+                <li><strong>幂等提示</strong>：SDK 文档和 code review 时反复强调——执行器必须是幂等的，因为"至少一次投递"意味着同一个任务可能被执行多次</li>
+            </ul>
+
+            <h3>Kubernetes Operator</h3>
+
+            <p>系统部署在 Kubernetes 上。一开始用标准的 Deployment + ConfigMap，但运维痛点很快暴露：</p>
+
+            <ul>
+                <li>新业务接入需要手动创建 Kafka topic、更新路由配置、调整 consumer 数量</li>
+                <li>Dispatcher 的 partition 分配和 MySQL poller 的并发度需要根据 QPS 动态调整</li>
+                <li>Cron 规则的变更需要重启 Scheduler</li>
+            </ul>
+
+            <p>于是我们开发了一个 Custom Operator，引入了 CRD：</p>
+
+<pre><code>apiVersion: asyncd.shopee.io/v1
+kind: AsyncJobConfig
+metadata:
+  name: order-cancel-job
+spec:
+  taskType: cancel_expired_order
+  executor:
+    service: order-service
+    method: CancelExpiredOrder
+    timeout: 30s
+  retry:
+    maxRetries: 3
+    backoff: exponential
+  kafka:
+    topic: asyncd-order-cancel
+    partitions: 6
+    consumerGroup: asyncd-order-cancel-cg</code></pre>
+
+            <p>Operator 监听 CRD 的变更，自动完成：</p>
+
+            <ul>
+                <li>创建/更新 Kafka topic 和 consumer group</li>
+                <li>更新 Dispatcher 的路由表（通过 ConfigMap 热更新）</li>
+                <li>根据 QPS 指标自动调整 consumer 副本数（HPA 联动）</li>
+            </ul>
+
+            <p>这大幅降低了业务接入的门槛——从"提工单找平台团队配置"变成"提交一个 YAML"。</p>
+
+            <h3>监控与告警</h3>
+
+            <p>每个环节都暴露了 Prometheus metrics：</p>
+
+<pre><code>// 任务提交
+asyncd_task_submitted_total{task_type, source_service}
+asyncd_task_submit_latency_seconds{task_type}
+
+// 任务调度
+asyncd_task_dispatched_total{task_type}
+asyncd_task_dispatch_delay_seconds{task_type}  // 实际触发时间 - 预期触发时间
+
+// 任务执行
+asyncd_task_executed_total{task_type, status}   // status: success/failed/timeout
+asyncd_task_execution_duration_seconds{task_type}
+asyncd_task_retry_total{task_type}
+
+// 队列健康
+asyncd_kafka_consumer_lag{topic, partition}
+asyncd_mysql_pending_tasks{task_type}
+asyncd_mysql_poll_duration_seconds</code></pre>
+
+            <p>最关键的告警规则：</p>
+
+            <ul>
+                <li><strong>dispatch_delay > 5s</strong>：任务调度延迟超过 5 秒，说明消费能力不足或 MySQL poller 卡住了</li>
+                <li><strong>kafka_consumer_lag 持续增长</strong>：消费者跟不上生产者，需要扩容</li>
+                <li><strong>mysql_pending_tasks 持续增长</strong>：到期任务堆积，poller 可能有问题</li>
+                <li><strong>task retry 率 > 10%</strong>：下游服务可能出了问题</li>
+            </ul>
+
+            <h3>双十一：从 25K 到 50K QPS</h3>
+
+            <p>2021 年双十一是这个系统最大的考验。日常 QPS 在 25K 左右，预估峰值需要支撑 50K+。</p>
+
+            <p>提前做了几件事：</p>
+
+            <ul>
+                <li><strong>Kafka partition 扩容</strong>：核心 topic 从 12 partition 扩到 24，consumer 相应扩容</li>
+                <li><strong>MySQL 读写分离</strong>：poller 查询走从库，状态更新走主库，避免扫描查询影响写入</li>
+                <li><strong>批量提交优化</strong>：SDK 增加了 <code>SubmitBatch</code> 接口，单次 RPC 提交多个任务，减少网络 round trip</li>
+                <li><strong>预热</strong>：双十一前一天，提前创建好所有 Cron 任务的下一次触发记录，避免零点的写入尖峰</li>
+            </ul>
+
+            <p>实际峰值达到了约 48K QPS，系统扛住了，没有任务丢失。核心指标：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>指标</th>
+                        <th>日常</th>
+                        <th>双十一峰值</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>QPS</td>
+                        <td>~25K</td>
+                        <td>~48K</td>
+                    </tr>
+                    <tr>
+                        <td>P99 调度延迟</td>
+                        <td>180ms</td>
+                        <td>520ms</td>
+                    </tr>
+                    <tr>
+                        <td>任务丢失</td>
+                        <td>0</td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td>重试率</td>
+                        <td>0.3%</td>
+                        <td>1.2%</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>踩过的坑</h3>
+
+            <h3>1. MySQL 的 datetime 精度</h3>
+
+            <p>MySQL 的 <code>DATETIME</code> 默认精度是秒。当多个任务的 <code>trigger_at</code> 在同一秒内，<code>ORDER BY trigger_at</code> 的顺序不确定。对于秒级延迟任务，这导致了任务被乱序执行。解决方案：改用 <code>DATETIME(3)</code>（毫秒精度），并在 <code>ORDER BY</code> 中加上 <code>id</code> 作为 tiebreaker。</p>
+
+            <h3>2. Kafka rebalance 风暴</h3>
+
+            <p>早期 consumer 没有设置合理的 <code>session.timeout.ms</code> 和 <code>heartbeat.interval.ms</code>，业务执行器偶尔的慢请求导致 consumer 被认为挂了，触发 rebalance，rebalance 期间所有 consumer 停止消费，导致延迟飙升。最终调整为 <code>session.timeout=30s</code>、<code>heartbeat.interval=10s</code>、<code>max.poll.interval=5min</code>，同时执行器调用改为异步——消费消息后立即 commit，执行结果通过回调上报。</p>
+
+            <h3>3. Poller 的惊群效应</h3>
+
+            <p>多个 Dispatcher 实例同时扫描 MySQL，虽然 <code>FOR UPDATE SKIP LOCKED</code> 避免了重复执行，但大量的锁竞争导致 MySQL CPU 飙高。解决方案：每个 Dispatcher 实例负责特定的 <code>task_type</code> 范围（通过一致性哈希分配），避免所有实例扫描同一批数据。</p>
+
+            <h3>4. 时区问题</h3>
+
+            <p>Shopee 业务覆盖东南亚多个国家，各国时区不同。Cron 表达式 <code>0 0 * * *</code>（每天零点）到底是哪个零点？最终方案：所有内部时间统一用 UTC 存储和计算，Cron 规则必须显式指定时区 <code>CRON_TZ=Asia/Singapore 0 0 * * *</code>。SDK 会校验 cron 表达式中是否包含时区信息，没有的话直接拒绝。</p>
+
+            <h3>5. 幂等性的推广困难</h3>
+
+            <p>技术上最简单但推广最难的问题。"至少一次投递"要求业务执行器必须幂等，但很多业务开发者不理解或者不重视。上线后出过几次"重复扣款"、"重复发券"的事故，都是因为执行器没做幂等。最终在 SDK 层面强制要求传入一个 <code>idempotency_key</code>，并提供了一个基于 Redis 的去重 helper，从工具层面降低了出错概率。</p>
+
+            <h3>回顾与反思</h3>
+
+            <p>这个系统从 2019 年中开始设计，到 2020 年初第一个业务接入，到 2021 年双十一扛住 50K QPS。三年间的几个感悟：</p>
+
+            <ul>
+                <li><strong>存储选型决定了系统的天花板</strong>：Kafka + MySQL 的组合虽然不性感，但胜在成熟可靠。在中间件系统里，"不丢数据"比"低延迟"重要得多。如果重新做一次，我可能会更早引入 Redis 作为短延迟任务的缓冲层，进一步降低 Kafka 的 consumer lag。</li>
+                <li><strong>SDK 的易用性决定了系统的推广速度</strong>：再好的系统，如果 SDK 用起来很麻烦，业务团队就不会用。花在 SDK 设计上的时间永远不亏。</li>
+                <li><strong>Kubernetes Operator 是中间件团队的杠杆</strong>：把运维操作编码为 CRD + Controller，业务团队自助接入，平台团队不再是瓶颈。这个模式后来被其他中间件（配置中心、消息队列）复用。</li>
+                <li><strong>监控不是事后补的，是第一天就要有的</strong>：系统上线第一天就有完整的 Prometheus + Grafana dashboard。早期很多问题都是通过 metrics 提前发现的，而不是等业务报障。</li>
+                <li><strong>幂等性是一个社会问题，不是技术问题</strong>：你可以提供工具，但最终需要业务开发者理解并重视。文档、培训、code review、事故复盘，缺一不可。</li>
+            </ul>
+
+            <h3>如果重新做一次</h3>
+
+            <p>几件会做不同的事：</p>
+
+            <ul>
+                <li><strong>用 Redis Streams 替代部分 Kafka 场景</strong>：对于延迟 < 1 分钟的任务，Redis Streams 的延迟更低，且支持 consumer group。省去了 Kafka 的运维成本。</li>
+                <li><strong>引入死信队列</strong>：重试耗尽的任务应该进入死信队列而不是标记为 failed 就完了。当时缺少这个机制，导致一些失败任务被遗忘。</li>
+                <li><strong>任务优先级</strong>：早期设计没有考虑优先级，所有任务平等调度。后来发现"订单取消"和"统计报表"共享队列时，报表任务的堆积会影响订单任务的延迟。应该一开始就支持优先级队列。</li>
+                <li><strong>更好的任务编排</strong>：业务经常需要"任务 A 完成后触发任务 B"。当时是业务自己在执行器里手动提交下一个任务，很容易出错。应该提供 DAG 式的任务编排能力。</li>
+            </ul>
+
+            <p>不过话说回来，这些都是事后诸葛亮。在当时的资源和时间约束下，Kafka + MySQL 的方案已经足够好了。工程的核心不是做出完美的系统，而是在约束条件下做出够用的系统，然后持续迭代。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+</body>
+</html>
