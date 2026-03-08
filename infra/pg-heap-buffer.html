@@ -163,6 +163,68 @@
 
             <p>这个间接层让 VACUUM 可以自由移动 Tuple 的物理位置，只要更新对应的 ItemId 就行，不需要修改任何索引。</p>
 
+            <h4>TID、ItemId、Tuple：三者的关系</h4>
+
+            <p>这三个概念经常被混淆，我们把它们的关系彻底理清。一句话总结：<strong>TID 是地址，ItemId 是门牌号到房间号的映射表，Tuple 是房间里的人</strong>。</p>
+
+            <table>
+                <thead>
+                    <tr><th>概念</th><th>是什么</th><th>存在哪里</th><th>是否稳定</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>TID</strong></td><td>逻辑地址 (BlockNumber, OffsetNumber)</td><td>索引条目中、其他行的引用中</td><td>稳定——VACUUM 不会改变它</td></tr>
+                    <tr><td><strong>ItemId</strong></td><td>Page 内的间接指针 (offset, len, flags)</td><td>Page 头部之后的 ItemId 数组中</td><td>槽位号稳定，但内部的 offset 可以变</td></tr>
+                    <tr><td><strong>Tuple</strong></td><td>实际的行数据 (行头 + 用户数据)</td><td>Page 尾部的 Tuple 区域中</td><td>不稳定——VACUUM 整理后物理位置可以变</td></tr>
+                </tbody>
+            </table>
+
+            <p>关键洞察：TID 中的 OffsetNumber 不是字节偏移，而是 <strong>ItemId 数组的下标</strong>（从 1 开始）。真正的字节偏移藏在 ItemId 内部。这个间接层是整个设计的精髓。</p>
+
+<pre class="diagram"><code>  一次完整的行定位过程：
+
+  外部持有: TID = (5, 3)
+                   │  │
+                   │  └─ OffsetNumber = 3 (ItemId 数组的第 3 个槽位)
+                   └──── BlockNumber = 5  (第 5 个 Page)
+
+  步骤 1: 用 BlockNumber 找到 Page
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Page 5                                                       │
+  │                                                              │
+  │  步骤 2: 用 OffsetNumber 在 ItemId 数组中查找                  │
+  │                                                              │
+  │  ItemId[1]    ItemId[2]    ItemId[3]                         │
+  │  off:7100     off:6900     off:6700  ◄── 就是这个             │
+  │  len:120      len:80       len:150                           │
+  │  flags:NORM   flags:DEAD   flags:NORM                        │
+  │                               │                              │
+  │                               │ 步骤 3: 用 offset 跳到 Tuple  │
+  │                               ▼                              │
+  │                    ┌──────────────────────┐                  │
+  │  偏移 6700 处 ──►  │ HeapTupleHeader      │                  │
+  │                    │  t_xmin = 100        │                  │
+  │                    │  t_xmax = 0          │                  │
+  │                    │  t_ctid = (5, 3)     │  ← 指向自己=最新版│
+  │                    ├──────────────────────┤                  │
+  │                    │ 用户数据              │                  │
+  │                    │  id=42               │                  │
+  │                    │  name='Alice'        │                  │
+  │                    │  age=25              │                  │
+  │                    └──────────────────────┘                  │
+  │                    ◄──── 150 字节 ────►                      │
+  └─────────────────────────────────────────────────────────────┘</code></pre>
+
+            <p>理解了这三层关系，就能理解以下行为：</p>
+
+            <ul>
+                <li><strong>VACUUM 整理碎片</strong>：移动 Tuple 的物理位置（比如从偏移 6700 搬到 7000），只需更新 ItemId[3] 的 offset 字段。TID (5, 3) 不变，所有索引条目不需要修改</li>
+                <li><strong>DELETE 一行</strong>：不会立即删除 Tuple 数据，而是把 ItemId 的 flags 标记为 DEAD。空间在 VACUUM 时才真正回收</li>
+                <li><strong>HOT UPDATE</strong>：新旧版本都在同一个 Page 里，通过 Tuple 行头的 <code>t_ctid</code> 串成链。索引条目仍然指向旧版本的 TID，沿链遍历找到新版本</li>
+                <li><strong>索引扫描回表</strong>：索引给出 TID → 读 Page → 用 OffsetNumber 找到 ItemId → 用 ItemId 的 offset 找到 Tuple → 做 MVCC 可见性检查</li>
+            </ul>
+
+            <p>一个常见的误解是"TID 就是行的物理地址"。不是的——TID 是<strong>逻辑地址</strong>，中间隔了 ItemId 这层间接。正是这层间接，让 PG 可以在不修改任何外部引用的情况下移动行的物理位置。</p>
+
             <h4>HeapTupleHeader：行头</h4>
 
             <p>每个 Tuple 的前 23 字节是行头，记录了 MVCC 需要的所有信息：</p>
