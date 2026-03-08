@@ -201,6 +201,21 @@ footer {
     margin-bottom: 5px;
 }
 
+/* Value Proposition */
+.post-content .value-prop {
+    background: #f0f7ff;
+    border-left: 4px solid #0066cc;
+    padding: 16px 20px;
+    margin: 20px 0 30px;
+    font-size: 0.95rem;
+    line-height: 1.7;
+    color: #2c3e50;
+}
+
+.post-content .value-prop strong {
+    color: #0066cc;
+}
+
 /* Code Blocks */
 .post-content pre {
     background: #f6f8fa;
