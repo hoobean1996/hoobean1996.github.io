@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>神笔：在浏览器里造一门给小朋友的编程语言 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../linux/">Linux</a></li>
+                <li><a href="../cpp/">C++</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>神笔：在浏览器里造一门给小朋友的编程语言</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../images/children-playing-goldfish.jpg" alt="Two Children Playing with Goldfish, Metropolitan Museum of Art">
+                <figcaption>《两个孩子戏金鱼》— 孩子天生就在探索和互动中学习。少儿编程也应该如此——不是教语法，而是让孩子体会到"我写的东西能控制世界"的魔力</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：Scratch 很强大但对小朋友来说太复杂，Apple Swift Playgrounds 很优雅但和真实编程语言脱节。这篇文章分享一个不同的方案——在浏览器里从零实现一门中英双语的 Python-like 编程语言，包含完整的 Lexer → Parser → Compiler → VM 流水线、积木/代码双向同步、以及一个 World 抽象让同一套语言能驱动不同类型的游戏。如果你对"怎么造一门语言"或"怎么设计少儿编程产品"感兴趣，这里有完整的工程细节。
+            </blockquote>
+
+            <h3>为什么要自己造</h3>
+
+            <p>市面上的少儿编程工具大致分两类：</p>
+
+            <ul>
+                <li><strong>Scratch 类</strong>：纯积木拖拽，功能极其强大（事件系统、并发、消息广播），但对 5-8 岁的孩子来说概念太多。一个"让角色走到终点"的任务，Scratch 需要理解坐标系、事件循环、广播消息——这些不是编程的本质，是 Scratch 自身的复杂度</li>
+                <li><strong>Apple Swift Playgrounds 类</strong>：精美的 3D 界面，引导式教学，体验很好。但它教的是 Swift 语法，和孩子未来会用到的 Python/JavaScript 没有任何关系。学完 Playgrounds，转到其他语言还是要从头来</li>
+            </ul>
+
+            <p>我想要的是：</p>
+
+            <ol>
+                <li><strong>足够简单</strong>：5 岁的孩子看得懂积木，8 岁的孩子能读懂代码</li>
+                <li><strong>和真实语言接轨</strong>：语法和 Python 高度一致，学完可以无缝过渡到真正的 Python</li>
+                <li><strong>中英双语</strong>：<code>如果</code> 和 <code>if</code> 是同一个东西，孩子可以用中文入门，逐步切换到英文</li>
+                <li><strong>积木和代码双向切换</strong>：不是"积木生成代码"的单向关系，而是积木和代码可以随时互转</li>
+            </ol>
+
+            <p>找不到满足这些条件的工具，所以自己造了一个。叫<strong>神笔</strong>（Shenbi）——写代码像画画，画出来的东西能动。</p>
+
+            <h3>整体架构</h3>
+
+<pre><code>┌─────────────────────────────────────────────┐
+│                  用户界面                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
+│  │ 积木编辑器 │  │ 代码编辑器 │  │  游戏画布  │   │
+│  │ (Block)   │  │ (Code)   │  │ (Canvas) │   │
+│  └─────┬─────┘  └─────┬─────┘  └─────▲─────┘   │
+│        │    ↕ 双向同步   │              │        │
+│        └───────┬────────┘              │        │
+│                ▼                       │        │
+│  ┌──────────────────────┐              │        │
+│  │    MiniPython 语言     │              │        │
+│  │  Lexer → Parser →     │              │        │
+│  │  Compiler → IR        │              │        │
+│  └──────────┬───────────┘              │        │
+│             ▼                          │        │
+│  ┌──────────────────────┐              │        │
+│  │     栈式虚拟机 (VM)    │──────────────┘        │
+│  │  单步执行 / 断点 /     │                       │
+│  │  回退调试              │                       │
+│  └──────────┬───────────┘                       │
+│             ▼                                   │
+│  ┌──────────────────────┐                       │
+│  │    World (游戏世界)    │                       │
+│  │  MazeWorld / TurtleWorld / ...               │
+│  └──────────────────────┘                       │
+└─────────────────────────────────────────────────┘</code></pre>
+
+            <p>从下往上看：<strong>World</strong> 是游戏状态，<strong>VM</strong> 执行代码并操作 World，<strong>Canvas</strong> 渲染 World 的状态，<strong>积木/代码编辑器</strong> 是两种编辑 MiniPython 代码的方式。</p>
+
+            <h3>第一部分：造一门语言</h3>
+
+            <h4>Lexer：中英双语在这里实现</h4>
+
+            <p>中英双语的核心设计很简单：在 Lexer 层，中文关键字和英文关键字映射到同一个 Token 类型。Parser 和后续的所有阶段完全不知道用户写的是中文还是英文。</p>
+
+<pre><code>const KEYWORDS: Record&lt;string, TokenType&gt; = {
+  // 中英文映射到相同的 Token
+  '如果': 'IF',      'if': 'IF',
+  '否则如果': 'ELIF', 'elif': 'ELIF',
+  '否则': 'ELSE',    'else': 'ELSE',
+  '重复': 'REPEAT',  'repeat': 'REPEAT',
+  '次': 'TIMES',     'times': 'TIMES',
+  '当': 'WHILE',     'while': 'WHILE',
+  '对于': 'FOR',     'for': 'FOR',
+  '在': 'IN',        'in': 'IN',
+  '定义': 'DEF',     'def': 'DEF',
+  '返回': 'RETURN',  'return': 'RETURN',
+  '真': 'TRUE',      'True': 'TRUE',
+  '假': 'FALSE',     'False': 'FALSE',
+  '和': 'AND',       'and': 'AND',
+  '或': 'OR',        'or': 'OR',
+  '不': 'NOT',       'not': 'NOT',
+  '类': 'CLASS',     'class': 'CLASS',
+};</code></pre>
+
+            <p>标识符也支持中文字符（Unicode CJK 范围），所以变量名可以是中文：</p>
+
+<pre><code>// 这两段代码在 Lexer 之后完全等价
+重复 3 次:
+    前进()
+    左转()
+
+repeat 3 times:
+    forward()
+    turnLeft()</code></pre>
+
+            <p>Lexer 还需要处理 Python 风格的缩进——用 INDENT/DEDENT token 表示代码块的开始和结束，而不是花括号。这是整个 Lexer 里最复杂的部分。</p>
+
+            <h4>Parser → Compiler → IR</h4>
+
+            <p>Parser 是手写的递归下降，生成 AST。Compiler 做多趟编译：先收集函数和类的定义，再编译主体代码，最后编译函数体和类方法。输出是一组线性的栈式指令：</p>
+
+<pre><code>// IR 指令集（~35 个 opcode）
+type OpCode =
+  // 栈操作
+  | 'PUSH' | 'POP' | 'DUP'
+  // 变量
+  | 'LOAD' | 'STORE'
+  // 算术
+  | 'ADD' | 'SUB' | 'MUL' | 'DIV' | 'MOD' | 'NEG'
+  // 比较
+  | 'EQ' | 'NEQ' | 'LT' | 'GT' | 'LTE' | 'GTE'
+  // 控制流
+  | 'JUMP' | 'JUMP_IF' | 'JUMP_IF_NOT'
+  // 函数
+  | 'CALL' | 'CALL_USER' | 'RETURN'
+  // 数据结构
+  | 'ARRAY_CREATE' | 'ARRAY_GET' | 'ARRAY_SET'
+  | 'OBJECT_CREATE' | 'OBJECT_GET' | 'OBJECT_SET'
+  // 类
+  | 'CLASS_DEF' | 'NEW' | 'METHOD_CALL'
+  | 'HALT' | 'NOP';</code></pre>
+
+            <p>一个简单例子的编译结果：</p>
+
+<pre><code>// MiniPython 源码
+重复 3 次:
+    前进()
+
+// 编译后的 IR
+PUSH 0          // 循环计数器 = 0
+STORE $i        // 保存到变量
+PUSH 3          // 循环上限
+STORE $limit
+LOAD $i         // ← 循环开始
+LOAD $limit
+LT              // i < limit ?
+JUMP_IF_NOT end // 不满足则跳出
+CALL forward:0  // 调用 forward()，0 个参数
+POP             // 丢弃返回值
+LOAD $i
+PUSH 1
+ADD
+STORE $i        // i++
+JUMP loop       // 跳回循环开始
+HALT            // ← end</code></pre>
+
+            <h4>VM：能暂停的虚拟机</h4>
+
+            <p>VM 是一个栈式虚拟机：程序计数器（PC）、操作数栈、全局变量表、调用栈。但它不是一口气跑完所有指令——它<strong>每次只执行一步</strong>，然后把控制权交还给调用方。</p>
+
+            <p>这是少儿编程的核心需求：孩子写了 <code>前进()</code>，你需要看到角色走一格的动画，然后再执行下一条。如果 VM 一口气跑完，用户只能看到最终状态。</p>
+
+<pre><code>// VM.step() 返回执行结果，而不是跑到底
+step(): StepResult {
+  const inst = this.program[this.pc];
+
+  switch (inst.opcode) {
+    case 'CALL': {
+      const { name, argCount } = parseCallArg(inst.arg);
+      const args = this.popN(argCount);
+
+      // 游戏命令：_forward, _turnLeft, ...
+      if (this.commandHandlers.has(name)) {
+        this.commandHandlers.get(name)!(args);
+        this.stack.push(null);
+        this.pc++;
+        return { action: name, actionArgs: args };
+        //       ↑ 返回给调用方："刚执行了 forward"
+        //         调用方可以播放动画，然后再调 step()
+      }
+
+      // 传感器：frontBlocked, atGoal, ...
+      if (this.sensorHandlers.has(name)) {
+        const result = this.sensorHandlers.get(name)!(args);
+        this.stack.push(result);
+        this.pc++;
+        return { sensorQuery: name };
+      }
+
+      // 内置函数：len, print, random, ...
+      // ...
+    }
+    // ... 其他 opcode
+  }
+}</code></pre>
+
+            <p>这个设计还天然支持<strong>单步调试</strong>和<strong>断点</strong>：调用方控制何时调 <code>step()</code>，可以在每一步之间检查变量、高亮当前行。</p>
+
+            <p>更进一步，VM 支持<strong>回退调试</strong>——在每一步执行前保存 VM 的完整状态快照，用户可以"倒放"程序执行过程。对小朋友理解代码流程特别有帮助。</p>
+
+            <h3>第二部分：积木 ↔ 代码双向同步</h3>
+
+            <p>大部分积木编程平台是单向的：积木生成代码，但代码改不回积木。这意味着一旦孩子切到代码模式改了点东西，就再也回不到积木模式了。</p>
+
+            <p>神笔做了双向同步：</p>
+
+            <h4>积木 → 代码</h4>
+
+            <p>每种积木类型（command、repeat、while、if、函数定义……）有对应的代码生成规则，同时维护一个 <code>LineToBlockMap</code>——记录生成的每一行代码对应哪个积木 ID，用于执行时高亮对应的积木：</p>
+
+<pre><code>function generateBlockCode(block: Block, indent: number,
+                           lineMap: LineToBlockMap) {
+  const spaces = '    '.repeat(indent);
+
+  switch (block.type) {
+    case 'command':
+      lines.push(`${spaces}${commandName}(${args})`);
+      lineMap.set(currentLine, block.id);
+      break;
+
+    case 'repeat':
+      lines.push(`${spaces}repeat ${block.repeatCount} times:`);
+      lineMap.set(currentLine, block.id);
+      // 递归处理子积木
+      for (const child of block.children) {
+        generateBlockCode(child, indent + 1, lineMap);
+      }
+      break;
+
+    case 'if':
+      lines.push(`${spaces}if ${conditionToCode(block)}:`);
+      // ...
+  }
+}</code></pre>
+
+            <h4>代码 → 积木</h4>
+
+            <p>这是更有意思的方向。代码先经过真正的 Lexer/Parser 编译成 AST，然后把 AST 节点逆向转换为积木：</p>
+
+<pre><code>function parseCodeToBlocks(code: string): Block[] | null {
+  try {
+    const ast = compile(code);  // 用真正的编译器解析
+    return ast.body
+      .map(stmt => statementToBlock(stmt))
+      .filter(b => b !== null);
+  } catch {
+    return null;  // 语法错误，无法转换
+  }
+}</code></pre>
+
+            <p>这里复用了 MiniPython 的编译器——不是另写一个简化的 parser，而是真正地编译代码，拿到 AST，再转成积木。这保证了代码→积木的转换和积木→代码的转换是完全对称的。</p>
+
+            <p>难点在于：要处理中文函数名、英文函数名、历史遗留命名的映射。比如 <code>forward</code>、<code>前进</code>、<code>move</code> 都要映射到同一个 <code>command</code> 类型的积木：</p>
+
+<pre><code>const COMMAND_MAP: Record&lt;string, CommandId&gt; = {
+  move: 'move', turn: 'turn',
+  移动: 'move', 转向: 'turn',
+  forward: 'move', backward: 'move',  // legacy
+  前进: 'move', 后退: 'move',
+  左转: 'turn', 右转: 'turn',
+  setColor: 'setColor', 设置颜色: 'setColor',
+};</code></pre>
+
+            <p>效果：孩子在积木模式拼好逻辑，切到代码模式看到对应的 Python 代码；在代码模式改了几行，切回积木模式看到对应的积木变化。两个模式始终同步。</p>
+
+            <h3>第三部分：World 模型</h3>
+
+            <p>这是我觉得设计得最好的部分。神笔不只有迷宫游戏——还有海龟画图（Turtle Graphics）、后续可以扩展更多游戏类型。问题是：<strong>怎么让同一套语言和 VM 驱动完全不同类型的游戏？</strong></p>
+
+            <p>答案是 <strong>World 抽象</strong>：</p>
+
+<pre><code>架构模式：
+- World：数据模型（状态 + 命令 + 传感器）
+- VM：代码执行器（把代码映射到 World 的方法）
+- Canvas：渲染器（显示 World 的状态）</code></pre>
+
+            <p>每种游戏类型实现自己的 World、自己的 VM 绑定、自己的 Canvas，但共享同一个 MiniPython 语言和 VM 核心。</p>
+
+            <h4>MazeWorld</h4>
+
+<pre><code>class MazeWorld {
+  // 状态
+  grid: Cell[][];
+  x: number; y: number;
+  direction: 'up' | 'down' | 'left' | 'right';
+  collected: number;
+  steps: number;
+
+  // 命令
+  moveForward(): boolean;
+  turnLeft(): void;
+  turnRight(): void;
+  collect(): boolean;
+
+  // 传感器
+  isFrontBlocked(): boolean;
+  isAtGoal(): boolean;
+  hasStarHere(): boolean;
+
+  // 序列化（给 VM 用）
+  toSharedState(): SharedMazeState;
+  syncFromSharedState(state: SharedMazeState): void;
+}</code></pre>
+
+            <h4>TurtleWorld</h4>
+
+<pre><code>class TurtleWorld {
+  // 状态
+  x: number; y: number;
+  angle: number;
+  penDown: boolean;
+  penColor: string;
+  lines: LineSegment[];
+
+  // 命令
+  forward(distance: number): void;
+  turnLeft(degrees: number): void;
+  penUp(): void;
+  setColor(color: string): void;
+
+  // 序列化
+  toSharedState(): SharedTurtleState;
+  syncFromSharedState(state: SharedTurtleState): void;
+}</code></pre>
+
+            <h4>关键设计：SharedState 桥接</h4>
+
+            <p>World 和 VM 之间通过 <code>SharedState</code> 连接。VM 启动时，把 World 的状态序列化成一个普通 JavaScript 对象，注入到 MiniPython 的全局作用域里叫 <code>world</code>：</p>
+
+<pre><code>// MazeVM.loadWithSource()
+loadWithSource(userCode: string): void {
+  const fullCode = MAZE_STDLIB + '\n' + userCode;
+  const program = compileToIR(compile(fullCode));
+  this.sharedState = this.world.toSharedState();
+  this.vm.load(program);
+  this.vm.setGlobal('world', this.sharedState);
+  //                  ↑ MiniPython 代码里可以直接读写 world.x, world.y, ...
+}</code></pre>
+
+            <p>然后 MiniPython 的标准库代码直接操作这个 <code>world</code> 对象：</p>
+
+<pre><code># MiniPython 标准库（迷宫）
+def forward():
+    offset = DIRECTION_OFFSETS[world.direction]
+    newX = world.x + offset[0]
+    newY = world.y + offset[1]
+    if getCell(newX, newY) == 'wall':
+        return False
+    _forward()    # ← 唯一的 native 调用，通知 Canvas 播放动画
+    return True
+
+def frontBlocked():
+    offset = DIRECTION_OFFSETS[world.direction]
+    newX = world.x + offset[0]
+    newY = world.y + offset[1]
+    return getCell(newX, newY) == 'wall'</code></pre>
+
+            <p>注意：<code>forward()</code> 的碰撞检测、坐标计算都是 MiniPython 自己做的。只有 <code>_forward()</code> 是 native 命令——它通知 Canvas "角色移动了一格"，Canvas 播放动画。标准库是 <strong>用自己的语言写的</strong>。</p>
+
+            <p>海龟画图的标准库也是同样的模式：</p>
+
+<pre><code># MiniPython 标准库（海龟）
+def forward(distance):
+    radians = world.angle * 3.14159265359 / 180
+    dx = _cos(radians) * distance * world.stepSize
+    dy = _sin(radians) * distance * world.stepSize * -1
+    oldX = world.x
+    oldY = world.y
+    world.x = world.x + dx
+    world.y = world.y + dy
+    if world.penDown:
+        _drawLine(oldX, oldY, world.x, world.y,
+                  world.penColor, world.penWidth)</code></pre>
+
+            <p>只有 <code>_cos</code>、<code>_sin</code>、<code>_drawLine</code> 是 native——因为三角函数和画线是 MiniPython 做不了的。其余的坐标计算全在 MiniPython 里完成。</p>
+
+            <h4>加一种新游戏需要什么</h4>
+
+            <p>World 模型让扩展新游戏变得很清晰：</p>
+
+            <ol>
+                <li>定义一个新的 World 类（状态 + 命令 + 传感器 + toSharedState）</li>
+                <li>写一个对应的 VM 绑定类，注册少量 native 命令</li>
+                <li>用 MiniPython 写标准库——大部分游戏逻辑在这里</li>
+                <li>写一个 Canvas 组件渲染 World 状态</li>
+            </ol>
+
+            <p>语言、编译器、VM 核心、积木编辑器——全部复用，零修改。</p>
+
+            <h3>关卡系统：条件也是表达式</h3>
+
+            <p>每个关卡是一个 JSON 文件，用 ASCII art 定义地图：</p>
+
+<pre><code>{
+  "id": "maze-01",
+  "name": "First Steps",
+  "grid": [
+    "########",
+    "#>...*G#",    // > = 玩家朝右, * = 星星, G = 终点
+    "########"
+  ],
+  "availableBlocks": ["command"],
+  "winCondition": "collectedCount() >= 1 and atGoal()",
+  "failCondition": "stepCount() > 10",
+  "hints": [
+    "Use the Forward block to move the robot",
+    "Keep going until you reach the flag!"
+  ]
+}</code></pre>
+
+            <p><code>winCondition</code> 和 <code>failCondition</code> 不是硬编码的枚举——它们是 <strong>MiniPython 表达式</strong>，由 VM 求值。这意味着关卡设计者（老师）可以组合任意条件，不需要改代码：</p>
+
+<pre><code>// 各种 win condition
+"atGoal()"                                // 到达终点
+"collectedCount() >= 3 and atGoal()"      // 收集3颗星 + 到达终点
+"stepCount() <= 8 and atGoal()"           // 8步内到达终点
+"collectedCount() == getRemainingStars()" // 收集所有星星</code></pre>
+
+            <h3>总结</h3>
+
+            <p>回到最初的目标：</p>
+
+            <ul>
+                <li><strong>足够简单</strong> → 积木模式让 5 岁的孩子能上手，代码模式语法和 Python 一致</li>
+                <li><strong>和真实语言接轨</strong> → MiniPython 的语法就是 Python 的子集，学完可以直接写 Python</li>
+                <li><strong>中英双语</strong> → 在 Lexer 层实现关键字映射，后续流水线完全无感知</li>
+                <li><strong>积木和代码双向切换</strong> → 通过复用编译器的 AST 实现代码→积木的逆向转换</li>
+            </ul>
+
+            <p>工程上最满意的三个设计：</p>
+
+            <ol>
+                <li><strong>中英双语只在 Lexer 层处理</strong>：一张关键字映射表解决问题，Parser/Compiler/VM 完全不需要关心语言。这个决定让整个系统的复杂度没有因为"双语"而翻倍</li>
+                <li><strong>World 抽象</strong>：游戏世界是纯数据模型，VM 通过 SharedState 桥接，标准库用自己的语言写。加新游戏不需要改语言和 VM</li>
+                <li><strong>VM 的 step() 设计</strong>：每次只执行一步而不是跑到底，让动画播放、单步调试、断点、回退调试都变得自然</li>
+            </ol>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../js/toc.js"></script>
+</body>
+</html>
