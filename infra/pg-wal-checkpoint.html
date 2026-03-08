@@ -30,6 +30,13 @@
                 <figcaption>Albrecht Dürer,《书房中的圣哲罗姆》, 1514 — 哲罗姆伏案翻译圣经，每一个字都被忠实地记录下来，墙上的沙漏标记着时间的流逝。WAL 的本质与此相同：在任何改变发生之前，先把它写入日志。这份记录是崩溃恢复的基础，也是流复制的源头</figcaption>
             </figure>
 
+            <nav class="series-nav">
+                <strong>PostgreSQL 存储引擎内幕</strong><br>
+                <a href="pg-heap-buffer.html">上：Heap Page 与 Buffer Pool</a> ·
+                <a href="pg-index-mvcc.html">中：索引扫描与 MVCC</a> ·
+                <span class="current">下：WAL、Checkpoint 与持久性</span>
+            </nav>
+
             <blockquote class="value-prop">
             <strong>这篇文章的价值</strong>：数据库承诺你"事务提交后数据不会丢"。这个承诺是怎么实现的？答案是 WAL（Write-Ahead Log）——在修改数据页之前，先把变更记录写入日志。这篇文章追踪一条 INSERT 语句从产生 WAL 记录、到 WAL Writer 刷盘、到 Checkpoint 创建恢复点的完整路径，并解释这套机制如何同时支撑崩溃恢复和流复制。
             </blockquote>

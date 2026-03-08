@@ -30,6 +30,13 @@
                 <figcaption>Rembrandt,《持放大镜的男人》, 约 1660s — 他举起放大镜，透过镜片审视眼前的事物。这就是 MVCC 的快照：同一份数据，不同的事务透过不同的"镜片"看到不同的版本。可见与不可见，取决于你何时拿起这面镜子</figcaption>
             </figure>
 
+            <nav class="series-nav">
+                <strong>PostgreSQL 存储引擎内幕</strong><br>
+                <a href="pg-heap-buffer.html">上：Heap Page 与 Buffer Pool</a> ·
+                <span class="current">中：索引扫描与 MVCC</span> ·
+                <a href="pg-wal-checkpoint.html">下：WAL、Checkpoint 与持久性</a>
+            </nav>
+
             <blockquote class="value-prop">
             <strong>这篇文章的价值</strong>：上一篇我们看到了 Heap Page 的内部布局和 Buffer Pool 如何管理页面缓存。但一个关键问题还没回答：当多个事务同时读写同一张表时，每个事务看到的数据是怎么决定的？这篇文章追踪两条路径——索引扫描如何从 B-Tree 叶节点跳到 Heap Page 取回数据，以及 MVCC 快照如何决定一行数据"对你可见还是不可见"。理解这些，你才能真正理解事务隔离级别不是一个抽象概念，而是一个具体的数据结构。
             </blockquote>
