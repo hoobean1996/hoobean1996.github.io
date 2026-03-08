@@ -30,12 +30,12 @@
                 <figcaption>Charles Percier 设计,《钱币柜》, 约 1809-19 — 打开柜门，44 个固定大小的抽屉整齐排列，每一格存放不同的钱币。这和 PostgreSQL 的存储结构异曲同工：文件是柜子，Page 是抽屉，Tuple 是里面的钱币</figcaption>
             </figure>
 
-            <nav class="series-nav">
+            <div class="series-nav">
                 <strong>PostgreSQL 存储引擎内幕</strong><br>
                 <span class="current">上：Heap Page 与 Buffer Pool</span> ·
                 <a href="pg-index-mvcc.html">中：索引扫描与 MVCC</a> ·
                 <a href="pg-wal-checkpoint.html">下：WAL、Checkpoint 与持久性</a>
-            </nav>
+            </div>
 
             <blockquote class="value-prop">
             <strong>这篇文章的价值</strong>：当你执行 <code>SELECT * FROM users WHERE id = 123</code> 时，数据是怎么从磁盘到达你面前的？这篇文章追踪这条路径的最底层：8KB 的 Page 内部长什么样、Buffer Pool 如何管理内存中的页面缓存、顺序扫描如何一页一页地读取数据、以及 HOT Chain 如何优化更新操作。理解这些，你才能真正理解 VACUUM 为什么必要、为什么跨主机容器通信比同主机慢、以及 PG 和 MySQL 在存储层的根本差异。

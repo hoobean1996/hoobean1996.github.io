@@ -202,7 +202,7 @@ footer {
 }
 
 /* Series Navigation */
-.post-content .series-nav {
+.series-nav {
     background: #f9f9f9;
     border: 1px solid #e1e4e8;
     border-radius: 4px;
@@ -212,23 +212,23 @@ footer {
     line-height: 1.8;
 }
 
-.post-content .series-nav strong {
+.series-nav strong {
     font-size: 0.85rem;
     color: #666;
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
 
-.post-content .series-nav a {
+.series-nav a {
     color: #0066cc;
     text-decoration: none;
 }
 
-.post-content .series-nav a:hover {
+.series-nav a:hover {
     text-decoration: underline;
 }
 
-.post-content .series-nav .current {
+.series-nav .current {
     color: #333;
     font-weight: 600;
 }
