@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema 驱动 UI：用 JSON 描述整个界面 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../linux/">Linux</a></li>
+                <li><a href="../cpp/">C++</a></li>
+                <li><a href="./">Misc</a></li>
+                <li><a href="https://github.com/hoobean1996">GitHub</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Schema 驱动 UI：用 JSON 描述整个界面</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../images/klee-highways-byways.jpg" alt="Highways and Byways by Paul Klee">
+                <figcaption>Paul Klee,《大路与小路》(Highways and Byways), 1929 — 用简单的几何色块和规则排列，构建出丰富的视觉世界。Schema 驱动 UI 的理念如出一辙</figcaption>
+            </figure>
+
+            <h3>从表单到界面</h3>
+
+            <p>上一篇文章讨论了用 JSON Schema 驱动表单渲染。但如果仔细想想，表单不过是 UI 的一个子集。一个表单里不只有输入框——还有布局（分栏、卡片、Tab 切换）、展示组件（文字、图片、Badge）、交互逻辑（点击按钮触发动作、根据选项显示/隐藏字段）。</p>
+
+            <p>如果我们把 Schema 的能力从"描述表单字段"扩展到"描述整个 UI 树"，就得到了一个更强大的系统：<strong>Schema 驱动 UI</strong>。一份 JSON 不仅定义数据输入，还定义布局、条件渲染、校验规则、交互动作——前端只需要一个通用的 <code>SchemaRenderer</code>，就能渲染出完整的页面。</p>
+
+            <h3>核心类型设计</h3>
+
+            <p>整个系统的类型定义：</p>
+
+<pre><code>// 一个组件的完整描述
+interface ComponentSchema {
+  type: string;              // 组件类型："Input" | "Card" | "Row" | ...
+  name?: string;             // 字段名（表单组件才有）
+  props?: Record&lt;string, unknown&gt;;  // 传给组件的 props
+  validation?: ValidationSchema;     // 校验规则
+  conditional?: ConditionalSchema;   // 条件渲染
+  actions?: Record&lt;string, ActionSchema&gt;;  // 事件处理
+  children?: ComponentSchema[];      // 子组件（布局容器用）
+}
+
+// 顶层 Schema
+interface FormSchema {
+  id: string;
+  title?: string;
+  description?: string;
+  form?: {
+    initialValues?: Record&lt;string, unknown&gt;;  // 默认值
+    values?: Record&lt;string, unknown&gt;;         // 预填值（优先级最高）
+    validateOn?: "change" | "blur" | "submit";
+  };
+  components: ComponentSchema[];  // 组件树
+}</code></pre>
+
+            <p>关键设计决策：<strong>ComponentSchema 是递归的</strong>。一个 <code>Card</code> 的 <code>children</code> 里可以放 <code>Row</code>，<code>Row</code> 里放 <code>Input</code> 和 <code>Button</code>。这意味着 Schema 可以描述任意深度的 UI 树，不局限于扁平的字段列表。</p>
+
+            <h3>一个真实的 Schema 示例</h3>
+
+<pre><code>{
+  "id": "employee-onboarding",
+  "title": "新员工入职登记",
+  "form": {
+    "initialValues": { "accountType": "individual" }
+  },
+  "components": [
+    {
+      "type": "Card",
+      "props": { "title": "基本信息" },
+      "children": [
+        {
+          "type": "Row",
+          "props": { "gap": 16 },
+          "children": [
+            {
+              "type": "Input",
+              "name": "name",
+              "props": { "label": "姓名", "placeholder": "请输入姓名" },
+              "validation": {
+                "rule": "LEN(@name) >= 2",
+                "message": "姓名至少 2 个字符"
+              }
+            },
+            {
+              "type": "DatePicker",
+              "name": "startDate",
+              "props": { "label": "入职日期" }
+            }
+          ]
+        },
+        {
+          "type": "Selector",
+          "name": "department",
+          "props": {
+            "label": "部门",
+            "options": [
+              { "value": "eng", "label": "工程" },
+              { "value": "product", "label": "产品" },
+              { "value": "design", "label": "设计" }
+            ]
+          }
+        },
+        {
+          "type": "RadioGroup",
+          "name": "accountType",
+          "props": {
+            "label": "账号类型",
+            "options": [
+              { "value": "individual", "label": "个人" },
+              { "value": "business", "label": "企业" }
+            ]
+          }
+        },
+        {
+          "type": "Input",
+          "name": "companyName",
+          "props": { "label": "公司名称" },
+          "conditional": {
+            "when": "@accountType == 'business'"
+          }
+        }
+      ]
+    },
+    {
+      "type": "Button",
+      "props": { "label": "提交", "type": "submit" },
+      "actions": {
+        "onClick": { "type": "submit" }
+      }
+    }
+  ]
+}</code></pre>
+
+            <p>这份 JSON 描述了：布局（Card 包裹、Row 分栏）、表单字段（Input、DatePicker、Selector、RadioGroup）、校验规则（姓名长度 ≥ 2）、条件渲染（选择"企业"才显示公司名称）、交互动作（按钮提交）。前端不需要写任何组件代码，只需要一个通用渲染器。</p>
+
+            <h3>表达式引擎</h3>
+
+            <p>条件渲染和校验规则的核心是一个表达式引擎。Schema 里的字符串表达式（如 <code>@accountType == 'business'</code>）需要在运行时求值。</p>
+
+            <p><code>@</code> 前缀引用表单字段的当前值，表达式支持比较、逻辑运算和内置函数：</p>
+
+<pre><code>// 校验规则示例
+"LEN(@name) >= 2"                              // 字符串长度
+"@age >= 18 AND @age <= 120"                   // 范围校验
+"LEN(@email) > 5 AND FIND(\"@\", @email) > 0" // 邮箱格式
+
+// 条件渲染示例
+"@accountType == 'business'"                    // 等值判断
+"@role == 'admin' OR @role == 'super_admin'"   // 多条件
+"@items > 0"                                    // 数值比较</code></pre>
+
+            <p>表达式引擎的实现不需要很复杂。一个简单的递归下降 parser 就够了，或者直接用现成的库（如 <a href="https://github.com/nicolo-ribaudo/tc39-proposal-pattern-matching">expr-eval</a>）。关键是：<strong>表达式的求值上下文必须和表单状态同步</strong>。每次表单值变化时，表达式引擎能拿到最新的值来重新求值。</p>
+
+            <p>实现方式是用 React Context 把表单值注入到表达式引擎：</p>
+
+<pre><code>function FormContent({ schema, registry }) {
+  const formContext = useFormSchema();
+  const evalContext = useLibExprEvaluation();
+
+  // 表单值变化时，同步到表达式引擎
+  useEffect(() => {
+    evalContext.setValues(formContext.values);
+  }, [formContext.values]);
+
+  return (
+    &lt;form&gt;
+      {schema.components.map((comp, i) =&gt; (
+        &lt;SchemaField key={comp.name || i} schema={comp} registry={registry} /&gt;
+      ))}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+            <h3>条件渲染</h3>
+
+            <p>条件渲染的 Schema 定义：</p>
+
+<pre><code>interface ConditionalSchema {
+  when: string;                     // 表达式，决定是否可见
+  then?: Partial&lt;ComponentSchema&gt;;  // 条件为 true 时合并的 props
+  else?: Partial&lt;ComponentSchema&gt;;  // 条件为 false 时合并的 props
+}</code></pre>
+
+            <p>不仅能控制显示/隐藏，还能根据条件修改组件的 props。比如：</p>
+
+<pre><code>{
+  "type": "Input",
+  "name": "budget",
+  "props": { "label": "预算" },
+  "conditional": {
+    "when": "@role == 'manager'",
+    "then": { "props": { "label": "部门预算（管理员）" } },
+    "else": { "props": { "disabled": true } }
+  }
+}</code></pre>
+
+            <p>渲染器里的实现很直接：</p>
+
+<pre><code>function SchemaField({ schema, registry }) {
+  const evalContext = useLibExprEvaluation();
+  const { conditional } = schema;
+
+  const isVisible = useMemo(() =&gt; {
+    if (!conditional?.when) return true;
+    try {
+      return evalContext.validate(conditional.when);
+    } catch {
+      return true;  // 表达式出错时默认显示
+    }
+  }, [conditional?.when, evalContext]);
+
+  if (!isVisible) return null;
+
+  // ... 渲染组件
+}</code></pre>
+
+            <h3>组件注册表</h3>
+
+            <p>Schema 里的 <code>type: "Input"</code> 怎么变成真正的 React 组件？通过一个组件注册表：</p>
+
+<pre><code>interface ComponentRegistry {
+  [key: string]: React.ComponentType&lt;any&gt;;
+}
+
+const defaultRegistry: ComponentRegistry = {
+  // 表单输入
+  Input: XDSInput,
+  TextArea: XDSTextArea,
+  NumberInput: XDSNumberInput,
+  Checkbox: XDSCheckbox,
+  RadioGroup: XDSRadioGroup,
+  Selector: XDSSelector,
+  Switch: XDSSwitch,
+  DatePicker: XDSDatePicker,
+  TimePicker: XDSTimePicker,
+  FileUpload: XDSFileUpload,
+  Slider: XDSSlider,
+  Rating: XDSRating,
+  ColorPicker: XDSColorPicker,
+
+  // 布局
+  Card: XDSCard,
+  Row: XDSFlexbox,     // direction: row
+  Column: XDSFlexbox,  // direction: column
+  Tabs: XDSTabs,
+  Accordion: XDSAccordion,
+  Divider: XDSDivider,
+
+  // 展示
+  Text: XDSText,
+  Badge: XDSBadge,
+  Alert: XDSAlert,
+  Image: XDSImage,
+  Table: XDSTable,
+
+  // 交互
+  Button: XDSButton,
+  Dropdown: XDSDropdown,
+};</code></pre>
+
+            <p>使用时可以注入自定义组件覆盖默认的，或者扩展新类型：</p>
+
+<pre><code>&lt;SchemaRenderer
+  schema={schema}
+  components={{
+    RichTextEditor: MyRichTextEditor,  // 新增
+    Input: MyCustomInput,              // 覆盖默认
+  }}
+/&gt;</code></pre>
+
+            <p>这个设计的好处是：<strong>Schema 和组件实现完全解耦</strong>。同一份 Schema 可以用不同的组件库渲染——桌面端用 Ant Design 的注册表，移动端用 React Native 的注册表，甚至可以渲染成 Flutter Widget。</p>
+
+            <h3>Action 系统</h3>
+
+            <p>表单不只是收集数据，还有交互。Action Schema 描述用户触发的行为：</p>
+
+<pre><code>type ActionType = "submit" | "setValue" | "navigate" | "toast" | "api" | "custom";
+
+interface ActionSchema {
+  type: ActionType;
+  field?: string;    // setValue: 目标字段
+  value?: unknown;   // setValue: 新值
+  to?: string;       // navigate: 目标路径
+  message?: string;  // toast: 提示内容
+  url?: string;      // api: 请求 URL
+  method?: string;   // api: HTTP 方法
+  handler?: string;  // custom: 处理函数名
+}</code></pre>
+
+            <p>在 Schema 里这样用：</p>
+
+<pre><code>// 点击按钮提交表单
+{
+  "type": "Button",
+  "props": { "label": "提交" },
+  "actions": {
+    "onClick": { "type": "submit" }
+  }
+}
+
+// 点击按钮设置另一个字段的值
+{
+  "type": "Button",
+  "props": { "label": "填入默认地址" },
+  "actions": {
+    "onClick": {
+      "type": "setValue",
+      "field": "address",
+      "value": "上海市浦东新区"
+    }
+  }
+}
+
+// 调用自定义处理函数
+{
+  "type": "Button",
+  "props": { "label": "导出 PDF" },
+  "actions": {
+    "onClick": {
+      "type": "custom",
+      "handler": "exportPDF"
+    }
+  }
+}</code></pre>
+
+            <p>渲染器根据 Action 类型分发到对应的处理逻辑：</p>
+
+<pre><code>const buildActionHandler = (action: ActionSchema) =&gt; () =&gt; {
+  switch (action.type) {
+    case "setValue":
+      formContext.setValue(action.field, action.value);
+      break;
+    case "submit":
+      formContext.submit();
+      break;
+    case "custom":
+      actionHandlers?.[action.handler]?.(action);
+      break;
+  }
+};</code></pre>
+
+            <h3>状态管理与持久化</h3>
+
+            <p>表单状态管理用 React Context 实现，提供一组 hooks：</p>
+
+<pre><code>// 完整的表单上下文
+const { values, setValue, reset, isDirty, submit, getSchema } = useFormSchema();
+
+// 单个字段绑定
+const [email, setEmail, { touched, setTouched }] = useFormField&lt;string&gt;("email");
+
+// 只读值
+const values = useFormValues();
+
+// 监听特定字段变化
+const { name, age } = useWatchFields(["name", "age"]);</code></pre>
+
+            <p>状态持久化是一个巧妙的设计：<code>getSchema()</code> 方法返回当前 Schema 并把用户填写的值嵌入到 <code>form.values</code> 里。保存这份 JSON，下次加载时表单自动恢复到之前的状态：</p>
+
+<pre><code>// 保存当前进度
+const schemaWithValues = getSchema();
+localStorage.setItem("draft", JSON.stringify(schemaWithValues));
+
+// 恢复进度——直接渲染保存的 Schema，表单自动预填
+const saved = JSON.parse(localStorage.getItem("draft"));
+&lt;SchemaRenderer schema={saved} /&gt;</code></pre>
+
+            <p>值的优先级设计也很讲究：<code>form.values</code>（预填/恢复）> <code>props.initialValues</code>（外部传入）> <code>form.initialValues</code>（Schema 默认值）。这保证了持久化恢复总能覆盖默认值。</p>
+
+            <h3>Props 中的动态表达式</h3>
+
+            <p>Schema 里的 props 不仅可以是静态值，还可以包含表达式插值：</p>
+
+<pre><code>{
+  "type": "Text",
+  "props": {
+    "content": "${@name ? '你好，' + @name + '！' : '请输入姓名'}"
+  }
+}</code></pre>
+
+            <p>渲染器递归遍历 props，遇到 <code>${...}</code> 就调用表达式引擎求值：</p>
+
+<pre><code>function evaluateProps(props, evaluate) {
+  const result = {};
+  for (const [key, value] of Object.entries(props)) {
+    if (typeof value === "string" && value.includes("${")) {
+      result[key] = safeEvaluate(value, evaluate);
+    } else if (typeof value === "object" && value !== null) {
+      result[key] = evaluateProps(value, evaluate);  // 递归
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}</code></pre>
+
+            <p>这让 Schema 具备了"数据绑定"的能力——展示组件的内容可以跟着表单输入实时变化，不需要写任何 JavaScript。</p>
+
+            <h3>渲染器的 Switch 策略</h3>
+
+            <p>不同类型的组件需要不同的 props 绑定方式。这是渲染器里最"脏"但最关键的部分：</p>
+
+<pre><code>// Input 用 onValueChange
+case "Input":
+  componentProps.onValueChange = handleChange;
+  break;
+
+// TextArea 用 event-based onChange
+case "TextArea":
+  componentProps.onChange = (e) =&gt; handleChange(e.target.value);
+  break;
+
+// Checkbox/Switch 用 checked + event
+case "Checkbox":
+case "Switch":
+  componentProps.checked = Boolean(value);
+  componentProps.onChange = (e) =&gt; handleChange(e.target.checked);
+  break;
+
+// DatePicker 需要 string ↔ Date 转换
+case "DatePicker":
+  componentProps.value = toDate(value);
+  componentProps.onChange = handleChange;
+  break;
+
+// 布局组件不需要 value/name
+case "Card":
+case "Row":
+case "Divider":
+  delete componentProps.value;
+  delete componentProps.name;
+  break;</code></pre>
+
+            <p>这段 switch 是不可避免的"适配层"。每个 UI 组件库对 onChange 的约定都不一样——有的传 value，有的传 event，有的传 Date 对象。Schema 渲染器的职责就是抹平这些差异，让 Schema 作者不需要关心底层组件的 API 细节。</p>
+
+            <h3>选择模式：给可视化编辑器铺路</h3>
+
+            <p>如果你要做一个拖拽式的表单构建器，需要让用户能点击页面上的组件来选中它、编辑它的属性。这需要一个"选择模式"：</p>
+
+<pre><code>&lt;SchemaRenderer
+  schema={schema}
+  selectionMode={true}
+  onComponentSelect={(info) =&gt; {
+    console.log(info.path);  // "components[0].children[2]"
+    console.log(info.type);  // "Input"
+    console.log(info.name);  // "email"
+  }}
+/&gt;</code></pre>
+
+            <p>选择模式下，每个组件外面套一层 hover overlay，点击时返回组件在 Schema 树中的路径。编辑器可以根据这个路径定位到 Schema JSON，修改 props 后重新渲染。</p>
+
+            <p>这就形成了一个完整的闭环：</p>
+
+<pre><code>可视化编辑器
+    ↓ 拖拽 / 配置
+FormSchema (JSON)
+    ↓ SchemaRenderer
+渲染出的 UI
+    ↓ 用户交互
+FormResponse (JSON)
+    ↓ getSchema()
+带状态的 FormSchema（可持久化）</code></pre>
+
+            <h3>这个方案的边界</h3>
+
+            <ul>
+                <li><strong>适合</strong>：配置驱动的表单、问卷系统、低代码平台、审批流表单、CMS 内容编辑器——这些场景的 UI 结构是"运行时决定"的，不是编译时写死的。</li>
+                <li><strong>不适合</strong>：高度定制的交互（拖拽排序、画布编辑、复杂动画）、性能敏感的场景（100+ 组件的实时更新）、需要大量自定义逻辑的页面。这些场景下 Schema 的抽象会变成限制——你不得不不断往 Schema 里加 escape hatch，最终 Schema 变得比直接写代码还复杂。</li>
+                <li><strong>复杂度天花板</strong>：当条件渲染规则超过 10 条、表达式嵌套超过 3 层时，JSON Schema 的可读性急剧下降。这时候需要一个好的可视化编辑器来辅助，而不是让人手写 JSON。</li>
+            </ul>
+
+            <h3>和其他方案的关系</h3>
+
+            <table>
+                <tr>
+                    <th>方案</th>
+                    <th>Schema 范围</th>
+                    <th>表达式能力</th>
+                    <th>布局能力</th>
+                </tr>
+                <tr>
+                    <td>react-jsonschema-form</td>
+                    <td>数据结构</td>
+                    <td>无</td>
+                    <td>需要 uiSchema 补充</td>
+                </tr>
+                <tr>
+                    <td>Formily</td>
+                    <td>表单字段 + 布局</td>
+                    <td>JSON Schema + reactions</td>
+                    <td>FormLayout / FormGrid</td>
+                </tr>
+                <tr>
+                    <td>Retool / Appsmith</td>
+                    <td>整个应用</td>
+                    <td>JavaScript</td>
+                    <td>拖拽画布</td>
+                </tr>
+                <tr>
+                    <td>本文的方案</td>
+                    <td>UI 组件树</td>
+                    <td>自定义表达式语言</td>
+                    <td>组件嵌套（Card/Row/Tabs）</td>
+                </tr>
+            </table>
+
+            <p>本文的方案介于"表单 Schema"和"低代码平台"之间。它比 react-jsonschema-form 强大（支持布局、条件渲染、Action），但比 Retool 轻量（不涉及数据源连接、API 编排、状态机）。这个定位适合"需要非开发者配置 UI，但不需要一个完整低代码平台"的场景。</p>
+
+            <h3>总结</h3>
+
+            <p>Schema 驱动 UI 的核心公式：</p>
+
+<pre><code>ComponentSchema（递归的组件树描述）
+  + ComponentRegistry（类型 → 组件的映射）
+  + Expression Engine（动态求值）
+  + FormContext（状态管理 + 持久化）
+  = SchemaRenderer（通用渲染器）</code></pre>
+
+            <p>四个部分各自独立，组合起来就能渲染任意复杂度的 UI。Schema 负责"是什么"，Registry 负责"长什么样"，Expression Engine 负责"什么时候"，FormContext 负责"当前状态是什么"。</p>
+
+            <p>这不是一个新想法——从 WinForms 的 XML 描述到 SwiftUI 的声明式语法，"用数据描述 UI"是一个反复出现的主题。JSON Schema 驱动 UI 只是这个思想在 Web 前端、特别是 B 端产品中的一个具体实例。它的价值不在于技术上有多先进，而在于：<strong>它把 UI 的创建权从开发者转移给了业务人员</strong>。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../js/toc.js"></script>
+</body>
+</html>
