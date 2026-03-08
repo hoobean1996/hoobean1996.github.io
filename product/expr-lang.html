@@ -508,9 +508,13 @@ if (shouldShow) {
   renderComponent(schema);
 }</code></pre>
 
-            <h3>一个额外的彩蛋：真值表生成</h3>
+            <h3>真值表生成：让业务人员自己验证规则</h3>
 
-            <p>既然有了表达式求值器，顺手加了一个真值表分析功能——给一个布尔表达式，自动生成所有变量组合的真值表：</p>
+            <p>做 Schema 驱动表单时发现一个问题：业务人员（产品经理、运营）配置条件规则时，经常不确定自己写的逻辑对不对。比如一个审批流规则 <code>isManager and (amount > 1000 or isUrgent)</code>，他们很难在脑子里穷举所有情况。</p>
+
+            <p>但他们会用 Excel。很多业务人员验证逻辑的方式就是在 Excel 里手动列一个真值表——把所有变量组合列出来，逐行检查结果是否符合预期。</p>
+
+            <p>既然有了表达式求值器，这件事可以自动化。给一个布尔表达式，自动生成完整的真值表：</p>
 
 <pre><code>libexpr.analyze('a and (b or c)');
 
@@ -528,7 +532,30 @@ if (shouldShow) {
 // | F | F | F | F      |
 // -------------------</code></pre>
 
-            <p>实现方式：先从表达式 AST 里收集所有变量名，然后生成 2^n 个组合，逐个求值。</p>
+            <p>实现方式：从表达式 AST 里递归收集所有变量名，生成 2^n 个布尔组合，逐个求值。</p>
+
+<pre><code>let rec collect_vars = function
+  | Var name -> [name]
+  | And (e1, e2) | Or (e1, e2) -> collect_vars e1 @ collect_vars e2
+  | _ -> []
+
+let rec gen_combinations = function
+  | [] -> [[]]
+  | v :: vs ->
+      let rest = gen_combinations vs in
+      List.map (fun l -> (v, true) :: l) rest
+      @ List.map (fun l -> (v, false) :: l) rest
+
+let analyze_expr expr =
+  let vars = List.sort_uniq String.compare (collect_vars expr) in
+  let combinations = gen_combinations vars in
+  List.map (fun env ->
+    let env_map = (* 把 [(name, bool)] 转成求值环境 *) in
+    let result = eval_expr env_map expr in
+    (env, result)
+  ) combinations</code></pre>
+
+            <p>在产品里，这个功能被集成到表单规则的配置界面：业务人员写完条件表达式后，点一下"验证"就能看到真值表，直观地确认每种情况下的行为是否符合预期。不需要发布上线再测试，也不需要找开发帮忙检查逻辑。</p>
 
             <h3>为什么用 OCaml</h3>
 
