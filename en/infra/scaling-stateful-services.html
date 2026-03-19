@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scaling Stateful Services: From Methodology to Real-World Redis, Memcached, and MySQL - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Scaling Stateful Services: From Methodology to Real-World Redis, Memcached, and MySQL</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/tempesta-rome-plan.jpg" alt="Plan of the City of Rome, Antonio Tempesta, 1645">
+                <figcaption>Antonio Tempesta, "Plan of the City of Rome", 1645 — A vast city divided into several regions (Regiones), each with its own boundaries and jurisdiction. This mirrors sharding in distributed systems: data is divided into different Slots, each with a clearly assigned owner node. Scaling a city and scaling a stateful service face the same problem: how to redraw boundaries without shutting everything down</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>What you'll learn from this post</strong>: Scaling stateless services is simple — add machines and put them behind a load balancer. But scaling stateful services (databases, caches, message queues) is one of the hardest problems in distributed systems: which machine has the data? How do you move it? What happens to requests during the move? This post first presents a reusable five-step methodology, then uses Redis Cluster, Memcached, and MySQL to show how each step is implemented in practice.
+            </blockquote>
+
+            <h3>Why Stateful Services Are Hard to Scale</h3>
+
+            <p>Scaling model for stateless services:</p>
+
+<pre class="diagram"><code>  Request ──► Load Balancer ──┬──► Server A
+                              ├──► Server B    Any server can handle it
+                              └──► Server C    Add machines to scale</code></pre>
+
+            <p>Scaling model for stateful services:</p>
+
+<pre class="diagram"><code>  Request (user_id=42)
+    │
+    │  This request can only go to the machine storing user_id=42's data
+    │  Can't send it anywhere
+    ▼
+  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ Node A   │  │ Node B   │  │ Node C   │
+  │ id: 1-100│  │id:101-200│  │id:201-300│
+  └──────────┘  └──────────┘  └──────────┘
+
+  Adding Node D:
+  - Whose data needs to move?
+  - How are reads/writes routed during the move?
+  - What if it crashes halfway through?</code></pre>
+
+            <p>The fundamental problem is that <strong>data has ownership</strong>. Scaling stateful services = reassigning data ownership without downtime.</p>
+
+            <h3>Methodology: The Five-Step Scaling Model</h3>
+
+            <h4>Step 1: Sharding Strategy — Mapping Keys to Nodes</h4>
+
+            <p>The most intuitive approach is <code>hash(key) % N</code> to directly map to N machines. But after adding a machine, N becomes N+1, and <strong>almost all key mappings change</strong> — meaning a full data migration.</p>
+
+            <p>The solution is adding a layer of <strong>virtual slots</strong>:</p>
+
+<pre class="diagram"><code>  Bad design: Key → Node (direct mapping)
+  hash(key) % 3 = Node A
+  hash(key) % 4 = Node B  ← Add one machine, almost all keys must move
+
+  Good design: Key → Slot → Node (two-layer mapping)
+  hash(key) % 16384 = Slot 5742    ← This layer never changes
+  Slot 5742 → Node A               ← Only need to move Slot ownership
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Key Space                                               │
+  │  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐     │
+  │  │Slot │Slot │Slot │Slot │Slot │Slot │Slot │ ... │     │
+  │  │  0  │  1  │  2  │  3  │  4  │  5  │  6  │     │     │
+  │  └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴─────┘     │
+  │     │     │     │     │     │     │                      │
+  │     ▼     ▼     ▼     ▼     ▼     ▼                      │
+  │   Node A        Node B        Node C                     │
+  │  Slot 0,1,2    Slot 3,4      Slot 5,6                   │
+  └─────────────────────────────────────────────────────────┘
+
+  Scaling: Move Slot 2 from Node A to Node D
+  - Key-to-Slot mapping doesn't change
+  - Only change Slot-to-Node mapping
+  - Only move data in Slot 2</code></pre>
+
+            <p>Choosing Slot count: typically 100x+ the number of machines. Too few and Slots are too coarse for even distribution; too many and metadata overhead grows. Redis Cluster chose 16384, a battle-tested balance point.</p>
+
+            <h4>Step 2: Control Plane — Where Metadata Lives</h4>
+
+            <p>The routing table "Slot X is on Node A" needs to be stored somewhere, and all participants need to see a consistent version.</p>
+
+            <table>
+                <thead>
+                    <tr><th>Approach</th><th>Principle</th><th>Advantage</th><th>Disadvantage</th><th>Typical System</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Gossip</strong></td><td>Nodes propagate to each other, eventually consistent</td><td>No single point, self-healing</td><td>Slow convergence, split-brain risk, hard to do complex scheduling</td><td>Redis Cluster</td></tr>
+                    <tr><td><strong>Centralized store</strong></td><td>etcd/ZooKeeper stores authoritative metadata</td><td>Strong consistency, easy orchestration</td><td>One more component to maintain</td><td>TiDB PD, Vitess</td></tr>
+                    <tr><td><strong>Config service</strong></td><td>Mcrouter reads routing table from config files</td><td>Extremely simple, no runtime dependency</td><td>Changes require pushes, not suitable for dynamic scaling</td><td>Memcached + Mcrouter</td></tr>
+                </tbody>
+            </table>
+
+            <p>The 2026 trend: <strong>centralized control plane + K8s Operator</strong> is mainstream. etcd provides strongly consistent metadata storage, Operators automate scaling, failover, and data migration. Gossip protocols are still used for failure detection (quickly discovering downed nodes), but no longer for routing decisions.</p>
+
+            <h4>Step 3: Routing Layer — How Requests Find the Right Node</h4>
+
+<pre class="diagram"><code>  Option A: Smart Client               Option B: Proxy
+
+  ┌──────────┐                        ┌──────────┐
+  │  Client   │                        │  Client   │
+  │ Built-in  │                        │ Only knows│
+  │ Slot Map  │                        │ Proxy addr│
+  │ cache     │                        │           │
+  └─────┬────┘                        └─────┬────┘
+        │ Direct to target node              │
+        │ Latency: 1 hop                     ▼
+        │                             ┌──────────┐
+        │                             │  Proxy    │
+        │                             │ (Mcrouter │
+        │                             │  /Envoy)  │
+        │                             └─────┬────┘
+        │                                   │ Forward
+        ▼                                   ▼
+  ┌────────────────────────────────────────────┐
+  │  Node A    Node B    Node C    Node D      │
+  └────────────────────────────────────────────┘</code></pre>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Smart Client</th><th>Proxy</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Latency</strong></td><td>Lowest (direct connection)</td><td>One extra hop</td></tr>
+                    <tr><td><strong>Client complexity</strong></td><td>High (must implement for each language)</td><td>Low (only needs Proxy address)</td></tr>
+                    <tr><td><strong>Upgrading routing logic</strong></td><td>Must upgrade all clients</td><td>Only upgrade Proxy</td></tr>
+                    <tr><td><strong>Extra capabilities</strong></td><td>None</td><td>Rate limiting, canary, monitoring, connection pooling</td></tr>
+                    <tr><td><strong>Best for</strong></td><td>Uniform language, latency-sensitive</td><td>Multi-language, ops-first</td></tr>
+                </tbody>
+            </table>
+
+            <p>Large-scale production environments lean toward the Proxy model. When you have dozens of programming languages for clients, it's impossible to maintain a complex smart client for each one. Proxy centralizes routing logic — clients just need to speak the protocol.</p>
+
+            <h4>Step 4: Replicas and Availability — Data Can't Exist in Just One Copy</h4>
+
+            <p>Sharding solves the capacity problem, but each shard is still a single point of failure. Replicas solve availability:</p>
+
+<pre class="diagram"><code>  Slot 0-5461              Slot 5462-10922          Slot 10923-16383
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │ Master A     │         │ Master B     │         │ Master C     │
+  │ (read/write) │         │ (read/write) │         │ (read/write) │
+  └──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+         │ Async replication      │ Async replication      │ Async replication
+         ▼                        ▼                        ▼
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │ Replica A'   │         │ Replica B'   │         │ Replica C'   │
+  │ (read-only)  │         │ (read-only)  │         │ (read-only)  │
+  └──────────────┘         └──────────────┘         └──────────────┘</code></pre>
+
+            <p>Standard failover procedure:</p>
+            <ol>
+                <li>Detect that Master A is down (heartbeat timeout / Gossip voting / control plane probe)</li>
+                <li>Select a new Master from replicas (choose the one closest in replication progress)</li>
+                <li><strong>Key step</strong>: Update control plane metadata — Owner of Slot 0-5461 changes from A to A'</li>
+                <li>Notify routing layer (Proxy updates routing table / Client refreshes Slot Map)</li>
+                <li>New Master A' starts accepting reads and writes</li>
+            </ol>
+
+            <p>Replication mode selection:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Mode</th><th>Consistency</th><th>Latency</th><th>Availability</th><th>Typical System</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Async replication</strong></td><td>May lose data</td><td>Lowest</td><td>Highest</td><td>Redis, Memcached</td></tr>
+                    <tr><td><strong>Semi-sync replication</strong></td><td>At least one replica confirms</td><td>Medium</td><td>High</td><td>MySQL Semi-sync</td></tr>
+                    <tr><td><strong>Raft/Paxos</strong></td><td>Majority confirms, strong consistency</td><td>Higher</td><td>Medium</td><td>TiKV, CockroachDB</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Step 5: Data Migration — Changing Engines Mid-Flight</h4>
+
+            <p>This is the hardest step. After adding a new machine, some Slots must be moved from old nodes to new ones, <strong>while not interrupting live service</strong>.</p>
+
+<pre class="diagram"><code>  Migrating Slot 3 from Node A → Node D:
+
+  Phase 1: Mark migration state
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Slot 3:  │                    │ Slot 3:  │
+  │ MIGRATING│                    │ IMPORTING│
+  └──────────┘                    └──────────┘
+
+  Phase 2: Full snapshot transfer
+  ┌──────────┐  ══ Snapshot data ══►  ┌──────────┐
+  │ Node A   │                        │ Node D   │
+  │ Continues│                        │ Receiving │
+  │ serving  │                        │ data      │
+  └──────────┘                        └──────────┘
+
+  Phase 3: Incremental catch-up
+  ┌──────────┐  ── Incremental log ──► ┌──────────┐
+  │ Node A   │  (new writes during     │ Node D   │
+  │ Continues│   migration)            │ Catching  │
+  │ serving  │                         │ up        │
+  └──────────┘                         └──────────┘
+
+  Phase 4: Atomic switchover (critical moment)
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Pause    │  ← Brief write     │ Caught   │
+  │ Slot 3   │  block (typically  │ up!      │
+  │ writes   │  milliseconds)     │          │
+  └──────────┘                    └──────────┘
+       │
+       │  Control plane update: Slot 3 → Node D
+       │  Routing layer refresh
+       ▼
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Delete   │                    │ Slot 3:  │
+  │ Slot 3   │                    │ Normal   │
+  │ data     │                    │ service  │
+  └──────────┘                    └──────────┘</code></pre>
+
+            <p>Phase 4 is the most dangerous moment in the entire process. If the incremental log can't keep up (writes are too fast), the blocking time extends and impacts live service. Two coping strategies:</p>
+
+            <ul>
+                <li><strong>Throttle writes</strong>: Rate-limit the Slot during catch-up phase, reducing write speed so incremental catch-up can keep up</li>
+                <li><strong>Dual-write mode</strong>: Write to both nodes during switchover, no blocking, but more complex logic requiring conflict handling</li>
+            </ul>
+
+            <h3>In Practice: Redis Cluster Scaling</h3>
+
+            <table>
+                <thead>
+                    <tr><th>Step</th><th>Redis Cluster Implementation</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Sharding</strong></td><td>16384 Slots, <code>CRC16(key) % 16384</code></td></tr>
+                    <tr><td><strong>Control plane</strong></td><td>Decentralized Gossip. Each node maintains the full Slot Map, synchronized via Gossip protocol</td></tr>
+                    <tr><td><strong>Routing</strong></td><td>Smart Client. Client caches Slot Map, connects directly to target node. If sent to wrong node, it returns <code>MOVED</code> redirect</td></tr>
+                    <tr><td><strong>Replicas</strong></td><td>Each Master has 1-N Replicas, async replication. Failover through Gossip voting to elect new Master</td></tr>
+                    <tr><td><strong>Migration</strong></td><td><code>CLUSTER SETSLOT</code> + <code>MIGRATE</code> commands, key-by-key migration</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Redis Migration Details</h4>
+
+<pre><code># 1. Mark migration state
+CLUSTER SETSLOT 3 MIGRATING target-node-id   # Mark on source node
+CLUSTER SETSLOT 3 IMPORTING source-node-id   # Mark on target node
+
+# 2. Key-by-key migration (Redis has no snapshot migration, moves one at a time)
+CLUSTER GETKEYSINSLOT 3 100                  # Get 100 keys from Slot 3
+MIGRATE target-host 6379 "" 0 5000 KEYS key1 key2 key3 ...
+
+# 3. Complete switchover
+CLUSTER SETSLOT 3 NODE target-node-id        # Execute on all nodes</code></pre>
+
+            <p>Redis migration characteristics and limitations:</p>
+            <ul>
+                <li><strong>Key-by-key migration</strong>, not snapshot. Large keys (e.g., a Hash with millions of elements) block the source node during migration</li>
+                <li>During migration, source node handling of MIGRATING Slot: if key is still local → handle normally; if key has been moved → return <code>ASK</code> redirect to target node</li>
+                <li>Gossip convergence is slow — in large clusters (200+ nodes), a Slot change may take several seconds to propagate to all nodes</li>
+                <li><strong>No incremental log</strong>: Key migration is atomic (MIGRATE = DEL + RESTORE), so there's no "key modified during migration" problem, but the cost is that large key migration blocks</li>
+            </ul>
+
+            <h4>Redis Scale-Out in Practice</h4>
+
+<pre class="diagram"><code>  Before scaling: 3 Masters, each ~5461 Slots
+
+  Master A: Slot 0-5460
+  Master B: Slot 5461-10922
+  Master C: Slot 10923-16383
+
+  Adding Master D, need to move some Slots from A/B/C:
+
+  Master A: Slot 0-4095          (moved out 1366 Slots)
+  Master B: Slot 5461-9556       (moved out 1366 Slots)
+  Master C: Slot 10923-15017     (moved out 1366 Slots)
+  Master D: Slot 4096-5460,      (received 4098 Slots)
+            9557-10922,
+            15018-16383
+
+  redis-cli --cluster reshard automates this process</code></pre>
+
+            <h3>In Practice: Memcached Scaling</h3>
+
+            <table>
+                <thead>
+                    <tr><th>Step</th><th>Memcached Implementation</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Sharding</strong></td><td>Client-side consistent hashing. No Slot concept, virtual nodes on a hash ring</td></tr>
+                    <tr><td><strong>Control plane</strong></td><td>None. Memcached servers don't communicate at all, don't know about each other</td></tr>
+                    <tr><td><strong>Routing</strong></td><td>Pure client-side routing. Mcrouter (Proxy mode) or libmemcached (Smart Client mode)</td></tr>
+                    <tr><td><strong>Replicas</strong></td><td>None by default. Mcrouter can configure shadow/replica pools for read replicas</td></tr>
+                    <tr><td><strong>Migration</strong></td><td>No migration. Cache misses are rebuilt from the source of truth</td></tr>
+                </tbody>
+            </table>
+
+            <p>Memcached's scaling philosophy is completely different from Redis — it positions itself as a <strong>pure cache</strong>, not a data store:</p>
+
+            <h4>Consistent Hashing: Adding Machines Only Affects Adjacent Nodes</h4>
+
+<pre class="diagram"><code>  Hash ring (0 ~ 2^32)
+
+        Node A                    Node A
+       ╱      ╲                  ╱      ╲
+      ╱   key1  ╲               ╱   key1  ╲
+  Node D ─── Node B    →    Node D ─── Node B
+      ╲        ╱               ╲    ↑   ╱
+       ╲      ╱                 ╲ Node E╱    ← Newly joined
+        Node C                   Node C
+
+  Adding Node E:
+  - Only keys between Node B and Node E need remapping
+  - All other keys completely unaffected
+  - No data migration needed — cache misses naturally rebuild to Node E</code></pre>
+
+            <h4>Mcrouter: Memcached's "Brain"</h4>
+
+            <p>Memcached itself is brainless; all intelligence is in Mcrouter (Meta's open-source Proxy):</p>
+
+            <ul>
+                <li><strong>Consistent hash routing</strong>: Computes which Memcached server a key should go to</li>
+                <li><strong>Failure handling</strong>: Automatically removes downed nodes from the ring, keys auto-remap to the next node</li>
+                <li><strong>Canary switchover</strong>: Config file updates routing rules, gradually shifting traffic to a new cluster</li>
+                <li><strong>Connection pooling</strong>: Thousands of frontend client connections multiplexed into a few long-lived connections to Memcached</li>
+                <li><strong>Cold start warm-up</strong>: When a new cluster comes online, read misses automatically fall back to the old cluster, simultaneously writing to the new cluster</li>
+            </ul>
+
+<pre><code>// Mcrouter routing config example
+{
+  "pools": {
+    "A": { "servers": ["mc1:11211", "mc2:11211", "mc3:11211"] },
+    "B": { "servers": ["mc4:11211", "mc5:11211", "mc6:11211"] }
+  },
+  "route": {
+    "type": "WarmUpRoute",          // Cold start warm-up
+    "cold": "PoolRoute|B",          // New cluster
+    "warm": "PoolRoute|A",          // Old cluster (fallback on miss)
+    "exptime": 180
+  }
+}</code></pre>
+
+            <p>Memcached scaling core philosophy: <strong>don't move data, rely on cache self-healing</strong>. Add machines → update Mcrouter config → new keys auto-route to new nodes → old key misses naturally rebuild from source. The cost is temporarily lower cache hit rates after scaling (cold start), but this is acceptable for cache use cases.</p>
+
+            <h3>In Practice: MySQL Scaling</h3>
+
+            <table>
+                <thead>
+                    <tr><th>Step</th><th>MySQL Implementation</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Sharding</strong></td><td>Application-layer sharding (ShardingSphere) or middleware sharding (Vitess). Modulo on user_id or order_id</td></tr>
+                    <tr><td><strong>Control plane</strong></td><td>Vitess: etcd stores topology. ShardingSphere: ZooKeeper/etcd</td></tr>
+                    <tr><td><strong>Routing</strong></td><td>Vitess: VTGate (Proxy). ShardingSphere: optional Proxy or JDBC Driver (Smart Client)</td></tr>
+                    <tr><td><strong>Replicas</strong></td><td>InnoDB semi-sync replication / Group Replication / Raft (TiDB)</td></tr>
+                    <tr><td><strong>Migration</strong></td><td>Binlog-based incremental replication + atomic switchover</td></tr>
+                </tbody>
+            </table>
+
+            <p>MySQL scaling is much more complex than Redis and Memcached because it involves <strong>transactions, JOINs, and foreign keys</strong> — relational semantics.</p>
+
+            <h4>Vitess: YouTube's Battle-Tested MySQL Scaling Solution</h4>
+
+<pre class="diagram"><code>  Application
+      │
+      ▼
+  ┌──────────┐     ┌───────────────┐
+  │ VTGate   │────►│ Topology      │  etcd stores:
+  │ (Proxy)  │     │ Server (etcd) │  - Keyspace → Shard mapping
+  └────┬─────┘     └───────────────┘  - Shard → Tablet mapping
+       │                               - Tablet roles (Master/Replica)
+       │  SQL routing
+       │
+  ┌────┼──────────────────────────────────────────┐
+  │    │  Keyspace: user_db                        │
+  │    │                                           │
+  │    ├──► Shard -80     ──► vttablet ──► MySQL A │  user_id < 0x80
+  │    │    (Master)                                │
+  │    │    Shard -80     ──► vttablet ──► MySQL A' │  (Replica)
+  │    │                                           │
+  │    └──► Shard 80-     ──► vttablet ──► MySQL B │  user_id >= 0x80
+  │         (Master)                                │
+  │         Shard 80-     ──► vttablet ──► MySQL B' │  (Replica)
+  └────────────────────────────────────────────────┘</code></pre>
+
+            <h4>MySQL Shard Migration: Binlog-Based</h4>
+
+            <p>MySQL data migration is essentially the same pattern as PG's streaming replication — <strong>full snapshot + incremental log catch-up</strong>:</p>
+
+            <ol>
+                <li><strong>Full snapshot</strong>: Take a <code>mysqldump</code> or Xtrabackup physical snapshot of the source Shard, transfer to the new node</li>
+                <li><strong>Incremental catch-up</strong>: Starting from the Binlog position at snapshot time, continuously consume Binlog and apply to the new node. This step mirrors PG's WAL replay</li>
+                <li><strong>Verification</strong>: Compare data consistency between source and target (VDiff in Vitess)</li>
+                <li><strong>Atomic switchover</strong>: Brief write block → wait for Binlog to catch up → update topology → resume writes</li>
+            </ol>
+
+            <p>Vitess's <code>Reshard</code> command automates this process. The key is the <code>VReplication</code> engine — it doesn't simply replay Binlog, but <strong>filters by sharding rules</strong>: only row changes belonging to the target Shard are applied.</p>
+
+            <h4>MySQL Scaling Special Challenges</h4>
+
+            <ul>
+                <li><strong>Cross-Shard JOINs</strong>: <code>SELECT * FROM orders JOIN users ON orders.user_id = users.id</code> — if orders and users are on different Shards, the Proxy must query each separately and merge. Performance drops dramatically</li>
+                <li><strong>Cross-Shard transactions</strong>: Requires two-phase commit (2PC); Vitess coordinates via VTGate, but performance and reliability are inferior to single-Shard transactions</li>
+                <li><strong>Shard key selection</strong>: Once chosen (e.g., user_id), it's nearly impossible to change. A wrong choice (e.g., sharding by order_id but frequently querying by user_id) leads to massive cross-Shard queries</li>
+                <li><strong>Hotspot problem</strong>: If one large customer (user_id=1) has far more data than others, their Shard becomes a hotspot. Solution: further split that Shard, or handle it specially at the application layer</li>
+            </ul>
+
+            <h3>Comparing the Three Systems</h3>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Redis Cluster</th><th>Memcached + Mcrouter</th><th>MySQL + Vitess</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Positioning</strong></td><td>Data store + cache</td><td>Pure cache</td><td>Persistent data store</td></tr>
+                    <tr><td><strong>Sharding method</strong></td><td>16384 Slots</td><td>Consistent hashing</td><td>Range or Hash sharding</td></tr>
+                    <tr><td><strong>Control plane</strong></td><td>Gossip (decentralized)</td><td>None (config-driven)</td><td>etcd (centralized)</td></tr>
+                    <tr><td><strong>Routing</strong></td><td>Smart Client + MOVED</td><td>Mcrouter (Proxy)</td><td>VTGate (Proxy)</td></tr>
+                    <tr><td><strong>Migration method</strong></td><td>Key-by-key transfer</td><td>No migration, cache self-heals</td><td>Snapshot + Binlog incremental</td></tr>
+                    <tr><td><strong>Migration impact on service</strong></td><td>Large keys block</td><td>Short-term miss rate increase</td><td>Brief write block (milliseconds)</td></tr>
+                    <tr><td><strong>Scaling complexity</strong></td><td>Medium</td><td>Low</td><td>High</td></tr>
+                    <tr><td><strong>Data loss risk</strong></td><td>Async replication may lose</td><td>It's a cache anyway</td><td>Semi-sync/Raft guarantees</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Summary</h3>
+
+            <p>The five-step model for scaling stateful services:</p>
+
+            <ol>
+                <li><strong>Sharding</strong>: Key → Slot → Node two-layer mapping, Slot count = machines x 100+</li>
+                <li><strong>Control plane</strong>: Where the routing table lives and who is authoritative. Trend is etcd + Operator</li>
+                <li><strong>Routing</strong>: Smart Client (low latency) vs Proxy (easy ops). Multi-language environments choose Proxy</li>
+                <li><strong>Replicas</strong>: Async (fast but may lose data) vs semi-sync (balanced) vs Raft (strong consistency but slower)</li>
+                <li><strong>Migration</strong>: Full snapshot + incremental log + atomic switchover. The critical part is the strategy for the switchover moment</li>
+            </ol>
+
+            <p>Three levels of practice:</p>
+
+            <ul>
+                <li><strong>Memcached</strong>: Simplest — don't move data, cache self-heals on miss. Suitable for pure cache scenarios</li>
+                <li><strong>Redis</strong>: Medium complexity — key-by-key migration, Gossip coordination. Suitable for both cache and lightweight storage</li>
+                <li><strong>MySQL</strong>: Most complex — snapshot + Binlog incremental, plus handling cross-Shard JOINs and transactions. Suitable for persistent relational data</li>
+            </ul>
+
+            <p>Regardless of the specific system, the five-step model is universal. Next time you encounter a new stateful system that needs scaling, ask these five questions: how to shard, where metadata lives, how requests are routed, how replicas work, and how data is moved.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

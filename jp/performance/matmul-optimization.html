@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>0.98 から 267 GFLOPS へ：行列乗算パフォーマンス最適化の全記録 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>0.98 から 267 GFLOPS へ：行列乗算パフォーマンス最適化の全記録</h2>
+            <time>2026-02-16</time>
+
+            <figure class="post-cover">
+                <img src="../../images/escher-relativity.jpg" alt="Relativity by M.C. Escher">
+                <figcaption>M.C. Escher,《相対性》, 1953</figcaption>
+            </figure>
+
+            <h3>はじめに</h3>
+
+            <p>行列乗算（GEMM, General Matrix Multiply）は高性能計算における最も核心的な操作の一つだ。ニューラルネットワークの全結合層、畳み込み層、アテンション機構、すべての底辺には行列乗算がある。BLAS ライブラリの <code>sgemm</code> は最も極限まで最適化された関数の一つであり、Intel MKL、OpenBLAS、BLIS これらのライブラリの中核的な競争力はここにある。</p>
+
+            <p>教科書的な三重ループから、ハードウェアの理論ピーク性能に近い実装まで、その間に何が起きるのかを理解したかった。そこで C++ でゼロから、一歩ずつ最適化し、各ステップの考え方、効果、ハマったポイントをすべて記録した。</p>
+
+            <h3>問題定義</h3>
+
+            <p>C = A &times; B を計算する。A は M&times;K 行列、B は K&times;N 行列、C は M&times;N 行列。すべての行列は行優先（row-major）で格納された float32 である。</p>
+
+            <p>ハードウェア環境：</p>
+            <ul>
+                <li>CPU: Intel i7-14700KF (Raptor Lake, 14 コア / 20 スレッド)</li>
+                <li>L1d: 48 KB/core, L2: 2 MB/core, L3: 33 MB shared</li>
+                <li>AVX2 + FMA 対応、AVX-512 非対応</li>
+            </ul>
+
+            <p><strong>理論ピーク性能の計算方法</strong></p>
+
+            <p>ここは分解して説明する必要がある。i7-14700KF のシングルコアブースト周波数は約 5.5 GHz で、毎秒 55 億クロックサイクルを実行する。重要な問題は：各サイクルで何回の浮動小数点演算ができるか？</p>
+
+            <p>この CPU は AVX2 命令セットをサポートしている。AVX2 のレジスタ幅は 256 ビット（32 バイト）で、8 個の float32 を同時に格納できる。さらに FMA（Fused Multiply-Add）命令をサポートしており、1 命令で乗算と加算を同時に行う、つまり <code>a * b + c</code> で 2 回の浮動小数点演算を計算する。そして Raptor Lake の各コアには 2 つの FMA 実行ユニットがあり、同一クロックサイクルで 2 つの FMA 命令を同時に実行できる。</p>
+
+            <p>したがってシングルコアのサイクルあたり浮動小数点演算数 = 2 FMA ユニット &times; 8 float/FMA &times; 2 FLOP/FMA = <strong>32 FLOP/cycle</strong>。理論シングルコアピーク：</p>
+
+<pre><code>5.5 GHz &times; 32 FLOP/cycle &asymp; 176 GFLOPS (単精度, シングルコア)</code></pre>
+
+            <p>マルチコアの理論ピークはさらに高いが、メモリ帯域幅と共有キャッシュの制約により、実際に達成できる性能は計算密度に依存する。後で見るように、シングルスレッドで 144 GFLOPS（ピークの 82%）に最適化できれば、非常に良い結果である。</p>
+
+            <p>ベンチマークの行列サイズは N=1024、つまり 1024&times;1024 の正方行列の乗算。行列乗算の計算量の公式は 2&times;M&times;N&times;K（各出力要素に K 回の乗算と K 回の加算が必要）で、総計算量は 2&times;1024&sup3; &asymp; 21.5 億回の浮動小数点演算。</p>
+
+            <h3>総覧</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>バージョン</th>
+                        <th>時間 (ms)</th>
+                        <th>GFLOPS</th>
+                        <th>Baseline 比</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Baseline (i-j-k)</td>
+                        <td>2205</td>
+                        <td>0.98</td>
+                        <td>1&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Naive (i-k-j)</td>
+                        <td>61.0</td>
+                        <td>35.3</td>
+                        <td>36&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Tiled</td>
+                        <td>73.5</td>
+                        <td>29.3</td>
+                        <td>30&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Tiled + SIMD</td>
+                        <td>72.8</td>
+                        <td>29.3</td>
+                        <td>30&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Register Tiling</td>
+                        <td>16.9</td>
+                        <td>125.8</td>
+                        <td>128&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Packed</td>
+                        <td>14.8</td>
+                        <td>144.4</td>
+                        <td>147&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Parallel (OpenMP)</td>
+                        <td>8.24</td>
+                        <td>267.2</td>
+                        <td>273&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Optimized</td>
+                        <td>8.21</td>
+                        <td>266.3</td>
+                        <td>272&times;</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Step 0: 教科書的な書き方 (i-j-k) &mdash; 0.98 GFLOPS</h3>
+
+            <p>線形代数を学ぶ時に誰もが最初に書くバージョン：</p>
+
+<pre><code>void matmul_baseline(const float* A, const float* B, float* C,
+                     size_t M, size_t N, size_t K) {
+  std::memset(C, 0, M * N * sizeof(float));
+  for (size_t i = 0; i &lt; M; ++i) {
+    for (size_t j = 0; j &lt; N; ++j) {
+      for (size_t k = 0; k &lt; K; ++k) {
+        C[i * N + j] += A[i * K + k] * B[k * N + j];
+      }
+    }
+  }
+}</code></pre>
+
+            <p>0.98 GFLOPS、理論ピークの約 1%。衝撃的な遅さだ。</p>
+
+            <p>問題は内側ループのメモリアクセスパターンにある。行列は行優先（row-major）で格納されている。つまり <code>B[0][0], B[0][1], B[0][2], ...</code> の要素はメモリ上で連続している。しかし内側ループは <code>k</code> をスキャンし、毎回 <code>B[k * N + j]</code> にアクセスする――<code>k</code> が 1 増えるごとに、メモリアドレスは N 個の float（4096 バイト）分ジャンプする。つまり行を飛ばしてアクセスしている。</p>
+
+            <p>現代の CPU には重要な設計がある：メモリからデータを 1 つ読む時、CPU はその 1 つだけでなく、それが属する <strong>cache line</strong> 全体（通常 64 バイト）をロードする。float32 の場合、1 つの cache line に 16 個の連続した float が入る。CPU の前提は「このデータを読んだなら、その隣のデータも次に読むだろう」――これを空間的局所性（spatial locality）と呼ぶ。</p>
+
+            <p>しかし i-j-k ループはこの前提に完全に反している。cache line（64 バイト = 16 float）をロードするたびに、その中の 1 つだけ使って次にジャンプする。cache line の利用率はわずか 1/16 = 6.25%。Cachegrind の実測で D1 miss rate は <strong>32.8%</strong>――3 回のメモリアクセスごとに 1 回が cache miss である。</p>
+
+            <h3>Step 1: ループ並べ替え (i-k-j) &mdash; 35.3 GFLOPS</h3>
+
+            <p><code>k</code> ループを中間に持ってきて、内側ループで <code>j</code> をスキャンさせる：</p>
+
+<pre><code>void matmul_naive(const float* A, const float* B, float* C,
+                  size_t M, size_t N, size_t K) {
+  std::memset(C, 0, M * N * sizeof(float));
+  for (size_t i = 0; i &lt; M; ++i) {
+    for (size_t k = 0; k &lt; K; ++k) {
+      float a_ik = A[i * K + k];
+      for (size_t j = 0; j &lt; N; ++j) {
+        C[i * N + j] += a_ik * B[k * N + j];
+      }
+    }
+  }
+}</code></pre>
+
+            <p><strong>36 倍の高速化</strong>、ループの 2 行を入れ替えただけで。</p>
+
+            <p>今や内側ループで <code>B[k*N+j]</code> と <code>C[i*N+j]</code> はどちらも行に沿って連続アクセス（stride-1）している。64 バイトの cache line がロードされると、中の 16 個の float がすべて使われ、cache line の利用率は 6.25% から 100% に向上した。同時に <code>A[i*K+k]</code> は内側ループ内で定数なので、ループ外のローカル変数 <code>a_ik</code> に保存される――これを scalar replacement と呼び、コンパイラも通常自動的にこれを行う。</p>
+
+            <p>Cachegrind 実測で D1 miss rate は 32.8% から <strong>4.8%</strong> に低下した。</p>
+
+            <p>これはプロジェクト全体で単一ステップとして最大の性能向上だ。教訓はシンプルだ：<strong>メモリアクセスパターンはアルゴリズムの計算量よりも重要</strong>。2 つの書き方の算術演算量は完全に同じ（どちらも 2N&sup3; 回）だが、メモリアクセスパターンの違いが 36 倍の性能差を生んだ。</p>
+
+            <h3>Step 2: Cache Tiling &mdash; 29.3 GFLOPS</h3>
+
+            <p>教科書的な古典的最適化：大きな行列を小さなブロック（64&times;64&times;64）に分割し、各ブロックのデータ量（64&times;64&times;4B = 16KB）が 48KB の L1d cache に収まるようにする。これにより、1 つのブロックの処理中にデータを cache から追い出されることなく繰り返し使用できる。</p>
+
+<pre><code>void matmul_tiled(const float* A, const float* B, float* C,
+                  size_t M, size_t N, size_t K) {
+  constexpr size_t BM = 64, BN = 64, BK = 64;
+  std::memset(C, 0, M * N * sizeof(float));
+
+  for (size_t i0 = 0; i0 &lt; M; i0 += BM) {
+    const size_t imax = std::min(i0 + BM, M);
+    for (size_t k0 = 0; k0 &lt; K; k0 += BK) {
+      const size_t kmax = std::min(k0 + BK, K);
+      for (size_t j0 = 0; j0 &lt; N; j0 += BN) {
+        const size_t jmax = std::min(j0 + BN, N);
+        for (size_t i = i0; i &lt; imax; ++i) {
+          for (size_t k = k0; k &lt; kmax; ++k) {
+            float a_ik = A[i * K + k];
+            for (size_t j = j0; j &lt; jmax; ++j) {
+              C[i * N + j] += a_ik * B[k * N + j];
+            }
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>結果：<strong>むしろ遅くなった</strong>。35.3 から 29.3 GFLOPS に低下。</p>
+
+            <p>原因はコンパイラ（GCC/Clang -O3）がシンプルな i-k-j ループに対してすでに良い最適化を施しているためだ。ブロック分割は余分なループ制御オーバーヘッドと <code>std::min</code> 境界計算を導入し、コスト倒れになった。しかも i-k-j 自体のアクセスパターンはすでにフレンドリーで、B も C も stride-1 アクセスなので、tiling の限界効果は小さい。</p>
+
+            <p>教訓：<strong>Tiling の価値は register tiling と packing と組み合わせて初めて発揮される</strong>。単独で tiling を使うと、現代のコンパイラの方が上手にやることがある。</p>
+
+            <h3>Step 3: 手書き SIMD (AVX2 FMA) &mdash; 29.3 GFLOPS</h3>
+
+            <p>まず SIMD とは何かを説明する。SIMD（Single Instruction, Multiple Data）は並列計算の一形式で、1 つの命令で複数のデータを同時に処理する。通常のスカラー命令は一度に 1 つの float しか加算できないが、AVX2 の SIMD 命令は一度に 8 つの float を同時に加算できる（YMM レジスタが 256 ビット幅で、256 / 32 = 8 float のため）。</p>
+
+            <p>FMA（Fused Multiply-Add）はさらに一歩進んでおり、1 命令で <code>a * b + c</code> を完了する。つまり乗算と加算を同時に行い、丸め誤差も 1 回のみ（先に乗算してから加算するより精確）。行列乗算の場合、核心的な操作はまさに <code>C[i][j] += A[i][k] * B[k][j]</code> であり、FMA に天然に適している。</p>
+
+            <p>C/C++ では、アセンブリを書かずに intrinsics 関数でこれらの命令を直接呼び出せる：</p>
+
+<pre><code>// 内側ループのコア
+__m256 va = _mm256_set1_ps(A[i * K + k]);     // 1 つの float を 8 レーンにブロードキャスト
+size_t j = j0;
+for (; j + 8 &lt;= jmax; j += 8) {
+  __m256 vb = _mm256_loadu_ps(&amp;B[k * N + j]); // 8 つの連続 float を一括ロード
+  __m256 vc = _mm256_loadu_ps(&amp;C[i * N + j]); // 8 つの連続 float を一括ロード
+  vc = _mm256_fmadd_ps(va, vb, vc);            // 8 レーン並列: C += A * B
+  _mm256_storeu_ps(&amp;C[i * N + j], vc);         // 8 つの float を一括書き戻し
+}</code></pre>
+
+            <p>ここで各 <code>_mm256</code> で始まる関数は AVX2 命令に対応する。<code>_mm256_set1_ps</code> はスカラーを 256 ビットレジスタの 8 つの位置すべてにブロードキャストする。<code>_mm256_loadu_ps</code> はメモリから 8 つの連続 float をレジスタにロードする。<code>_mm256_fmadd_ps</code> は 8 ペアのデータに対して同時に FMA を実行する。</p>
+
+            <p>結果：<strong>tiled バージョンとまったく同じ</strong>。</p>
+
+            <p><code>-O3 -march=native -ffast-math</code> の下で、コンパイラはすでに内側ループの自動ベクトル化（auto-vectorization）を行っていた。つまりコンパイラがこのシンプルな <code>for j</code> ループを見て、自動的に SIMD 命令に変換していた――手書きの intrinsics とまったく同じことをしている。<code>-fopt-info-vec</code>（GCC）または <code>-Rpass=loop-vectorize</code>（Clang）でコンパイラが自動ベクトル化を行ったかどうかを確認できる。</p>
+
+            <p>教訓：<strong>現代のコンパイラに対して、単純なループの手書き SIMD は通常自動ベクトル化を超えられない</strong>。本当の効果はコンパイラにできないこと――例えば次のステップの register tiling で、プログラマが各レジスタの用途を正確に計画する必要がある。</p>
+
+            <h3>Step 4: Register Tiling &mdash; 125.8 GFLOPS（重要なブレークスルー）</h3>
+
+            <p>前のすべてのバージョンには根本的な問題がある：<strong>1 回の積和演算ごとにメモリ（またはキャッシュ）から C を読み書きしている</strong>。i-k-j の内側ループで、<code>C[i*N+j] += a_ik * B[k*N+j]</code> というコードは毎回 C の読み取り、積和演算、C への書き戻しを意味する。C が L1 cache にあっても、読み書きのレイテンシは存在する。</p>
+
+            <p>Register tiling の考え方：C の小さなサブブロックを完全に CPU レジスタに配置する。レジスタは CPU 内で最速のストレージで、アクセスレイテンシはゼロ、いかなるキャッシュ階層も経由しない。C のサブブロックを k ループ全体を通じてレジスタに保持し、ループの最初に一度ロードし、最後に一度書き戻すだけにすれば、メモリアクセスを大幅に削減できる。</p>
+
+            <p>重要な問題は：サブブロックをどれだけ大きくできるか？これは CPU のレジスタ数に依存する。</p>
+
+<pre class="diagram"><code>              NR=16 (2 &times; __m256)
+           +----------------------+
+     MR=6  | c00 c01              |  12 個の YMM レジスタが C の 6&times;16 サブブロックを保持
+    rows   | c10 c11              |
+     of C  | c20 c21              |  k ループ中:
+           | c30 c31              |    2 つの B ベクトル (b0, b1) をロード
+           | c40 c41              |    6 つの A スカラーをブロードキャスト
+           | c50 c51              |    12 回の FMA
+           +----------------------+</code></pre>
+
+            <p>AVX2 は 16 個の YMM レジスタ（ymm0-ymm15）を提供し、各 256 ビット幅（8 float）。精密に割り当てる必要がある：</p>
+            <ul>
+                <li>C サブブロック：6 行 &times; 2 __m256（各行 16 float）= <strong>12 レジスタ</strong></li>
+                <li>B ベクトル：各 k ステップで 2 __m256 をロード = <strong>2 レジスタ</strong></li>
+                <li>A ブロードキャスト：各 k ステップで 1 つの A 要素を __m256 にブロードキャスト = <strong>1 レジスタ</strong></li>
+                <li>一時用：<strong>1 レジスタ</strong></li>
+                <li>合計：12 + 2 + 1 + 1 = <strong>16、ちょうど使い切り</strong></li>
+            </ul>
+
+            <p>なぜ MR=6, NR=16 で他の組み合わせではないのか？この組み合わせの<strong>計算密度</strong>が最も高いからだ。各 k ステップで 12 回の FMA（6 行 &times; 2 ベクトル）を行い、メモリからの読み取りはわずか 3 値（2 B ベクトル + 1 A スカラー）で、計算密度は 12/3 = 4 FMA/load。4&times;24（同じく 12 C レジスタ）の場合、3 B + 1 A = 4 回の読み取りが必要で、密度は 12/4 = 3 FMA/load と低くなる。</p>
+
+            <p>コア実装（micro-kernel）：</p>
+
+<pre><code>// 1. C の 6&times;16 サブブロックを 12 レジスタにロード（1 回のみ）
+__m256 c00 = _mm256_loadu_ps(&amp;C[0 * N + 0]);
+__m256 c01 = _mm256_loadu_ps(&amp;C[0 * N + 8]);
+__m256 c10 = _mm256_loadu_ps(&amp;C[1 * N + 0]);
+__m256 c11 = _mm256_loadu_ps(&amp;C[1 * N + 8]);
+// ... c20, c21, c30, c31, c40, c41, c50, c51
+
+// 2. k ループ中は完全にレジスタ内で累積
+for (size_t k = 0; k &lt; K; ++k) {
+  __m256 b0 = _mm256_loadu_ps(&amp;B[k * N + 0]);  // B の 16 float をロード
+  __m256 b1 = _mm256_loadu_ps(&amp;B[k * N + 8]);
+
+  __m256 a;
+  a = _mm256_set1_ps(A[0 * lda + k]);  // A[0][k] をブロードキャスト
+  c00 = _mm256_fmadd_ps(a, b0, c00);   // c00 += a * b0
+  c01 = _mm256_fmadd_ps(a, b1, c01);   // c01 += a * b1
+
+  a = _mm256_set1_ps(A[1 * lda + k]);  // A[1][k] をブロードキャスト
+  c10 = _mm256_fmadd_ps(a, b0, c10);
+  c11 = _mm256_fmadd_ps(a, b1, c11);
+
+  // ... 同様に第 2-5 行を処理、合計 12 回の FMA
+}
+
+// 3. k ループ終了、C をメモリに書き戻し（1 回のみ）
+_mm256_storeu_ps(&amp;C[0 * N + 0], c00);
+_mm256_storeu_ps(&amp;C[0 * N + 8], c01);
+// ...</code></pre>
+
+            <p>Cachegrind 実測：D refs（データアクセス総数）が 177M から <strong>21M</strong> に減少（8.4 倍減）。C が k ループ中に繰り返し読み書きされなくなったため――以前は各 k ステップで C の 6&times;16 = 96 float を読み書きしていたが、今は k ループ全体で最初と最後に 1 回ずつのみ。</p>
+
+            <p><strong>4.3 倍の高速化</strong>、29 GFLOPS から 126 GFLOPS へ。ループ並べ替えに次いで最も重要な単一ステップの最適化だ。コンパイラはこのレベルのレジスタ編成はできない――C の大きなブロックをループ全体にわたってレジスタに保持することを自発的には行わない。これにはハードウェアリソースへの正確な理解がプログラマに求められる。</p>
+
+            <h3>Step 5: Goto-style Packing &mdash; 144.4 GFLOPS</h3>
+
+            <p>Register tiling の micro-kernel は依然として stride=K で A に、stride=N で B にアクセスしている。行列が大きい場合、隣接する micro-kernel 呼び出し間で、A と B のデータはメモリ上で不連続であり、不要なデータが間に挟まって cache line のスペースを無駄にしている。</p>
+
+            <p>解決策は Kazushige Goto が 2008 年の古典的論文（GotoBLAS の作者）で提案したもの：micro-kernel 実行前に、A と B のデータを連続したメモリ領域に再配置（pack）し、micro-kernel の各メモリ読み取りが完全に連続になるようにする。</p>
+
+<pre class="diagram"><code>元の A (stride = K):              pack_A 後 (stride = MR):
++------------------+              +---------+
+| a00 a01 a02 ...  |  MR=6 rows  | a00     |
+| a10 a11 a12 ...  |  --------&gt;  | a10     |  MR 個の値が連続
+| ...              |              | a20     |  マイクロカーネルが順番に読み取り
+| a50 a51 a52 ...  |              | ...     |
++------------------+              | a01     |
+                                  | a11     |
+                                  +---------+</code></pre>
+
+            <p>しかし packing だけでは不十分で、各キャッシュレベルが十分に活用されるようにループ構造を慎重に設計する必要がある。これが Goto-style の 3 層ループネストである：</p>
+
+<pre><code>for (size_t jc = 0; jc &lt; N; jc += NC) {       // 第 3 層: B panel が L3 に常駐
+  for (size_t kc = 0; kc &lt; K; kc += KC) {     // 第 2 層: B slice が L2 に常駐
+    pack_B(&amp;B[kc * N + jc], packed_B, kk, nc, N);
+
+    for (size_t ic = 0; ic &lt; M; ic += MC) {   // 第 1 層: A slice が L1 に常駐
+      pack_A(&amp;A[ic * K + kc], packed_A, mc, kk, K);
+
+      // Macro-kernel: MR&times;NR マイクロタイルを反復
+      for (size_t ir = 0; ir &lt; mc; ir += MR) {
+        for (size_t jr = 0; jr &lt; nc; jr += NR) {
+          microkernel_packed_6x16(
+              &amp;packed_A[ir * kk],
+              &amp;packed_B[jr * kk],
+              &amp;C[(ic + ir) * N + (jc + jr)],
+              kk, N);
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>各層のタイルサイズは各キャッシュレベルに正確に対応する：</p>
+            <ul>
+                <li><strong>MC&times;KC = 72&times;256 = 72KB</strong>：packed_A のサイズ、L1d cache（48KB）に常駐 + 少量が L2 にスピル</li>
+                <li><strong>KC&times;NC = 256&times;4096 = 4MB</strong>：packed_B のサイズ、L2（2MB）+ L3 に常駐</li>
+                <li>MC は MR(6) の倍数、NC は NR(16) の倍数でなければならず、micro-kernel が境界処理を不要にする</li>
+            </ul>
+
+            <p>設計の核心思想：packed_B は最外層ループで 1 度パックされ、すべての MC-strip で共有再利用される。packed_A は各 MC-strip で 1 度パックされ、内側ループですべての NR-strip で共有再利用される。こうして packing のオーバーヘッドは大量の micro-kernel 計算で償却される。</p>
+
+            <p>シングルスレッドで 126 から <strong>144 GFLOPS</strong>、15% の向上。大きな行列ほど向上が顕著で、大きな行列ではキャッシュ内のデータ不連続の問題がより深刻だからだ。</p>
+
+            <h3>Step 6: マルチスレッド並列 (OpenMP) &mdash; 267.2 GFLOPS</h3>
+
+            <p>前のすべての最適化はシングルスレッドだった。i7-14700KF には 14 コア 20 スレッドがある――そのうち 1 コアしか使っていなかった。他のコアも使う時だ。</p>
+
+            <p>OpenMP は C/C++/Fortran で最もよく使われる共有メモリ並列プログラミングインターフェースだ。コンパイラディレクティブ（pragma）で並列化を制御し、スレッドを手動管理しない。ループの前に <code>#pragma omp parallel for</code> を 1 行追加するだけで、コンパイラがループイテレーションを複数のスレッドに自動的に分配して実行する。</p>
+
+<pre><code>#pragma omp parallel
+{
+  // 各スレッドプライベートの packed_A バッファ
+  float* packed_A = static_cast&lt;float*&gt;(
+      std::aligned_alloc(32, MC * KC * sizeof(float)));
+
+  #pragma omp for schedule(dynamic)
+  for (size_t ic = 0; ic &lt; M; ic += MC) {
+    const size_t mc = std::min(MC, M - ic);
+    pack_A(&amp;A[ic * K + kc], packed_A, mc, kk, K);
+
+    for (size_t ir = 0; ir &lt; mc; ir += MR) {
+      for (size_t jr = 0; jr &lt; nc; jr += NR) {
+        microkernel_packed_6x16(
+            &amp;packed_A[ir * kk],
+            &amp;packed_B[jr * kk],
+            &amp;C[(ic + ir) * N + (jc + jr)],
+            kk, N);
+      }
+    }
+  }
+
+  std::free(packed_A);
+}</code></pre>
+
+            <p>並列化の重要な設計判断：</p>
+            <ul>
+                <li><strong>packed_B は共有</strong>：B panel は並列領域の外で 1 度パックされ、すべてのスレッドが読み取り専用で共有する。ロック不要</li>
+                <li><strong>packed_A はプライベート</strong>：各スレッドが自分の packed_A バッファを確保する。複数のスレッドが 1 つのバッファを共有すると false sharing が発生する――異なるスレッドが同じ cache line に書き込み、cache line がコア間で絶えず往復する（cache ping-pong）ことで、性能に深刻な影響を及ぼす</li>
+                <li><strong>並列粒度</strong>：MC-strip（つまり ic ループ）レベルで並列化。各 MC-strip は C 行列の独立した 72 行を処理し、strip 間に書き込み競合がなく、同期が不要</li>
+                <li><strong><code>schedule(dynamic)</code></strong>：動的スケジューリングでは、アイドルのスレッドが次の未処理 strip を自動的に取得する。負荷が不均等なシナリオ（行列の行数が MC で割り切れず、最後の strip が小さくなる場合など）に適している</li>
+            </ul>
+
+            <p>144 から <strong>267 GFLOPS</strong>、1.85 倍の高速化。理想的な線形スケーリング（14 コアなら 14 倍）には達していない。原因は：メモリ帯域幅がボトルネックになること、L3 cache の競合、スレッドスケジューリングのオーバーヘッド、そして pack_B がまだシングルスレッドでシリアル実行されていることだ。しかし N=1024 のスケールで 267 GFLOPS は十分に良い結果である。</p>
+
+            <h3>Step 7: マイクロ最適化 (Unroll + Prefetch + Huge Pages) &mdash; 266.3 GFLOPS</h3>
+
+            <p>最後に 3 つのマイクロ最適化を試みた：</p>
+
+            <p><strong>1) k-unroll by 4</strong></p>
+
+            <p>micro-kernel の k ループを 4 回展開する。展開しない場合、各イテレーション終了ごとに比較、インクリメント、ジャンプ命令を実行する必要がある。展開後は 4 イテレーションにつき 1 セットの制御命令で済み、ループオーバーヘッドが削減される。さらに重要なのは、展開により CPU に同時実行できる命令が増えること――現代の CPU はアウトオブオーダー実行を行い、ある命令がデータ待ちの間にそれに依存しない後続の命令を先に実行する。展開はこのような並列機会をより多く露出させる。</p>
+
+<pre><code>for (; k + 4 &lt;= kc; k += 4) {
+  _mm_prefetch(packed_A + 4 * MR, _MM_HINT_T0);
+  _mm_prefetch(packed_B + 4 * NR, _MM_HINT_T0);
+
+  MICRO_ITER(packed_A + 0 * MR, packed_B + 0 * NR);
+  MICRO_ITER(packed_A + 1 * MR, packed_B + 1 * NR);
+  MICRO_ITER(packed_A + 2 * MR, packed_B + 2 * NR);
+  MICRO_ITER(packed_A + 3 * MR, packed_B + 3 * NR);
+
+  packed_A += 4 * MR;
+  packed_B += 4 * NR;
+}</code></pre>
+
+            <p><strong>2) Software prefetch</strong></p>
+
+            <p>CPU にはハードウェアプリフェッチャーがあり、連続的なメモリアクセスパターンを自動検出してデータを事前にロードできる。しかしハードウェアプリフェッチャーは万能ではない――シンプルな線形パターン（連続的な増加など）しか認識できず、ジャンプ式のアクセスや分岐後のアクセスパターンには予測が不正確になることがある。</p>
+
+            <p>Software prefetch は <code>_mm_prefetch</code> 命令で、CPU に明示的に伝える：「数ステップ後にこのアドレスのデータが必要になるので、今からメモリからキャッシュにロードを始めてくれ。」これにより、コードが実際にそのデータを必要とする時にはすでにキャッシュ内にあり、メモリ待ちのレイテンシ（通常 50-100ns）を回避できる。</p>
+
+            <p><code>_MM_HINT_T0</code> は L1 cache（最も近く、最も速い）にロードすることを意味し、<code>_MM_HINT_T1</code> は L2 cache にロードする。次の B panel には <code>_MM_HINT_T1</code> を使う。サイズが大きいため L2 に配置する方が適切だからだ。</p>
+
+            <p><strong>3) Transparent Huge Pages</strong></p>
+
+            <p>これは仮想メモリの重要なコンポーネントに関わる：TLB（Translation Lookaside Buffer、ページテーブルキャッシュ）。</p>
+
+            <p>現代の OS は仮想メモリを使用する――プログラムが見るメモリアドレスは実際の物理アドレスではなく、ページテーブルを通じて変換が必要だ。この変換プロセスは遅く（複数レベルのページテーブルへのアクセスが必要な場合がある）、そのため CPU は TLB を使って最近使われたアドレス変換結果をキャッシュする。TLB の容量は非常に小さく、典型的な L1 dTLB にはわずか 64-128 エントリしかない。</p>
+
+            <p>デフォルトのメモリページサイズは 4KB。TLB に 128 エントリがある場合、カバーできるメモリ範囲は 128 &times; 4KB = 512KB のみ。我々の packed_B は 4MB――TLB のカバー範囲をはるかに超えている。micro-kernel が packed_B を走査する時、大量の TLB miss が頻繁なページテーブル検索を引き起こす。</p>
+
+            <p>Huge pages はページサイズを 4KB から 2MB に拡大する。同じ 128 TLB エントリで 128 &times; 2MB = 256MB をカバーでき、4MB の packed_B は余裕で収まる。</p>
+
+<pre><code>// packed_B (~4MB) に 2MB huge pages を使用、TLB miss を削減
+void* ptr = std::aligned_alloc(2 * 1024 * 1024, aligned_bytes);
+madvise(ptr, aligned_bytes, MADV_HUGEPAGE);</code></pre>
+
+            <p><code>madvise</code> は Linux システムコールで、<code>MADV_HUGEPAGE</code> はカーネルにこのメモリ領域でトランスペアレントヒュージページを使いたいと伝える。packed_A（各スレッド 72KB）は小さすぎるため、2MB ヒュージページを使うとかえって無駄になるので、packed_B にのみ使用する。</p>
+
+            <p>実際の効果：N=1024 で <strong>267 &rarr; 266 GFLOPS</strong>、ほぼ向上なし。このスケールではハードウェアプリフェッチャー自体がすでに十分に機能しており、pack 後のデータアクセスパターンも規則的だ。これらのマイクロ最適化はより大きな行列（N=2048+）でより顕著な効果がある――データ量が大きいほど TLB miss と prefetch の影響が顕著になる。</p>
+
+            <h3>Cachegrind キャッシュ分析</h3>
+
+            <p>Valgrind はプログラム分析ツールフレームワークで、その cachegrind モジュールはプログラムのキャッシュ動作の分析に特化している。CPU のキャッシュ階層をシミュレートし、各メモリアクセスが L1/L2/L3 cache にヒットしたかどうかを統計する。</p>
+
+            <p>使い方はシンプルだ：</p>
+
+<pre><code># まず最適化版の実行ファイルをビルド
+bazel build -c opt //bench:cache_profile
+
+# cachegrind 下で実行、分析するバージョンと行列サイズを指定
+valgrind --tool=cachegrind ./bazel-bin/bench/cache_profile naive 512</code></pre>
+
+            <p>cachegrind は詳細なキャッシュ統計を出力する。ここでの重要な指標：</p>
+            <ul>
+                <li><strong>D refs</strong>：データアクセス総回数（読み取りと書き込みを含む）。プログラムのメモリアクセス頻度を反映</li>
+                <li><strong>D1 misses</strong>：L1 データキャッシュミス回数。各ミスはデータが最速の L1 cache にないことを意味し、より遅い L2/L3 またはメインメモリから取得する必要がある</li>
+                <li><strong>D1 miss rate</strong>：D1 misses / D refs。低いほど良い</li>
+            </ul>
+
+            <p>cachegrind はプログラムの実行を 10-50 倍遅くするため（キャッシュをシミュレートしているため）、N=1024 ではなく N=512 でテスト：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>バージョン</th>
+                        <th>D refs</th>
+                        <th>D1 misses</th>
+                        <th>D1 miss rate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Baseline (i-j-k)</td>
+                        <td>177M</td>
+                        <td>58.1M</td>
+                        <td><strong>32.8%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Naive (i-k-j)</td>
+                        <td>177M</td>
+                        <td>8.5M</td>
+                        <td><strong>4.8%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Tiled</td>
+                        <td>179M</td>
+                        <td>1.6M</td>
+                        <td><strong>0.9%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Register Tiling</td>
+                        <td>21M</td>
+                        <td>1.6M</td>
+                        <td><strong>7.8%</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>このテーブルは非常に注意深く見る価値がある。各最適化ステップのメカニズムを正確に説明しているからだ：</p>
+
+            <ul>
+                <li><strong>Baseline &rarr; Naive</strong>：D refs は同じ（177M）だが、D1 misses が 58.1M から 8.5M に減少。アクセス回数は変わらないが miss が大幅に減少した――これがループ並べ替えの威力だ。同じ計算量でアクセス順序を変えただけで、cache ヒット率が 67% から 95% に向上した。</li>
+                <li><strong>Naive &rarr; Tiled</strong>：D refs はほぼ変わらず（177M &rarr; 179M）だが、D1 misses は 8.5M から 1.6M に減少、miss rate は 4.8% から 0.9% に。ブロック分割によりデータがキャッシュ内でより多く再利用された（データがキャッシュに入った後、追い出される前に繰り返し使用される）。</li>
+                <li><strong>Tiled &rarr; Register Tiling</strong>：重要な変化は D refs にある――179M から <strong>21M</strong> に減少、8.5 倍減！D1 miss の絶対数は同じ（1.6M）だが、分母（D refs）が大幅に縮小したため miss rate はむしろ 7.8% に上昇した。これこそが register tiling の核心：miss を減らしたのではなく、<strong>メモリへのアクセス自体を根本的に減らした</strong>――C の読み書きはすべてレジスタ内で完了している。</li>
+            </ul>
+
+            <h3>まとめと考察</h3>
+
+            <p>このプロジェクトで最も印象に残ったポイント：</p>
+
+            <p><strong>1. メモリアクセスパターンが第一のパフォーマンスキラー。</strong>ループの並べ替えだけで 36 倍の高速化を達成した。現代のハードウェアでは、キャッシュフレンドリーなアクセスパターンはどんな高度な最適化よりも重要だ。2 つの書き方の算術演算量はまったく同じで、性能は 36 倍違った。</p>
+
+            <p><strong>2. すべての「古典的最適化」が有効なわけではない。</strong>Cache tiling と手書き SIMD はこのシナリオでは向上をもたらさなかった。現代のコンパイラは非常に強力で、<code>-O3 -march=native -ffast-math</code> の威力を過小評価してはならない。最適化を行う前に、まずコンパイラが何をしているか確認しよう。</p>
+
+            <p><strong>3. Register tiling が重要なブレークスルー。</strong>これはコンパイラにできない最適化だ――プログラマがハードウェアのレジスタ数、各レジスタに何を入れるべきか、計算密度をどう最大化するかを正確に理解する必要がある。12 個の YMM レジスタで C のサブブロックを保持し、k ループ中の C への繰り返し読み書きを排除、D refs を 8.5 倍減少させた。</p>
+
+            <p><strong>4. Packing が解決するのはデータレイアウトの問題。</strong>A と B を micro-kernel フレンドリーな連続メモリに再配置し、cache line の各バイトを十分に活用する。Goto-style の 3 層ループは L1/L2/L3 の 3 レベルキャッシュに正確に対応し、工学と理論の融合の典型である。</p>
+
+            <p><strong>5. マイクロ最適化の限界効用逓減。</strong>Unroll、prefetch、huge pages の最適化は N=1024 ではほぼ効果がなかった。パフォーマンス最適化はパレートの法則に従う――80% の効果は 20% の重要な最適化から得られる。</p>
+
+            <p>0.98 から 267 GFLOPS まで、<strong>273 倍の高速化</strong>。このプロセスを通じて、Knuth のあの有名な格言の前半（人々は後半だけ覚えがちだが）を真に理解した：</p>
+
+            <p><em>"We should forget about small efficiencies, say about 97% of the time: premature optimization is the root of all evil. Yet we should not pass up our opportunities in that critical 3%."</em></p>
+
+            <p>鍵はその 3% を見つけることだ。</p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

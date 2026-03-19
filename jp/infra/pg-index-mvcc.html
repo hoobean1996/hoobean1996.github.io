@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL ストレージエンジンの内部構造（中）：インデックススキャンと MVCC - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL ストレージエンジンの内部構造（中）：インデックススキャンと MVCC</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/rembrandt-magnifying-glass.jpg" alt="Man with a Magnifying Glass, Rembrandt, early 1660s">
+                <figcaption>Rembrandt,《拡大鏡を持つ男》, 約 1660年代 — 彼は拡大鏡を掲げ、レンズを通して目の前のものを精査する。これこそが MVCC のスナップショットだ：同じデータでも、異なるトランザクションが異なる「レンズ」を通して異なるバージョンを見る。可視か不可視かは、いつその鏡を手に取ったかによって決まる</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL ストレージエンジンの内部構造</strong><br>
+                <a href="pg-heap-buffer.html">上：Heap Page と Buffer Pool</a> ·
+                <span class="current">中：インデックススキャンと MVCC</span> ·
+                <a href="pg-wal-checkpoint.html">下：WAL、Checkpoint と永続性</a>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：前回は Heap Page の内部レイアウトと Buffer Pool がページキャッシュをどう管理するかを見た。しかし重要な問題がまだ答えられていない：複数のトランザクションが同時に同じテーブルを読み書きする時、各トランザクションが見るデータはどう決まるのか？この記事は 2 つのパスを追跡する――インデックススキャンが B-Tree のリーフノードから Heap Page にジャンプしてデータを取得する仕組みと、MVCC スナップショットが行データが「あなたに可視か不可視か」をどう決定するか。これらを理解して初めて、トランザクション分離レベルが抽象的な概念ではなく、具体的なデータ構造であることが真に理解できる。
+            </blockquote>
+
+            <h3>インデックススキャン：B-Tree から Heap へ</h3>
+
+            <p>前回はシーケンシャルスキャン――Heap 全体をページごとに走査する方法を説明した。インデックススキャンはもう一つのパスである：まずインデックスで TID を特定し、次に TID で Heap からデータを取得する。</p>
+
+            <h4>インデックスもテーブルである</h4>
+
+            <p>PostgreSQL では、インデックスも通常のテーブルと同様に Relation であり、独自のファイル、独自の Page 構造を持つ。違いはインデックス Page にはユーザーデータではなく、<strong>インデックスキー + TID</strong> のマッピングが格納されていることだ。</p>
+
+<pre class="diagram"><code>  CREATE INDEX users_age_idx ON users(age);
+
+  インデックススキャンは 2 つの Relation に関与する：
+
+  indexRelation (users_age_idx)          heapRelation (users)
+  ┌─────────────────────────┐           ┌──────────────────────────┐
+  │  B-Tree Page            │           │  Heap Page               │
+  │                         │           │                          │
+  │  ┌───────────────────┐  │           │  ┌────────────────────┐  │
+  │  │ age=20 → TID(1,3) │  │     ┌────►  │ ItemId[3] → Tuple  │  │
+  │  │ age=25 → TID(5,1) │──┼─────┘    │  │  (id=42, name=     │  │
+  │  │ age=25 → TID(8,7) │  │          │  │   'Alice', age=25) │  │
+  │  │ age=30 → TID(2,5) │  │          │  └────────────────────┘  │
+  │  └───────────────────┘  │           │                          │
+  └─────────────────────────┘           └──────────────────────────┘
+
+  IndexScanDesc は両方の Relation への参照を保持する</code></pre>
+
+            <p><code>IndexScanDesc</code> はインデックススキャンの記述子であり、主要フィールドは：</p>
+            <ul>
+                <li><code>heapRelation</code>：インデックス対象のテーブル</li>
+                <li><code>indexRelation</code>：インデックス自体</li>
+                <li><code>xs_heaptid</code>：現在見つかった TID、次のヒープアクセスに使用</li>
+            </ul>
+
+            <h4>ExecIndexScan の実行フロー</h4>
+
+<pre class="diagram"><code>  ExecIndexScan
+      │
+      │ Runtime Key あり？（例：WHERE id = $1）
+      │ はい → まずパラメータ値を計算してからスキャン開始
+      │
+      ├── ORDER BY あり？
+      │   はい → IndexNextWithReorder（ソート付きインデックススキャン）
+      │   いいえ → IndexNext（通常のインデックススキャン）
+      │
+      ▼
+  IndexNext
+      │
+      ▼
+  index_getnext_slot ─────────────────────────────────────┐
+      │                                                    │
+      │  ┌─────────────────────────────────┐               │
+      │  │ フェーズ 1: インデックスから TID 取得│              │
+      │  │                                  │               │
+      │  │ amgettuple(scan, direction)      │               │
+      │  │  → B-Tree: btgettuple()         │               │
+      │  │  → Hash:   hashgettuple()       │               │
+      │  │  → GIN:    gingettuple()        │               │
+      │  │  → GiST:   gistgettuple()      │               │
+      │  │                                  │               │
+      │  │ 結果: scan->xs_heaptid = TID    │               │
+      │  └─────────────────────────────────┘               │
+      │                                                    │
+      │  ┌─────────────────────────────────┐               │
+      │  │ フェーズ 2: TID でヒープアクセス   │               │
+      │  │ して Tuple を取得                │               │
+      │  │                                  │               │
+      │  │ index_fetch_heap()              │               │
+      │  │  → table_index_fetch_tuple()    │               │
+      │  │  → heapam_index_fetch_tuple()   │               │
+      │  │  → heap_hot_search_buffer()     │  ← HOT チェーン│
+      │  │                                  │    の走査      │
+      │  │ MVCC 可視性チェックを含む         │               │
+      │  └─────────────────────────────────┘               │
+      │                                                    │
+      │  Tuple が不可視 → フェーズ 1 に戻り次の TID を取得  │
+      └────────────────────────────────────────────────────┘</code></pre>
+
+            <p>Runtime Key は重要な概念である：クエリプランニング時に確定できない値のこと。例えば <code>WHERE id = $1</code> のパラメータ、<code>WHERE id = (SELECT max_id FROM others)</code> のサブクエリ結果。これらの値は executor 起動時に初めて計算され、インデックススキャンに渡される。</p>
+
+            <h4>B-Tree 内部：btgettuple</h4>
+
+            <p>B-Tree は PostgreSQL で最もよく使われるインデックスタイプである。<code>btgettuple</code> のロジックは直截的だ：</p>
+
+            <ul>
+                <li><strong>初回呼び出し</strong>：<code>_bt_first()</code> が B-Tree 内で開始位置を特定する――ルートノードからリーフノードまで下降し、スキャン条件を満たす最初のインデックスエントリを見つける</li>
+                <li><strong>以降の呼び出し</strong>：<code>_bt_next()</code> がリーフノードのリンクリスト上で前方/後方に移動し、次のエントリを取得</li>
+                <li>位置を見つけた後、<code>_bt_returnitem()</code> が現在位置から TID を抽出する：<code>scan->xs_heaptid = currItem->heapTid</code></li>
+            </ul>
+
+<pre class="diagram"><code>  B-Tree 構造（簡略化）：
+
+          ┌──────────────┐
+          │  Root Page   │
+          │  [20] [50]   │
+          └──┬──────┬────┘
+             │      │
+      ┌──────▼──┐  ┌▼──────────┐
+      │ Internal │  │ Internal   │
+      │ [10][20] │  │ [30][50]   │
+      └──┬───┬──┘  └──┬────┬───┘
+         │   │        │    │
+    ┌────▼┐ ┌▼────┐ ┌─▼──┐ ┌▼────┐
+    │Leaf │↔│Leaf │↔│Leaf│↔│Leaf │    ← リーフノード双方向リンクリスト
+    │5,8  │ │12,18│ │25  │ │35,42│
+    │TIDs │ │TIDs │ │TIDs│ │TIDs │
+    └─────┘ └─────┘ └────┘ └─────┘
+
+  WHERE age = 25:
+  1. _bt_first: Root → Internal → 第 3 リーフを特定
+  2. リーフ内で age=25 のエントリを見つけ、TID を抽出
+  3. _bt_next: リーフリンクリスト上でスキャンを継続、age ≠ 25 まで</code></pre>
+
+            <h4>ヒープアクセス：TID から Tuple へ</h4>
+
+            <p>TID を取得した後、<code>index_fetch_heap</code> が Heap からデータを取得する。ヒープテーブルの場合、実際には <code>heapam_index_fetch_tuple</code> が呼ばれ、その核心は <code>heap_hot_search_buffer</code> である：</p>
+
+<pre><code>// インデックスヒープアクセスの完全なパス（簡略化）
+
+// 1. インデックスが TID = (5, 1) を提供
+scan->xs_heaptid = {block: 5, offset: 1};
+
+// 2. Heap Page 5 を Buffer Pool に読み込み
+buffer = ReadBuffer(heapRelation, 5);
+
+// 3. Page 5 上で HOT チェーンを検索
+heap_hot_search_buffer(
+    tid,        // 開始 TID (5, 1)
+    relation,   // users テーブル
+    buffer,     // Page 5 の buffer
+    snapshot,   // 現在のトランザクションのスナップショット  ← MVCC はここで機能
+    &found
+);
+
+// 4. HOT チェーンをたどる：
+//    ItemId[1] → Tuple A (t_ctid が ItemId[2] を指す)
+//    ItemId[2] → Tuple B (t_ctid が ItemId[3] を指す)
+//    ItemId[3] → Tuple C (t_ctid が自分自身を指す = チェーン末端)
+//
+//    各バージョンで HeapTupleSatisfiesVisibility(snapshot) を呼び出し
+//    現在のスナップショットに可視なバージョンを返却</code></pre>
+
+            <p>ここで <code>snapshot</code> パラメータが登場する――これが MVCC の入口である。インデックス自体にはバージョン情報が格納されておらず、すべてのバージョン判定はヒープアクセス後に行われる。つまりインデックススキャンでインデックスから TID を取得しても、ヒープアクセス後にその行が現在のトランザクションに不可視だと判明する場合があり、その場合は次の TID の取得に進む。</p>
+
+            <h4>Lossy インデックスと Recheck</h4>
+
+            <p>一部のインデックス（GIN、GiST など）は「有損」である――インデックスは「この Tuple はマッチする可能性がある」と教えてくれるが、確実なマッチは保証しない。ヒープアクセス後に元の条件で再チェックが必要である：</p>
+
+<pre><code>// IndexNext の recheck ロジック
+while (index_getnext_slot(scandesc, direction, slot)) {
+    if (scandesc->xs_recheck) {
+        // インデックスが lossy なので、元の条件で再検証が必要
+        if (!ExecQualAndReset(node->indexqualorig, econtext))
+            continue;  // マッチしない、スキップ
+    }
+    return slot;  // マッチ、返却
+}</code></pre>
+
+            <h3>MVCC：多バージョン同時実行制御</h3>
+
+            <p>ここからこの記事の核心に入る。MVCC の目標は<strong>読み取りが書き込みをブロックせず、書き込みが読み取りをブロックしない</strong>ことだ。PG は各行データの複数バージョンを同時に存在させることでこれを実現する――各トランザクションが見るのはある時点の「スナップショット」である。</p>
+
+            <h4>トランザクション ID：論理クロック</h4>
+
+            <p>PG はトランザクション ID（TransactionId、略称 XID）を「論理クロック」として使用する。各書き込みトランザクション開始時に単調増加する XID が割り当てられる。可視性判定の核心は XID の比較である：</p>
+
+            <table>
+                <thead>
+                    <tr><th>行ヘッダフィールド</th><th>意味</th><th>可視性判定</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>t_xmin</code></td><td>このバージョンを作成したトランザクション</td><td>xmin のトランザクションがコミット済みでスナップショット前 → このバージョンは「生まれた」</td></tr>
+                    <tr><td><code>t_xmax</code></td><td>このバージョンを削除/更新したトランザクション</td><td>xmax = 0 または xmax がコミット未済 → このバージョンは「まだ生きている」</td></tr>
+                </tbody>
+            </table>
+
+            <p>Tuple があなたに可視な条件：<strong>すでに生まれている（xmin がコミット済み）かつ、まだ死んでいない（xmax が無効またはコミット未済）</strong>。</p>
+
+<pre class="diagram"><code>  トランザクションタイムライン：
+
+  XID:  100      101      102      103      104
+         │        │        │        │        │
+         │  INSERT │        │ UPDATE │        │
+         │  xmin=101       │ 新バージョン│      │
+         │        │        │ xmin=103│        │
+         │        │        │ 旧バージョン│      │
+         │        │        │ xmax=103│        │
+
+  トランザクション 104 のスナップショットはここで撮影 ──────►│
+
+  トランザクション 104 にとって：
+  旧バージョン：xmin=101(コミット済み✓) xmax=103(コミット済み✓) → 死亡 → 不可視
+  新バージョン：xmin=103(コミット済み✓) xmax=0(まだ生存✓)   → 可視 ✓</code></pre>
+
+            <h4>SnapshotData：スナップショットのデータ構造</h4>
+
+            <p>スナップショットは「時点」ではなく、具体的なデータ構造である：</p>
+
+<pre><code>typedef struct SnapshotData {
+    TransactionId xmin;    // XID < xmin のすべてのトランザクションはコミット済み（確実に可視）
+    TransactionId xmax;    // XID >= xmax のすべてのトランザクションは未開始（確実に不可視）
+    TransactionId *xip;    // xmin と xmax の間で実行中のトランザクションリスト
+    uint32 xcnt;           // xip 配列の長さ
+} SnapshotData;</code></pre>
+
+<pre class="diagram"><code>  スナップショットの 3 つの区間：
+
+  XID:  95  96  97  98  99  100  101  102  103  104  105
+        ────────────┬───────────────────────┬────────────
+                    │                       │
+               snapshot.xmin           snapshot.xmax
+
+  ◄── 確実に可視 ──►│◄── xip 配列の確認要 ──►│◄── 確実に不可視 ──►
+
+  xip[] = {99, 101}  ← スナップショット撮影時にまだ実行中のトランザクション
+
+  判定ロジック：
+  XID 96: < xmin → コミット済み → 可視 ✓
+  XID 99: xip 内にある → まだ実行中 → 不可視 ✗
+  XID 100: xip 内にない → コミット済み → 可視 ✓
+  XID 101: xip 内にある → まだ実行中 → 不可視 ✗
+  XID 104: >= xmax → 未開始 → 不可視 ✗</code></pre>
+
+            <p>この設計は精巧だ：<code>xmin</code> と <code>xmax</code> で大部分のトランザクションを高速に除外し、中間の区間に入るものだけ <code>xip</code> 配列を確認する必要がある。</p>
+
+            <h4>分離レベル：いつスナップショットを撮るか</h4>
+
+            <p>トランザクション分離レベルの本質的な違いは「何を見るか」ではなく、<strong>いつスナップショットを撮るか</strong>にある：</p>
+
+            <table>
+                <thead>
+                    <tr><th>分離レベル</th><th>スナップショット戦略</th><th>効果</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Read Committed</strong></td><td>各ステートメント開始時に新しいスナップショットを撮影</td><td>同一トランザクション内で、2 回の SELECT が異なるデータを見る可能性がある</td></tr>
+                    <tr><td><strong>Repeatable Read</strong></td><td>トランザクション開始時に 1 回スナップショットを撮影し、トランザクション全体で再利用</td><td>同一トランザクション内で、複数回の SELECT が一貫したデータを見る</td></tr>
+                    <tr><td><strong>Serializable</strong></td><td>Repeatable Read と同様 + 追加の競合検出</td><td>シリアル実行をシミュレートし、競合検出時にロールバック</td></tr>
+                </tbody>
+            </table>
+
+<pre><code>-- Read Committed：各ステートメントごとに新しいスナップショット
+BEGIN;
+SELECT count(*) FROM users;  -- スナップショット S1 → 100 行を参照
+-- この時、別のトランザクションが 1 行挿入してコミット
+SELECT count(*) FROM users;  -- スナップショット S2（新しい！）→ 101 行を参照
+COMMIT;
+
+-- Repeatable Read：トランザクション全体で 1 つのスナップショットを再利用
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM users;  -- スナップショット S1 → 100 行を参照
+-- この時、別のトランザクションが 1 行挿入してコミット
+SELECT count(*) FROM users;  -- まだスナップショット S1 → 依然として 100 行を参照
+COMMIT;</code></pre>
+
+            <p>コードレベルでは、<code>GetTransactionSnapshot()</code> がこの判断を行う：</p>
+
+            <ul>
+                <li>Read Committed：呼び出しごとに新しいスナップショットを作成</li>
+                <li>Repeatable Read / Serializable：初回呼び出しでスナップショットを作成してキャッシュし、以降はキャッシュされたスナップショットを返却</li>
+            </ul>
+
+            <h4>いつスナップショットが必要か</h4>
+
+            <p>すべての SQL がスナップショットを必要とするわけではない：</p>
+
+            <table>
+                <thead>
+                    <tr><th>ステートメントタイプ</th><th>スナップショット要否</th><th>理由</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>SELECT / INSERT / UPDATE / DELETE</td><td>要</td><td>テーブルデータにアクセスする必要があり、可視性判定が必須</td></tr>
+                    <tr><td>CREATE TABLE / DROP TABLE / ALTER</td><td>否</td><td>DDL 操作はメタデータに対するもので、行レベルの可視性は関与しない</td></tr>
+                    <tr><td>EXPLAIN</td><td>場合による</td><td>EXPLAIN ANALYZE の場合は実際に実行するため必要</td></tr>
+                </tbody>
+            </table>
+
+            <p>PG は <code>analyze_requires_snapshot</code> 関数で現在のステートメントにスナップショットが必要かどうかを判断し、不要な操作のためにスナップショットを作成するオーバーヘッドを回避する。</p>
+
+            <h4>可視性判定の完全なルール</h4>
+
+            <p>実際の可視性判定は「xmin がコミット済みで xmax が無効」よりはるかに複雑である。<code>HeapTupleSatisfiesMVCC</code> は以下のケースを処理する必要がある：</p>
+
+            <table>
+                <thead>
+                    <tr><th>シナリオ</th><th>xmin の状態</th><th>xmax の状態</th><th>結果</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>挿入直後、トランザクション未コミット</td><td>実行中</td><td>—</td><td>挿入者自身のみに可視</td></tr>
+                    <tr><td>挿入されコミット済み</td><td>コミット済み、スナップショット前</td><td>無効 (0)</td><td>可視</td></tr>
+                    <tr><td>削除済み、削除トランザクション未コミット</td><td>コミット済み</td><td>実行中</td><td>可視（削除はまだ有効でない）</td></tr>
+                    <tr><td>削除されコミット済み</td><td>コミット済み</td><td>コミット済み、スナップショット前</td><td>不可視（死亡）</td></tr>
+                    <tr><td>更新済み、新バージョンが存在</td><td>コミット済み</td><td>コミット済み</td><td>不可視（新バージョンを参照）</td></tr>
+                    <tr><td>挿入トランザクションがロールバック済み</td><td>ロールバック済み</td><td>—</td><td>不可視（存在しなかった）</td></tr>
+                </tbody>
+            </table>
+
+            <p>PG にはもう一つの最適化がある：<code>t_infomask</code> の hint bits。初回に行の xmin/xmax の状態を確認する際に CLOG（トランザクションコミットログ）を参照する必要があるが、確認後に <code>t_infomask</code> に「コミット済み」または「ロールバック済み」のマークを設定し、以降のチェックではマークを直接読み取って CLOG 参照をスキップする。</p>
+
+            <h4>EPQ：同時更新の競合処理</h4>
+
+            <p>スキャン中に Tuple が別のトランザクションによって修正されていることを検出すると、<strong>EvalPlanQual（EPQ）</strong>メカニズムがトリガーされる：</p>
+
+            <ul>
+                <li>通常のスキャン中にターゲット Tuple が同時修正されていることを検出</li>
+                <li>修正トランザクションの完了（コミットまたはロールバック）を待機</li>
+                <li>修正後の新バージョン Tuple を取得</li>
+                <li>現在のクエリの WHERE 条件で新バージョンを再評価</li>
+                <li>新バージョンが条件を満たす → 新バージョンを返却；そうでなければスキップ</li>
+            </ul>
+
+            <p>これは Read Committed 分離レベルでの UPDATE と DELETE に必要なメカニズムである――修正中の行をスキップすることはできないし、旧バージョンに基づいて判断を下すこともできない。</p>
+
+            <h3>スキャン方式の全体像</h3>
+
+            <p>PG は複数のスキャン方式を提供し、それぞれ異なる accessMtd 関数ポインタを持つ：</p>
+
+            <table>
+                <thead>
+                    <tr><th>スキャン方式</th><th>accessMtd</th><th>原理</th><th>適用シナリオ</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Sequential Scan</strong></td><td>SeqNext</td><td>Heap 全体をページごとに走査</td><td>フルテーブルスキャン、インデックスなし</td></tr>
+                    <tr><td><strong>Index Scan</strong></td><td>IndexNext</td><td>B-Tree で特定 → ヒープアクセスで Tuple 取得</td><td>高選択性クエリ</td></tr>
+                    <tr><td><strong>Index Only Scan</strong></td><td>IndexOnlyNext</td><td>インデックスのみ読み取り、ヒープアクセスなし</td><td>クエリ列がすべてインデックスに含まれる</td></tr>
+                    <tr><td><strong>Bitmap Heap Scan</strong></td><td>BitmapHeapNext</td><td>まず全 TID を収集しソート、次に一括ヒープアクセス</td><td>中程度の選択性、ランダム I/O 削減</td></tr>
+                    <tr><td><strong>TID Scan</strong></td><td>TidNext</td><td>TID で直接特定</td><td>CURRENT OF カーソル</td></tr>
+                </tbody>
+            </table>
+
+            <p>すべてのスキャン方式は最終的に <code>ExecScanExtended</code> で統一的にディスパッチされる：</p>
+
+<pre><code>// 統一スキャンフレームワーク
+ExecScanExtended(
+    ScanState *node,
+    ExecScanAccessMtd accessMtd,    // SeqNext / IndexNext / BitmapHeapNext / ...
+    ExecScanRecheckMtd recheckMtd,  // 対応する recheck 関数
+    EPQState *epqstate,             // 同時実行制御
+    ExprState *qual,                // WHERE 条件
+    ProjectionInfo *projInfo        // SELECT プロジェクション
+);</code></pre>
+
+            <p>この設計により、ストレージアクセスメソッドは完全にプラグ可能になっている――<code>heapam_methods</code> はデフォルトのヒープテーブル実装だが、PG の Table Access Method API によりストレージエンジン全体を置き換えることができる：</p>
+
+<pre><code>// heapam_methods：ヒープテーブルの関数テーブル
+static const TableAmRoutine heapam_methods = {
+    .scan_begin          = heap_beginscan,
+    .scan_getnextslot    = heap_getnextslot,
+    .index_fetch_tuple   = heapam_index_fetch_tuple,
+    .tuple_insert        = heapam_tuple_insert,
+    .tuple_delete        = heapam_tuple_delete,
+    .tuple_update        = heapam_tuple_update,
+    // ... 50+ の関数ポインタ
+};</code></pre>
+
+            <p>つまり理論的にはカラムナストレージエンジン、LSM-Tree エンジンなどを実装し、PG の実行フレームワークに組み込むことができる。Heap はデフォルトの選択であり、唯一の選択ではない。</p>
+
+            <h3>インデックスタイプの全体像</h3>
+
+            <p>PG は複数のインデックスタイプをサポートしており、それぞれ独自の <code>IndexAmRoutine</code> を持つ：</p>
+
+            <table>
+                <thead>
+                    <tr><th>インデックスタイプ</th><th>amgettuple</th><th>データ構造</th><th>適用シナリオ</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>B-Tree</strong></td><td>btgettuple</td><td>平衡探索木、リーフノードリンクリスト</td><td>等値クエリ、範囲クエリ、ソート（最も汎用的）</td></tr>
+                    <tr><td><strong>Hash</strong></td><td>hashgettuple</td><td>ハッシュバケット</td><td>等値クエリ（B-Tree より高速だが範囲非対応）</td></tr>
+                    <tr><td><strong>GIN</strong></td><td>gingettuple</td><td>転置インデックス</td><td>全文検索、配列包含、JSONB</td></tr>
+                    <tr><td><strong>GiST</strong></td><td>gistgettuple</td><td>汎用探索木</td><td>幾何データ、範囲型、全文検索</td></tr>
+                    <tr><td><strong>BRIN</strong></td><td>—</td><td>ブロック範囲インデックス</td><td>時系列データなど物理的に順序付けされた大規模テーブル</td></tr>
+                </tbody>
+            </table>
+
+            <p>これらは同一の <code>index_getnext_slot</code> 呼び出しフレームワークを共有し、<code>rd_indam->amgettuple</code> 関数ポインタで具体的な実装にディスパッチされる。</p>
+
+            <h3>すべてをつなげる：インデックスクエリの完全なパス</h3>
+
+<pre class="diagram"><code>  SELECT name FROM users WHERE age = 25;
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ Executor                                                  │
+  │                                                           │
+  │  ExecIndexScan                                            │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  IndexNext                                                │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  index_getnext_slot                                       │
+  │      │                                                    │
+  │      ├─── btgettuple ──────────────────────────┐          │
+  │      │    B-Tree: Root → Internal → Leaf        │          │
+  │      │    age=25 を発見, TID=(5,1)              │          │
+  │      │                                          │          │
+  │      ├─── index_fetch_heap ◄───────────────────┘          │
+  │      │    Heap Page 5 を Buffer Pool に読み込み            │
+  │      │                                                    │
+  │      ├─── heap_hot_search_buffer                          │
+  │      │    │                                               │
+  │      │    │  ItemId[1] → Tuple v1 (xmin=90, xmax=95)     │
+  │      │    │  HeapTupleSatisfiesMVCC(snapshot) → 不可視     │
+  │      │    │                                               │
+  │      │    │  t_ctid をたどる → ItemId[2]                   │
+  │      │    │  Tuple v2 (xmin=95, xmax=0)                   │
+  │      │    │  HeapTupleSatisfiesMVCC(snapshot) → 可視 ✓     │
+  │      │    │                                               │
+  │      │    └─► Tuple v2 を返却                              │
+  │      │                                                    │
+  │      ├─── ExecQual(WHERE age=25) → 合格                   │
+  │      │    （B-Tree は精密だが、recheck は依然存在）        │
+  │      │                                                    │
+  │      └─── ExecProject → name 列をプロジェクション →        │
+  │           クライアントに返却                               │
+  │                                                           │
+  └──────────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>まとめ</h3>
+
+            <p>覚えておくべき重要な直感：</p>
+
+            <ul>
+                <li><strong>インデックスにはバージョン情報が格納されない</strong>：インデックスは key → TID マッピングのみを格納し、すべての MVCC 判定はヒープアクセス後に行われる。つまりインデックススキャンで TID を取得しても、ヒープアクセス後に不可視だと判明して次の TID を取得する場合がある。Index Only Scan は唯一の例外――Visibility Map でヒープアクセスを回避する</li>
+                <li><strong>スナップショットはデータ構造であり、時点ではない</strong>：<code>SnapshotData</code> の xmin/xmax で大部分のトランザクションを高速に除外し、xip 配列で中間区間を正確に判定する。分離レベルの違いは、いつスナップショットを撮るかだけ</li>
+                <li><strong>可視性 = xmin コミット済み + xmax 無効</strong>：これが最も核心的な直感。すべての複雑なケース（ロールバック、実行中、HOT チェーン）はこのルールの変種である</li>
+                <li><strong>hint bits が CLOG の重複参照を回避</strong>：初回の可視性チェック後に行ヘッダにマークを設定し、以降のチェックでは直接マークを読み取る</li>
+                <li><strong>ストレージエンジンはプラグ可能</strong>：<code>TableAmRoutine</code> が 50+ の関数ポインタを定義し、heapam はデフォルト実装に過ぎない。<code>IndexAmRoutine</code> も同様――B-Tree、Hash、GIN、GiST は同一の呼び出しフレームワークを共有する</li>
+            </ul>
+
+            <p>次回は WAL と Checkpoint の世界に入る：一度の書き込みがどう WAL レコードになるか、WAL Writer がメモリ内のログをどうディスクにフラッシュするか、Checkpoint がどう一貫性回復ポイントを作成するか、そしてこれらすべてがレプリケーションと障害回復をどう支えるか。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL ストレージエンジンの内部構造（上）：Heap Page と Buffer Pool - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL ストレージエンジンの内部構造（上）：Heap Page と Buffer Pool</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/coin-cabinet-percier.jpg" alt="Coin Cabinet, designed by Charles Percier, made by Martin-Guillaume Biennais, ca. 1809-19">
+                <figcaption>Charles Percier 設計,《コインキャビネット》, 約 1809-19 — 扉を開けると、44 個の固定サイズの引き出しが整然と並び、各マスに異なるコインが収められている。これは PostgreSQL のストレージ構造と通じるものがある：ファイルはキャビネット、Page は引き出し、Tuple はその中のコインである</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL ストレージエンジンの内部構造</strong><br>
+                <span class="current">上：Heap Page と Buffer Pool</span> ·
+                <a href="pg-index-mvcc.html">中：インデックススキャンと MVCC</a> ·
+                <a href="pg-wal-checkpoint.html">下：WAL、Checkpoint と永続性</a>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：<code>SELECT * FROM users WHERE id = 123</code> を実行した時、データはどうやってディスクからあなたの手元に届くのか？この記事はそのパスの最下層を追跡する：8KB の Page の内部構造、Buffer Pool がメモリ内のページキャッシュをどう管理するか、シーケンシャルスキャンがどうやって 1 ページずつデータを読むか、そして HOT Chain がどう更新操作を最適化するか。これらを理解して初めて、VACUUM がなぜ必要か、クロスホストコンテナ通信がなぜ同一ホスト内より遅いか、そして PG と MySQL のストレージ層の根本的な違いが真に理解できる。
+            </blockquote>
+
+            <h3>全体像：ファイルから Tuple まで</h3>
+
+            <p>PostgreSQL のストレージは 4 層構造である。この 4 層のネスト関係を理解することが、以降のすべての内容を理解する基礎となる。</p>
+
+<pre class="diagram"><code>  ┌─────────────────────────────────────────────────────────┐
+  │ Relation (テーブル/インデックス)                          │
+  │                                                         │
+  │  データディレクトリ: $PGDATA/base/{dbOid}/{relFileNumber} │
+  │                                                         │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐                │
+  │  │ Segment 0 │ │ Segment 1 │ │ Segment 2 │  ...         │
+  │  │  (1 GB)   │ │  (1 GB)   │ │  (1 GB)   │              │
+  │  └─────┬────┘ └──────────┘ └──────────┘                │
+  │        │                                                │
+  │        ▼                                                │
+  │  ┌────────┬────────┬────────┬────────┬─────┐           │
+  │  │ Page 0 │ Page 1 │ Page 2 │ Page 3 │ ... │  各 8KB    │
+  │  └────┬───┘ └────────┘ └────────┘ └────────┘           │
+  │       │                                                 │
+  │       ▼                                                 │
+  │  ┌──────────────────────────────────┐                   │
+  │  │ PageHeader │ ItemId[] │ Tuples[] │  1 つの Page の内部│
+  │  └──────────────────────────────────┘                   │
+  └─────────────────────────────────────────────────────────┘</code></pre>
+
+            <table>
+                <thead>
+                    <tr><th>層</th><th>サイズ</th><th>説明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Relation</strong></td><td>無制限</td><td>1 つのテーブルまたはインデックス。ディスク上では 1 つまたは複数のファイルに対応</td></tr>
+                    <tr><td><strong>Segment</strong></td><td>1 GB</td><td>ファイルが 1GB を超えると自動分割（relFileNumber, relFileNumber.1, ...）</td></tr>
+                    <tr><td><strong>Page (Block)</strong></td><td>8 KB</td><td>ストレージの基本単位。ディスク上では Block、メモリに読み込むと Page と呼ぶ</td></tr>
+                    <tr><td><strong>Tuple</strong></td><td>可変</td><td>1 行のデータ。行ヘッダ + ユーザーデータ + アラインメントパディングを含む</td></tr>
+                </tbody>
+            </table>
+
+            <p>単一テーブルの容量上限の計算方法は？<code>Page サイズ (8KB) × 最大 Block 数 (2^32) = 32 TB</code>。これがハードコードされた上限である。</p>
+
+            <p>各 Relation にはディスク上にいくつかの「分岐ファイル」（Fork）がある：</p>
+
+            <table>
+                <thead>
+                    <tr><th>Fork</th><th>番号</th><th>ファイル接尾辞</th><th>内容</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Main</strong></td><td>0</td><td>（接尾辞なし）</td><td>メインデータファイル、実際の行データを格納</td></tr>
+                    <tr><td><strong>FSM</strong></td><td>1</td><td>_fsm</td><td>Free Space Map、各 Page の利用可能スペースを記録</td></tr>
+                    <tr><td><strong>VM</strong></td><td>2</td><td>_vm</td><td>Visibility Map、すべての Tuple が可視な Page をマーク（VACUUM が使用）</td></tr>
+                    <tr><td><strong>Init</strong></td><td>3</td><td>_init</td><td>初期化分岐、unlogged テーブルのクラッシュリカバリに使用</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Page 内部：8KB のミクロな世界</h3>
+
+            <p>これがこの記事で最も重要な図である。各 Page は 8192 バイトの固定サイズブロックで、内部構造は以下の通り：</p>
+
+<pre class="diagram"><code>  0 バイト                                                  8192 バイト
+  ┌──────────────────────────────────────────────────────────────┐
+  │                     PageHeaderData (24 バイト)                │
+  │  pd_lsn │ pd_checksum │ pd_flags │ pd_lower │ pd_upper │... │
+  ├──────────────────────────────────────────────────────────────┤
+  │ ItemId[1] │ ItemId[2] │ ItemId[3] │ ... │ ItemId[N] │       │
+  │ (4バイト)   (4バイト)    (4バイト)          (4バイト)           │
+  │                                          ↓ pd_lower          │
+  ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤
+  │                                                              │
+  │                     空  き  領  域                             │
+  │                                                              │
+  ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤
+  │                                          ↑ pd_upper          │
+  │  Tuple N  │  ...  │  Tuple 3  │  Tuple 2  │  Tuple 1        │
+  │                                                              │
+  ├──────────────────────────────────────────────────────────────┤
+  │                   Special Space                     ↑pd_special│
+  └──────────────────────────────────────────────────────────────┘
+
+  ← ItemId 配列は左から右へ成長     Tuple データは右から左へ成長 →
+
+  両者が向かい合って成長し、中間が空き領域。</code></pre>
+
+            <p>この「両端から向かい合って成長する」設計は非常に古典的で、OS のヒープとスタックが向かい合って成長するのと同じ考え方だ。利点は：ItemId と Tuple がそれぞれどれだけのスペースを占めるか事前に知る必要がなく、空き領域が両者で共有されること。</p>
+
+            <h4>PageHeaderData：ページのメタデータ</h4>
+
+            <table>
+                <thead>
+                    <tr><th>フィールド</th><th>サイズ</th><th>意味</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>pd_lsn</code></td><td>8 バイト</td><td>この Page を最後に変更した WAL レコードの LSN。リカバリ時にリプレイが必要かどうかを決定</td></tr>
+                    <tr><td><code>pd_checksum</code></td><td>2 バイト</td><td>ページチェックサム、ストレージ層のデータ破損を検出</td></tr>
+                    <tr><td><code>pd_flags</code></td><td>2 バイト</td><td>フラグビット（空きスペースがあるか、すべて可視か等）</td></tr>
+                    <tr><td><code>pd_lower</code></td><td>2 バイト</td><td>空き領域の開始位置を指す（ItemId 配列の末尾）</td></tr>
+                    <tr><td><code>pd_upper</code></td><td>2 バイト</td><td>空き領域の終了位置を指す（Tuple データの先頭）</td></tr>
+                    <tr><td><code>pd_special</code></td><td>2 バイト</td><td>Special Space の開始オフセット（インデックスページで使用）</td></tr>
+                </tbody>
+            </table>
+
+            <p><code>pd_upper - pd_lower</code> = 現在の Page の利用可能スペース。INSERT で新しい行を追加する時、PG はこの値が新しい Tuple + 新しい ItemId を格納するのに十分かどうかを確認する。</p>
+
+            <h4>ItemId：間接アドレッシング層</h4>
+
+            <p>ItemId は 4 バイトの構造体で、3 つの情報を含む：</p>
+
+            <ul>
+                <li><strong>offset</strong>（15 ビット）：Page 内での Tuple のバイトオフセット</li>
+                <li><strong>len</strong>（15 ビット）：Tuple の長さ</li>
+                <li><strong>flags</strong>（2 ビット）：状態（正常 / 削除済み / リダイレクト）</li>
+            </ul>
+
+            <p>なぜこの間接層が必要なのか？VACUUM が Page 内のフラグメンテーションを整理する必要があるからだ。整理後に Tuple の物理位置は変わる可能性があるが、ItemId の<strong>スロット番号（OffsetNumber）は変わらない</strong>。外部参照（インデックスエントリ、他の行の外部キー）は常に <code>(BlockNumber, OffsetNumber)</code> で行を特定する――これが <strong>TID（Tuple Identifier）</strong>である。</p>
+
+<pre class="diagram"><code>  TID = (BlockNumber, OffsetNumber)
+        (  ページ番号  ,  スロット番号  )
+
+  例えば TID = (5, 3) は：
+  第 5 Block の ItemId[3] が指す Tuple
+
+  インデックスエントリ:  age=25 → TID(5, 3)
+                         │
+                         ▼
+  Page 5:   ItemId[3] = {offset: 6800, len: 120, flags: NORMAL}
+                            │
+                            ▼
+            オフセット 6800:  HeapTupleHeader + ユーザーデータ</code></pre>
+
+            <p>この間接層により、VACUUM は Tuple の物理位置を自由に移動でき、対応する ItemId を更新するだけでよく、インデックスを修正する必要がない。</p>
+
+            <h4>TID、ItemId、Tuple：3 つの関係</h4>
+
+            <p>この 3 つの概念はよく混同される。関係を完全に整理しよう。一言でまとめると：<strong>TID はアドレス、ItemId は部屋番号から実際の部屋へのマッピングテーブル、Tuple は部屋にいる人</strong>である。</p>
+
+            <table>
+                <thead>
+                    <tr><th>概念</th><th>内容</th><th>存在場所</th><th>安定性</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>TID</strong></td><td>論理アドレス (BlockNumber, OffsetNumber)</td><td>インデックスエントリ内、他の行の参照内</td><td>安定――VACUUM で変わらない</td></tr>
+                    <tr><td><strong>ItemId</strong></td><td>Page 内の間接ポインタ (offset, len, flags)</td><td>Page ヘッダ直後の ItemId 配列内</td><td>スロット番号は安定だが、内部の offset は変わりうる</td></tr>
+                    <tr><td><strong>Tuple</strong></td><td>実際の行データ (行ヘッダ + ユーザーデータ)</td><td>Page 末尾の Tuple 領域内</td><td>不安定――VACUUM 整理後に物理位置が変わりうる</td></tr>
+                </tbody>
+            </table>
+
+            <p>重要な洞察：TID の OffsetNumber はバイトオフセットではなく、<strong>ItemId 配列のインデックス</strong>（1 から開始）である。実際のバイトオフセットは ItemId 内部に格納されている。この間接層が設計全体の精髄である。</p>
+
+<pre class="diagram"><code>  完全な行特定プロセス：
+
+  外部が保持: TID = (5, 3)
+                   │  │
+                   │  └─ OffsetNumber = 3 (ItemId 配列の第 3 スロット)
+                   └──── BlockNumber = 5  (第 5 Page)
+
+  ステップ 1: BlockNumber で Page を見つける
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Page 5                                                       │
+  │                                                              │
+  │  ステップ 2: OffsetNumber で ItemId 配列を検索                 │
+  │                                                              │
+  │  ItemId[1]    ItemId[2]    ItemId[3]                         │
+  │  off:7100     off:6900     off:6700  ◄── これだ              │
+  │  len:120      len:80       len:150                           │
+  │  flags:NORM   flags:DEAD   flags:NORM                        │
+  │                               │                              │
+  │                               │ ステップ 3: offset で Tuple へ │
+  │                               ▼                              │
+  │                    ┌──────────────────────┐                  │
+  │  オフセット 6700 ──►│ HeapTupleHeader      │                  │
+  │                    │  t_xmin = 100        │                  │
+  │                    │  t_xmax = 0          │                  │
+  │                    │  t_ctid = (5, 3)     │  ← 自分自身=最新版│
+  │                    ├──────────────────────┤                  │
+  │                    │ ユーザーデータ         │                  │
+  │                    │  id=42               │                  │
+  │                    │  name='Alice'        │                  │
+  │                    │  age=25              │                  │
+  │                    └──────────────────────┘                  │
+  │                    ◄──── 150 バイト ────►                     │
+  └─────────────────────────────────────────────────────────────┘</code></pre>
+
+            <p>この 3 層の関係を理解すると、以下の動作が理解できる：</p>
+
+            <ul>
+                <li><strong>VACUUM のフラグメント整理</strong>：Tuple の物理位置を移動し（例えばオフセット 6700 から 7000 へ）、ItemId[3] の offset フィールドを更新するだけ。TID (5, 3) は変わらず、すべてのインデックスエントリの修正は不要</li>
+                <li><strong>行の DELETE</strong>：Tuple データは即座に削除されず、ItemId の flags を DEAD にマークする。スペースは VACUUM 時に初めて回収される</li>
+                <li><strong>HOT UPDATE</strong>：新旧バージョンが同じ Page 内にあり、Tuple 行ヘッダの <code>t_ctid</code> でチェーンを形成する。インデックスエントリは引き続き旧バージョンの TID を指し、チェーンをたどって新バージョンを見つける</li>
+                <li><strong>インデックススキャンの行アクセス</strong>：インデックスが TID を提供 → Page を読む → OffsetNumber で ItemId を見つける → ItemId の offset で Tuple を見つける → MVCC 可視性チェックを実行</li>
+            </ul>
+
+            <p>よくある誤解は「TID は行の物理アドレスである」というもの。そうではない――TID は<strong>論理アドレス</strong>であり、間に ItemId という間接層が挟まっている。この間接層のおかげで、PG は外部参照を一切修正せずに行の物理位置を移動できるのだ。</p>
+
+            <h4>HeapTupleHeader：行ヘッダ</h4>
+
+            <p>各 Tuple の先頭 23 バイトは行ヘッダで、MVCC に必要なすべての情報を記録している：</p>
+
+            <table>
+                <thead>
+                    <tr><th>フィールド</th><th>意味</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>t_xmin</code></td><td>この行を挿入したトランザクション ID――「誰が私を作ったか」</td></tr>
+                    <tr><td><code>t_xmax</code></td><td>この行を削除/更新したトランザクション ID――「誰が私を消したか」（0 はまだ生存中）</td></tr>
+                    <tr><td><code>t_cid</code></td><td>コマンドシーケンス番号、同一トランザクション内の操作順序</td></tr>
+                    <tr><td><code>t_ctid</code></td><td>現在のバージョンの TID（更新された場合、新バージョンを指す → バージョンチェーンを形成）</td></tr>
+                    <tr><td><code>t_infomask</code></td><td>フラグビット（コミット済みか、NULL 列があるか、TOAST があるか等）</td></tr>
+                    <tr><td><code>t_hoff</code></td><td>ユーザーデータの開始オフセット（NULL ビットマップをスキップ）</td></tr>
+                </tbody>
+            </table>
+
+            <p>重要なポイント：PG の MVCC 情報は<strong>行ヘッダに直接格納</strong>されており、ユーザーデータと同じ Page 上にある。これは旧バージョンの行が消えないことを意味する――VACUUM がクリーンアップするまで Heap に積まれたままだ。これが PG と MySQL InnoDB の最大の違いの一つであり、後で詳しく比較する。</p>
+
+            <h3>Buffer Pool：メモリ内のページキャッシュ</h3>
+
+            <p>ディスク上の Block は直接アクセスされない。すべての読み書きは Buffer Pool を経由する――PostgreSQL が共有メモリ内に維持するページキャッシュである。</p>
+
+<pre class="diagram"><code>                       ┌──────────────────────────────┐
+                       │       Backend Process         │
+                       │    (あなたの SQL クエリプロセス) │
+                       └──────────┬───────────────────┘
+                                  │ Page (5, 0) を要求
+                                  │ = 第5ブロック, メインデータファイル
+                                  ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │                   Shared Buffer Pool                       │
+  │                  (shared_buffers パラメータ)                 │
+  │                                                            │
+  │  ┌──────────────────────────────────────────────────┐      │
+  │  │            Buffer Table (ハッシュテーブル)          │      │
+  │  │                                                   │      │
+  │  │  BufferTag → Buffer ID                            │      │
+  │  │  {spc, db, rel, fork, block} → スロット番号        │      │
+  │  └──────────────────────────────────────────────────┘      │
+  │                         │                                   │
+  │                         ▼                                   │
+  │  ┌────────┬────────┬────────┬────────┬────────┐            │
+  │  │ Slot 0 │ Slot 1 │ Slot 2 │ Slot 3 │  ...   │  Buffer   │
+  │  │ 8KB    │ 8KB    │ 8KB    │ 8KB    │        │  配列      │
+  │  └────────┘ └────────┘ └────────┘ └────────┘            │
+  │                                                            │
+  │  ┌──────────────────────────────────────────────────┐      │
+  │  │         Buffer Descriptors (記述子配列)            │      │
+  │  │  各スロットに 1 つの記述子が対応：                   │      │
+  │  │  - tag: このスロットがキャッシュしている page        │      │
+  │  │  - state: pin count + usage count + dirty flag    │      │
+  │  │  - buf_id: 対応するスロット番号                     │      │
+  │  └──────────────────────────────────────────────────┘      │
+  └───────────────────────────────────────────────────────────┘
+                                  │
+                                  │ キャッシュミス → ディスクから読み取り
+                                  ▼
+                       ┌──────────────────────┐
+                       │   ディスクファイル     │
+                       │   base/12345/67890    │
+                       └──────────────────────┘</code></pre>
+
+            <h4>BufferTag：五元組による特定</h4>
+
+            <p>BufferTag 一つで、データのディスク上の正確な位置を特定できる。システムテーブルを参照する必要はない：</p>
+
+<pre><code>typedef struct buftag {
+    Oid         spcOid;     // テーブルスペース OID
+    Oid         dbOid;      // データベース OID
+    RelFileNumber relNumber; // ファイル番号
+    ForkNumber  forkNum;    // 分岐 (0=メインデータ, 1=FSM, 2=VM)
+    BlockNumber blockNum;   // ブロック番号
+} BufferTag;
+
+// 例：{spcOid=1663, dbOid=12345, relNumber=67890, forkNum=0, blockNum=5}
+// → $PGDATA/base/12345/67890 の第 5 番目の 8KB ブロック</code></pre>
+
+            <p>この設計の自己完結性は重要である：バックグラウンドでダーティページをフラッシュするプロセスは、対応するトランザクションがまだコミットされていない時に作業を開始する可能性があり、データの特定にシステムテーブルに依存すべきではなく、依存してもいけない。</p>
+
+            <h4>共有 Buffer vs ローカル Buffer</h4>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Shared Buffer</th><th>Local Buffer</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>用途</strong></td><td>通常テーブル</td><td>一時テーブル、unlogged テーブル</td></tr>
+                    <tr><td><strong>可視性</strong></td><td>すべてのバックエンドプロセスで共有</td><td>現在のプロセスのみ可視</td></tr>
+                    <tr><td><strong>Buffer ID</strong></td><td>&gt; 0（buffer - 1）</td><td>&lt; 0（-buffer - 1）</td></tr>
+                    <tr><td><strong>ロック必要</strong></td><td>あり（マルチプロセス並行）</td><td>なし（シングルプロセス専有）</td></tr>
+                    <tr><td><strong>パラメータ</strong></td><td><code>shared_buffers</code></td><td><code>temp_buffers</code></td></tr>
+                </tbody>
+            </table>
+
+            <p>本番環境では一般的に <code>shared_buffers</code> を物理メモリの 25% に設定する。PG は OS の Page Cache を第 2 層キャッシュとして活用する――データが Buffer Pool になくても、OS キャッシュにあれば、読み取りは依然として高速である。</p>
+
+            <h4>クロック置換アルゴリズム</h4>
+
+            <p>Buffer Pool が満杯でページを追い出す必要がある時、PG は<strong>クロックスイープ（Clock Sweep）</strong>アルゴリズムを使用する。各 buffer descriptor は <code>usage_count</code> を維持する：</p>
+
+            <ul>
+                <li>ページがアクセスされると、<code>usage_count++</code>（上限 5）</li>
+                <li>クロックポインタが buffer をスキャンした時：<code>usage_count > 0</code> なら 1 減らしてスキップ；<code>usage_count == 0</code> なら、そのページを追い出す</li>
+                <li>ページがダーティページ（dirty）なら、追い出す前にディスクにフラッシュが必要</li>
+                <li>ページが pin されている（プロセスが使用中）なら、スキップ</li>
+            </ul>
+
+<pre class="diagram"><code>  クロックポインタ →
+
+  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐
+  │ 3 │  │ 1 │  │ 0 │  │ 2 │  │ 0 │  │ 1 │  │ 0 │  │ 4 │
+  └───┘  └───┘  └─┬─┘  └───┘  └─┬─┘  └───┘  └─┬─┘  └───┘
+                   │              │              │
+                  0に減少          0に減少         0に減少
+                  追い出し!        追い出し!       追い出し!
+
+  usage_count が高い → より「ホット」 → 追い出されにくい</code></pre>
+
+            <p>これは LRU よりデータベースシナリオに適している：1 回のフルテーブルスキャンでホットデータがすべてキャッシュから追い出されることはない（スキャンは各ページに +1 するだけだが、ホットページの usage_count は 5 かもしれないため）。</p>
+
+            <h3>シーケンシャルスキャンの完全な I/O パス</h3>
+
+            <p><code>SELECT * FROM users</code> を実行すると、executor が <code>ExecSeqScan</code> を呼び出し、最終的にストレージ層の <code>heap_getnextslot</code> に到達する。この完全なパスを追跡しよう：</p>
+
+<pre class="diagram"><code>  ExecSeqScan
+      │
+      ▼
+  ExecScanExtended(SeqNext, SeqRecheck)
+      │
+      ▼
+  SeqNext
+      │ 初回呼び出し: table_beginscan() でスキャン記述子を初期化
+      │ 以降の呼び出し:
+      ▼
+  table_scan_getnextslot
+      │ → heapam_methods.scan_getnextslot
+      ▼
+  heap_getnextslot
+      │
+      ├─── Page Mode (デフォルト):
+      │    heapgettup_pagemode
+      │    1. heap_fetch_next_buffer → 次の Page を Buffer Pool に読み込み
+      │    2. heap_prepare_pagescan → ページ全体の全 Tuple の可視性を一括判定
+      │    3. rs_vistuples[] 配列を構築（可視 Tuple の OffsetNumber リスト）
+      │    4. rs_vistuples[] をループで走査、Tuple を一つずつ返却
+      │
+      └─── Tuple Mode:
+           heapgettup
+           Tuple を一つずつ読み取り、各々個別に可視性判定</code></pre>
+
+            <p>Page Mode がデフォルト戦略で、性能がより良い：ページ全体の可視性結果を一度に取得し、繰り返しのロック取得を回避する。</p>
+
+            <h4>heap_fetch_next_buffer：プリフェッチ機構</h4>
+
+            <p>シーケンシャルスキャンは 1 ページずつ読むのではない――PG にはストリームプリフェッチ（Read Stream）機構がある：</p>
+
+            <ul>
+                <li><code>distance</code> パラメータでプリフェッチ深度を制御</li>
+                <li>連続するブロックは 1 つの大きな I/O リクエストに統合される（I/O マージ）</li>
+                <li>ファストパス：pinned buffer が 1 つだけでプリフェッチ距離が 1 の場合、次のブロックを直接読み取り、複雑なロジックをスキップ</li>
+                <li>各 Page を読むたびに割り込みリクエストを確認（<code>CHECK_FOR_INTERRUPTS</code>）し、長いスキャンがキャンセルされない事態を防止</li>
+            </ul>
+
+            <h4>Page 内部の走査</h4>
+
+            <p>Page を取得した後、内部の Tuple をどう読むか：</p>
+
+<pre><code>// heapgettup_pagemode のコアループ（簡略化）
+
+page = BufferGetPage(scan->rs_cbuf);      // Page ポインタを取得
+
+for (i = 0; i < scan->rs_ntuples; i++) {
+    OffsetNumber lineoff = scan->rs_vistuples[i];     // 可視 Tuple のスロット番号
+    ItemId lpp = PageGetItemId(page, lineoff);         // ItemId 配列からポインタを取得
+
+    tuple->t_data = (HeapTupleHeader) PageGetItem(page, lpp);  // Tuple データを特定
+    tuple->t_len = ItemIdGetLength(lpp);                        // Tuple の長さ
+    ItemPointerSetOffsetNumber(&tuple->t_self, lineoff);        // TID を設定
+
+    // スキャン条件を確認（scan key がある場合）
+    if (key != NULL && !HeapKeyTest(tuple, ...))
+        continue;
+
+    return;  // この Tuple を上位に返却
+}</code></pre>
+
+            <p>注目：TID はスキャン時に <code>tuple->t_self</code> に「再構築」される――これは (BlockNumber, OffsetNumber) の組み合わせで、書き込み時に確定し、スキャン時に現在位置から推定されて上位レイヤーに提供される。</p>
+
+            <h3>HOT Chain：Page 内で更新を完結させる</h3>
+
+            <p>PG の UPDATE は実際には新バージョンの INSERT + 旧バージョンの DELETE である。つまり各 UPDATE で：新しい Tuple の作成、新しい ItemId の割り当て、その行を指すすべてのインデックスの更新が発生する。コストが大きい。</p>
+
+            <p><strong>HOT（Heap Only Tuple）</strong>は重要な最適化である：UPDATE がインデックス付き列を一切変更せず、新しい Tuple が同じ Page に収まる場合、PG は HOT チェーンを作成し、<strong>インデックスを更新しない</strong>。</p>
+
+<pre class="diagram"><code>  UPDATE users SET name = 'Alice2' WHERE id = 123;
+  UPDATE users SET name = 'Alice3' WHERE id = 123;
+
+  インデックスエントリ: (id=123) → TID(5, 1)    インデックスエントリは 1 つだけ！
+                          │
+                          ▼
+  Page 5:
+  ┌────────────────────────────────────────────────────────┐
+  │ ItemId[1]          ItemId[2]         ItemId[3]         │
+  │ offset→A           offset→B          offset→C          │
+  │ flags: REDIRECT    flags: NORMAL     flags: NORMAL     │
+  ├────────────────────────────────────────────────────────┤
+  │                                                        │
+  │  Tuple C (最新)  ←  Tuple B (旧)  ←  Tuple A (最古)    │
+  │  name='Alice3'      name='Alice2'     name='Alice'      │
+  │  t_xmax=0           t_xmax=103        t_xmax=102        │
+  │  t_ctid=(5,3)       t_ctid=(5,3)      t_ctid=(5,2)      │
+  │                                                        │
+  └────────────────────────────────────────────────────────┘
+
+  インデックススキャン時：
+  1. インデックスが TID(5, 1) を提供
+  2. ItemId[1] を読み、REDIRECT と判明 → 追跡
+  3. t_ctid チェーンをたどる：A → B → C
+  4. 各バージョンで MVCC 可視性チェック
+  5. 現在のトランザクションに可視なバージョンを返却</code></pre>
+
+            <p>HOT の 3 つの条件：</p>
+            <ul>
+                <li>UPDATE がインデックス付き列を一切変更しない（そうでなければインデックスエントリの更新が必要）</li>
+                <li>新しい Tuple が同じ Page に収まる（そうでなければ Page 内ポインタでチェーンを形成できない）</li>
+                <li>同一行の HOT チェーンは Page をまたげない</li>
+            </ul>
+
+            <p>HOT の利点：</p>
+            <ul>
+                <li><strong>インデックス肥大化の削減</strong>：1 つのインデックスエントリで複数回の更新をカバー</li>
+                <li><strong>UPDATE 性能の向上</strong>：インデックス更新の I/O を省略</li>
+                <li><strong>VACUUM の簡素化</strong>：Page 内の HOT チェーンは Page レベルで高速にクリーンアップ可能（Pruning）</li>
+            </ul>
+
+            <p>インデックススキャンが HOT チェーンをたどるロジックは <code>heap_hot_search_buffer</code> 関数にある――インデックスが提供する TID から開始し、<code>t_ctid</code> に沿ってチェーン末端まで走査し、各バージョンで可視性判定を行う。</p>
+
+            <h3>PG vs InnoDB：2 つのストレージ哲学</h3>
+
+            <p>最後に PostgreSQL と MySQL InnoDB のストレージ層における根本的な設計の違いを比較しよう：</p>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>PostgreSQL (Heap)</th><th>MySQL InnoDB (Clustered Index)</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>データ構成</strong></td><td>Heap：行は挿入順に積み上げられ、順序なし</td><td>クラスタードインデックス：行は主キー順で B+ Tree リーフノードに格納</td></tr>
+                    <tr><td><strong>UPDATE 方式</strong></td><td>新バージョンを Heap に追加（マルチバージョン共存）</td><td>インプレース更新、旧バージョンは Undo Log へ</td></tr>
+                    <tr><td><strong>旧バージョンの場所</strong></td><td>新バージョンと同じ Heap Page に混在</td><td>独立した Undo Log 空間</td></tr>
+                    <tr><td><strong>肥大化問題</strong></td><td>深刻――旧バージョンを掃除しないとスペースを占有し続ける</td><td>軽微――Undo Log は独立して回収可能</td></tr>
+                    <tr><td><strong>VACUUM の必要性</strong></td><td>必須――さもなくばテーブルとインデックスが継続的に肥大化</td><td>同等のメカニズム不要（Purge スレッドが Undo を自動クリーンアップ）</td></tr>
+                    <tr><td><strong>主キー検索</strong></td><td>インデックススキャン + ヒープアクセス（TID → Heap Page）が必要</td><td>B+ Tree 上で直接データを発見（インデックスがデータ）</td></tr>
+                    <tr><td><strong>セカンダリインデックスのヒープアクセス</strong></td><td>セカンダリインデックス → TID → 1 回の Heap I/O</td><td>セカンダリインデックス → 主キー → もう 1 回クラスタードインデックスを走査</td></tr>
+                    <tr><td><strong>書き込み増幅</strong></td><td>HOT 最適化でインデックス書き込みを削減</td><td>Change Buffer でセカンダリインデックス更新を遅延</td></tr>
+                </tbody>
+            </table>
+
+            <p>2 つの哲学の核心的トレードオフ：</p>
+
+            <ul>
+                <li><strong>PG はシンプルな書き込みパスを選択</strong>：追加は常にインプレース更新よりシンプルで安全。代償は VACUUM でスペースを回収する必要があり、運用の複雑さが増すこと</li>
+                <li><strong>InnoDB はコンパクトなストレージを選択</strong>：インプレース更新 + Undo Log で肥大化を回避。代償は Undo Log の管理ロジックが複雑になり、セカンダリインデックスのヒープアクセスで B+ Tree を 2 回走査する必要があること</li>
+            </ul>
+
+            <h3>まとめ</h3>
+
+            <p>覚えておくべき重要な直感：</p>
+
+            <ul>
+                <li><strong>Page がすべての基礎</strong>：8KB 固定サイズ、ItemId 配列と Tuple データが向かい合って成長する。Page 内部のレイアウトを理解すれば、PG がなぜこのように TID を設計し、なぜ VACUUM が Page レベルでフラグメント整理できるかが理解できる</li>
+                <li><strong>ItemId は間接層</strong>：外部は (BlockNumber, OffsetNumber) で行を参照し、VACUUM はインデックスを修正せずに Tuple を移動できる</li>
+                <li><strong>Buffer Pool はすべての I/O の中間層</strong>：BufferTag 五元組の自己完結的な位置特定、クロック置換アルゴリズムは LRU よりデータベースワークロードに適しており、プリフェッチ機構がランダム I/O を削減する</li>
+                <li><strong>HOT Chain は PG の「追加式更新」のコストに対する補償</strong>：インデックス付き列を変更しない更新は Page 内で完結し、インデックス更新をトリガーしない</li>
+                <li><strong>MVCC 情報は行ヘッダに格納</strong>：これが PG と InnoDB の最も根本的な違い――旧バージョンは Undo Log ではなく Heap 自体にあり、肥大化問題と VACUUM の必要性を直接もたらす</li>
+            </ul>
+
+            <p>次回は MVCC と VACUUM の世界に入る：スナップショットが可視性をどう決定するか、トランザクション分離レベルの実装、そしてなぜ VACUUM が PG DBA の最も重要な日常業務なのか。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

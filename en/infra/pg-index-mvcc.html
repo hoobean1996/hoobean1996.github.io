@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL Storage Engine Internals (Part 2): Index Scans and MVCC - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL Storage Engine Internals (Part 2): Index Scans and MVCC</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/rembrandt-magnifying-glass.jpg" alt="Man with a Magnifying Glass, Rembrandt, early 1660s">
+                <figcaption>Rembrandt, "Man with a Magnifying Glass", ca. 1660s — He raises his magnifying glass, examining what lies before him through the lens. This is MVCC's snapshot: the same data, different transactions see different versions through different "lenses." What's visible and what's not depends on when you pick up the glass</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL Storage Engine Internals</strong><br>
+                <a href="pg-heap-buffer.html">Part 1: Heap Pages and Buffer Pool</a> ·
+                <span class="current">Part 2: Index Scans and MVCC</span> ·
+                <a href="pg-wal-checkpoint.html">Part 3: WAL, Checkpoint, and Durability</a>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>What you'll learn from this post</strong>: The previous post covered Heap Page internal layout and how the Buffer Pool manages page caching. But a key question remains unanswered: when multiple transactions simultaneously read and write the same table, how is the data each transaction sees determined? This post traces two paths — how index scans jump from B-Tree leaf nodes to Heap Pages to retrieve data, and how MVCC snapshots determine whether a row is "visible or invisible to you." Understanding these will show you that transaction isolation levels are not an abstract concept, but a concrete data structure.
+            </blockquote>
+
+            <h3>Index Scans: From B-Tree to Heap</h3>
+
+            <p>The previous post covered sequential scans — traversing the entire Heap page by page. Index scans take a different path: first locate the TID in the index, then use the TID to fetch data from the Heap.</p>
+
+            <h4>Indexes Are Also Tables</h4>
+
+            <p>In PostgreSQL, an index is a Relation just like a regular table, with its own files and its own Page structure. The difference is that index Pages don't store user data, but rather <strong>index key + TID</strong> mappings.</p>
+
+<pre class="diagram"><code>  CREATE INDEX users_age_idx ON users(age);
+
+  An index scan involves two Relations:
+
+  indexRelation (users_age_idx)          heapRelation (users)
+  ┌─────────────────────────┐           ┌──────────────────────────┐
+  │  B-Tree Page            │           │  Heap Page               │
+  │                         │           │                          │
+  │  ┌───────────────────┐  │           │  ┌────────────────────┐  │
+  │  │ age=20 → TID(1,3) │  │     ┌────►  │ ItemId[3] → Tuple  │  │
+  │  │ age=25 → TID(5,1) │──┼─────┘    │  │  (id=42, name=     │  │
+  │  │ age=25 → TID(8,7) │  │          │  │   'Alice', age=25) │  │
+  │  │ age=30 → TID(2,5) │  │          │  └────────────────────┘  │
+  │  └───────────────────┘  │           │                          │
+  └─────────────────────────┘           └──────────────────────────┘
+
+  IndexScanDesc holds references to both Relations</code></pre>
+
+            <p><code>IndexScanDesc</code> is the index scan descriptor with key fields:</p>
+            <ul>
+                <li><code>heapRelation</code>: The table being indexed</li>
+                <li><code>indexRelation</code>: The index itself</li>
+                <li><code>xs_heaptid</code>: The currently found TID, used for the next heap fetch step</li>
+            </ul>
+
+            <h4>ExecIndexScan Execution Flow</h4>
+
+<pre class="diagram"><code>  ExecIndexScan
+      │
+      │ Has Runtime Key? (e.g., WHERE id = $1)
+      │ Yes → Compute parameter value first, then start scan
+      │
+      ├── Has ORDER BY?
+      │   Yes → IndexNextWithReorder (index scan with reordering)
+      │   No  → IndexNext (regular index scan)
+      │
+      ▼
+  IndexNext
+      │
+      ▼
+  index_getnext_slot ─────────────────────────────────────┐
+      │                                                    │
+      │  ┌─────────────────────────────────┐               │
+      │  │ Phase 1: Get TID from index     │               │
+      │  │                                  │               │
+      │  │ amgettuple(scan, direction)      │               │
+      │  │  → B-Tree: btgettuple()         │               │
+      │  │  → Hash:   hashgettuple()       │               │
+      │  │  → GIN:    gingettuple()        │               │
+      │  │  → GiST:   gistgettuple()      │               │
+      │  │                                  │               │
+      │  │ Result: scan->xs_heaptid = TID  │               │
+      │  └─────────────────────────────────┘               │
+      │                                                    │
+      │  ┌─────────────────────────────────┐               │
+      │  │ Phase 2: Fetch Tuple from Heap  │               │
+      │  │ using TID                        │               │
+      │  │                                  │               │
+      │  │ index_fetch_heap()              │               │
+      │  │  → table_index_fetch_tuple()    │               │
+      │  │  → heapam_index_fetch_tuple()   │               │
+      │  │  → heap_hot_search_buffer()     │  ← HOT chain  │
+      │  │                                  │    traversal   │
+      │  │ Includes MVCC visibility check  │               │
+      │  └─────────────────────────────────┘               │
+      │                                                    │
+      │  If Tuple not visible → go back to Phase 1         │
+      │  for next TID                                      │
+      └────────────────────────────────────────────────────┘</code></pre>
+
+            <p>Runtime Key is an important concept: values that can't be determined at query planning time. For example, the parameter in <code>WHERE id = $1</code>, or the subquery result in <code>WHERE id = (SELECT max_id FROM others)</code>. These values are computed at executor startup, then passed to the index scan.</p>
+
+            <h4>Inside B-Tree: btgettuple</h4>
+
+            <p>B-Tree is PostgreSQL's most commonly used index type. The logic of <code>btgettuple</code> is straightforward:</p>
+
+            <ul>
+                <li><strong>First call</strong>: <code>_bt_first()</code> locates the starting position in the B-Tree — traverses from root to leaf node, finding the first index entry that satisfies the scan condition</li>
+                <li><strong>Subsequent calls</strong>: <code>_bt_next()</code> moves forward/backward on the leaf node linked list, getting the next entry</li>
+                <li>After finding the position, <code>_bt_returnitem()</code> extracts the TID from the current position: <code>scan->xs_heaptid = currItem->heapTid</code></li>
+            </ul>
+
+<pre class="diagram"><code>  B-Tree structure (simplified):
+
+          ┌──────────────┐
+          │  Root Page   │
+          │  [20] [50]   │
+          └──┬──────┬────┘
+             │      │
+      ┌──────▼──┐  ┌▼──────────┐
+      │ Internal │  │ Internal   │
+      │ [10][20] │  │ [30][50]   │
+      └──┬───┬──┘  └──┬────┬───┘
+         │   │        │    │
+    ┌────▼┐ ┌▼────┐ ┌─▼──┐ ┌▼────┐
+    │Leaf │↔│Leaf │↔│Leaf│↔│Leaf │    ← Leaf node doubly linked list
+    │5,8  │ │12,18│ │25  │ │35,42│
+    │TIDs │ │TIDs │ │TIDs│ │TIDs │
+    └─────┘ └─────┘ └────┘ └─────┘
+
+  WHERE age = 25:
+  1. _bt_first: Root → Internal → Locate 3rd Leaf
+  2. Find age=25 entry in Leaf, extract TID
+  3. _bt_next: Continue scanning on Leaf linked list until age ≠ 25</code></pre>
+
+            <h4>Heap Fetch: From TID to Tuple</h4>
+
+            <p>After obtaining a TID, <code>index_fetch_heap</code> fetches data from the Heap. For heap tables, it actually calls <code>heapam_index_fetch_tuple</code>, with the core being <code>heap_hot_search_buffer</code>:</p>
+
+<pre><code>// Complete path for index heap fetch (simplified)
+
+// 1. Index provides TID = (5, 1)
+scan->xs_heaptid = {block: 5, offset: 1};
+
+// 2. Read Heap Page 5 into Buffer Pool
+buffer = ReadBuffer(heapRelation, 5);
+
+// 3. Search HOT chain on Page 5
+heap_hot_search_buffer(
+    tid,        // Starting TID (5, 1)
+    relation,   // users table
+    buffer,     // Page 5's buffer
+    snapshot,   // Current transaction's snapshot  ← MVCC kicks in here
+    &found
+);
+
+// 4. Traverse HOT chain:
+//    ItemId[1] → Tuple A (t_ctid points to ItemId[2])
+//    ItemId[2] → Tuple B (t_ctid points to ItemId[3])
+//    ItemId[3] → Tuple C (t_ctid points to itself = end of chain)
+//
+//    Call HeapTupleSatisfiesVisibility(snapshot) for each version
+//    Return the version visible to the current snapshot</code></pre>
+
+            <p>Note the <code>snapshot</code> parameter here — this is the entry point for MVCC. The index itself doesn't store version information; all version determination happens after the heap fetch. This means an index scan may get a TID from the index, find the row invisible to the current transaction after fetching from the heap, and then continue to get the next TID.</p>
+
+            <h4>Lossy Indexes and Recheck</h4>
+
+            <p>Certain indexes (like GIN, GiST) are "lossy" — the index tells you "this Tuple might match" but doesn't guarantee a match. After heap fetch, the original condition must be rechecked:</p>
+
+<pre><code>// Recheck logic in IndexNext
+while (index_getnext_slot(scandesc, direction, slot)) {
+    if (scandesc->xs_recheck) {
+        // Index is lossy, need to re-verify with original condition
+        if (!ExecQualAndReset(node->indexqualorig, econtext))
+            continue;  // Doesn't match, skip
+    }
+    return slot;  // Matches, return
+}</code></pre>
+
+            <h3>MVCC: Multi-Version Concurrency Control</h3>
+
+            <p>Now we enter the core of this post. MVCC's goal is <strong>reads don't block writes, writes don't block reads</strong>. PG achieves this by having multiple versions of each row exist simultaneously — each transaction sees a "snapshot" from a certain point in time.</p>
+
+            <h4>Transaction ID: The Logical Clock</h4>
+
+            <p>PG uses Transaction IDs (TransactionId, or XID) as its "logical clock." Each write transaction is assigned a monotonically increasing XID at startup. The core of visibility determination is comparing XIDs:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Row header field</th><th>Meaning</th><th>Visibility check</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>t_xmin</code></td><td>Transaction that created this version</td><td>If xmin's transaction is committed and before the snapshot → this version "was born"</td></tr>
+                    <tr><td><code>t_xmax</code></td><td>Transaction that deleted/updated this version</td><td>If xmax = 0 or xmax is uncommitted → this version "is still alive"</td></tr>
+                </tbody>
+            </table>
+
+            <p>A Tuple is visible to you when: <strong>it has been born (xmin committed) and hasn't died yet (xmax invalid or uncommitted)</strong>.</p>
+
+<pre class="diagram"><code>  Transaction timeline:
+
+  XID:  100      101      102      103      104
+         │        │        │        │        │
+         │  INSERT │        │ UPDATE │        │
+         │  xmin=101       │ new ver│        │
+         │        │        │ xmin=103│        │
+         │        │        │ old ver│        │
+         │        │        │ xmax=103│        │
+
+  Transaction 104's snapshot taken here ──────────────────►│
+
+  For transaction 104:
+  Old version: xmin=101(committed✓) xmax=103(committed✓) → dead → invisible
+  New version: xmin=103(committed✓) xmax=0(still alive✓)  → visible ✓</code></pre>
+
+            <h4>SnapshotData: The Data Structure of a Snapshot</h4>
+
+            <p>A snapshot is not a "point in time" but a concrete data structure:</p>
+
+<pre><code>typedef struct SnapshotData {
+    TransactionId xmin;    // All XIDs < xmin are committed (definitely visible)
+    TransactionId xmax;    // All XIDs >= xmax haven't started (definitely invisible)
+    TransactionId *xip;    // List of running transactions between xmin and xmax
+    uint32 xcnt;           // Length of xip array
+} SnapshotData;</code></pre>
+
+<pre class="diagram"><code>  Three intervals of a snapshot:
+
+  XID:  95  96  97  98  99  100  101  102  103  104  105
+        ────────────┬───────────────────────┬────────────
+                    │                       │
+               snapshot.xmin           snapshot.xmax
+
+  ◄── Definitely  ──►│◄── Need to check  ──►│◄── Definitely   ──►
+      visible         │    xip array         │    invisible
+
+  xip[] = {99, 101}  ← Transactions still running when snapshot was taken
+
+  Decision logic:
+  XID 96: < xmin → committed → visible ✓
+  XID 99: in xip → still running → invisible ✗
+  XID 100: not in xip → committed → visible ✓
+  XID 101: in xip → still running → invisible ✗
+  XID 104: >= xmax → not started → invisible ✗</code></pre>
+
+            <p>This design is elegant: <code>xmin</code> and <code>xmax</code> quickly eliminate most transactions, and only those falling in the middle interval need to check the <code>xip</code> array.</p>
+
+            <h4>Isolation Levels: When Is the Snapshot Taken</h4>
+
+            <p>The essential difference between transaction isolation levels isn't "what you see" but <strong>when the snapshot is taken</strong>:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Isolation Level</th><th>Snapshot Strategy</th><th>Effect</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Read Committed</strong></td><td>Take a new snapshot at the start of each statement</td><td>Within the same transaction, two SELECTs may see different data</td></tr>
+                    <tr><td><strong>Repeatable Read</strong></td><td>Take one snapshot at transaction start, reuse throughout</td><td>Within the same transaction, multiple SELECTs see consistent data</td></tr>
+                    <tr><td><strong>Serializable</strong></td><td>Same as Repeatable Read + additional conflict detection</td><td>Simulates serial execution, rolls back on detected conflicts</td></tr>
+                </tbody>
+            </table>
+
+<pre><code>-- Read Committed: new snapshot per statement
+BEGIN;
+SELECT count(*) FROM users;  -- Snapshot S1 → sees 100 rows
+-- Meanwhile another transaction inserts 1 row and commits
+SELECT count(*) FROM users;  -- Snapshot S2 (new!) → sees 101 rows
+COMMIT;
+
+-- Repeatable Read: reuse one snapshot for entire transaction
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM users;  -- Snapshot S1 → sees 100 rows
+-- Meanwhile another transaction inserts 1 row and commits
+SELECT count(*) FROM users;  -- Still snapshot S1 → still sees 100 rows
+COMMIT;</code></pre>
+
+            <p>At the code level, <code>GetTransactionSnapshot()</code> handles this decision:</p>
+
+            <ul>
+                <li>Read Committed: Creates a new snapshot on every call</li>
+                <li>Repeatable Read / Serializable: Creates and caches a snapshot on first call, returns the cached snapshot on subsequent calls</li>
+            </ul>
+
+            <h4>When Is a Snapshot Needed</h4>
+
+            <p>Not all SQL statements need a snapshot:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Statement Type</th><th>Needs Snapshot?</th><th>Reason</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>SELECT / INSERT / UPDATE / DELETE</td><td>Yes</td><td>Needs to access table data, must determine visibility</td></tr>
+                    <tr><td>CREATE TABLE / DROP TABLE / ALTER</td><td>No</td><td>DDL operates on metadata, doesn't involve row-level visibility</td></tr>
+                    <tr><td>EXPLAIN</td><td>Maybe</td><td>If it's EXPLAIN ANALYZE that requires actual execution, then yes</td></tr>
+                </tbody>
+            </table>
+
+            <p>PG uses the <code>analyze_requires_snapshot</code> function to determine whether the current statement needs a snapshot, avoiding the overhead of creating snapshots for operations that don't need them.</p>
+
+            <h4>Complete Visibility Rules</h4>
+
+            <p>Actual visibility determination is much more complex than "xmin committed and xmax invalid." <code>HeapTupleSatisfiesMVCC</code> must handle these scenarios:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Scenario</th><th>xmin status</th><th>xmax status</th><th>Result</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Just inserted, transaction uncommitted</td><td>In progress</td><td>—</td><td>Visible only to the inserter</td></tr>
+                    <tr><td>Inserted and committed</td><td>Committed, before snapshot</td><td>Invalid (0)</td><td>Visible</td></tr>
+                    <tr><td>Deleted, delete transaction uncommitted</td><td>Committed</td><td>In progress</td><td>Visible (delete hasn't taken effect)</td></tr>
+                    <tr><td>Deleted and committed</td><td>Committed</td><td>Committed, before snapshot</td><td>Invisible (dead)</td></tr>
+                    <tr><td>Updated, new version exists</td><td>Committed</td><td>Committed</td><td>Invisible (see new version)</td></tr>
+                    <tr><td>Insert transaction rolled back</td><td>Rolled back</td><td>—</td><td>Invisible (never existed)</td></tr>
+                </tbody>
+            </table>
+
+            <p>PG also has an optimization: hint bits in <code>t_infomask</code>. The first time a row's xmin/xmax status is checked, it requires querying the CLOG (transaction commit log). Once confirmed, "committed" or "rolled back" markers are set in <code>t_infomask</code>, and subsequent checks read the markers directly, skipping the CLOG query.</p>
+
+            <h4>EPQ: Conflict Handling for Concurrent Updates</h4>
+
+            <p>When a scan discovers that a Tuple is being modified by another transaction, the <strong>EvalPlanQual (EPQ)</strong> mechanism is triggered:</p>
+
+            <ul>
+                <li>During normal scanning, a target Tuple is found to be concurrently modified</li>
+                <li>Wait for the modifying transaction to complete (commit or rollback)</li>
+                <li>Get the new version of the Tuple after modification</li>
+                <li>Re-evaluate the new version with the current query's WHERE conditions</li>
+                <li>If the new version still satisfies the conditions → return the new version; otherwise skip</li>
+            </ul>
+
+            <p>This is a necessary mechanism for UPDATE and DELETE under Read Committed isolation level — you can't skip a row being modified, nor can you make decisions based on the old version.</p>
+
+            <h3>Scan Method Overview</h3>
+
+            <p>PG provides multiple scan methods, each with a different accessMtd function pointer:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Scan Method</th><th>accessMtd</th><th>Principle</th><th>Use Case</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Sequential Scan</strong></td><td>SeqNext</td><td>Traverse entire Heap page by page</td><td>Full table scan, no index</td></tr>
+                    <tr><td><strong>Index Scan</strong></td><td>IndexNext</td><td>B-Tree locate → heap fetch Tuple</td><td>Highly selective queries</td></tr>
+                    <tr><td><strong>Index Only Scan</strong></td><td>IndexOnlyNext</td><td>Read index only, no heap fetch</td><td>Query columns all in the index</td></tr>
+                    <tr><td><strong>Bitmap Heap Scan</strong></td><td>BitmapHeapNext</td><td>Collect all TIDs first, sort, then batch heap fetch</td><td>Medium selectivity, reduces random I/O</td></tr>
+                    <tr><td><strong>TID Scan</strong></td><td>TidNext</td><td>Locate directly by TID</td><td>CURRENT OF cursor</td></tr>
+                </tbody>
+            </table>
+
+            <p>All scan methods are ultimately dispatched through <code>ExecScanExtended</code>:</p>
+
+<pre><code>// Unified scan framework
+ExecScanExtended(
+    ScanState *node,
+    ExecScanAccessMtd accessMtd,    // SeqNext / IndexNext / BitmapHeapNext / ...
+    ExecScanRecheckMtd recheckMtd,  // Corresponding recheck function
+    EPQState *epqstate,             // Concurrency control
+    ExprState *qual,                // WHERE conditions
+    ProjectionInfo *projInfo        // SELECT projection
+);</code></pre>
+
+            <p>This design makes storage access methods fully pluggable — <code>heapam_methods</code> is the default heap table implementation, but PG's Table Access Method API allows you to replace the entire storage engine:</p>
+
+<pre><code>// heapam_methods: function table for heap tables
+static const TableAmRoutine heapam_methods = {
+    .scan_begin          = heap_beginscan,
+    .scan_getnextslot    = heap_getnextslot,
+    .index_fetch_tuple   = heapam_index_fetch_tuple,
+    .tuple_insert        = heapam_tuple_insert,
+    .tuple_delete        = heapam_tuple_delete,
+    .tuple_update        = heapam_tuple_update,
+    // ... 50+ function pointers
+};</code></pre>
+
+            <p>This means theoretically you could implement a columnar storage engine, an LSM-Tree engine, etc., and plug them into PG's execution framework. Heap is just the default choice, not the only one.</p>
+
+            <h3>Index Type Overview</h3>
+
+            <p>PG supports multiple index types, each with its own <code>IndexAmRoutine</code>:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Index Type</th><th>amgettuple</th><th>Data Structure</th><th>Use Case</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>B-Tree</strong></td><td>btgettuple</td><td>Balanced search tree, leaf node linked list</td><td>Equality, range queries, sorting (most versatile)</td></tr>
+                    <tr><td><strong>Hash</strong></td><td>hashgettuple</td><td>Hash buckets</td><td>Equality queries (faster than B-Tree, but no range support)</td></tr>
+                    <tr><td><strong>GIN</strong></td><td>gingettuple</td><td>Inverted index</td><td>Full-text search, array containment, JSONB</td></tr>
+                    <tr><td><strong>GiST</strong></td><td>gistgettuple</td><td>Generalized search tree</td><td>Geometric data, range types, full-text search</td></tr>
+                    <tr><td><strong>BRIN</strong></td><td>—</td><td>Block range index</td><td>Time-series data and other physically ordered large tables</td></tr>
+                </tbody>
+            </table>
+
+            <p>They all share the same <code>index_getnext_slot</code> call framework, dispatched to specific implementations via the <code>rd_indam->amgettuple</code> function pointer.</p>
+
+            <h3>Putting It All Together: Complete Path of an Index Query</h3>
+
+<pre class="diagram"><code>  SELECT name FROM users WHERE age = 25;
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ Executor                                                  │
+  │                                                           │
+  │  ExecIndexScan                                            │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  IndexNext                                                │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  index_getnext_slot                                       │
+  │      │                                                    │
+  │      ├─── btgettuple ──────────────────────────┐          │
+  │      │    B-Tree: Root → Internal → Leaf        │          │
+  │      │    Found age=25, TID=(5,1)              │          │
+  │      │                                          │          │
+  │      ├─── index_fetch_heap ◄───────────────────┘          │
+  │      │    Read Heap Page 5 into Buffer Pool               │
+  │      │                                                    │
+  │      ├─── heap_hot_search_buffer                          │
+  │      │    │                                               │
+  │      │    │  ItemId[1] → Tuple v1 (xmin=90, xmax=95)     │
+  │      │    │  HeapTupleSatisfiesMVCC(snapshot) → invisible  │
+  │      │    │                                               │
+  │      │    │  Follow t_ctid → ItemId[2]                    │
+  │      │    │  Tuple v2 (xmin=95, xmax=0)                   │
+  │      │    │  HeapTupleSatisfiesMVCC(snapshot) → visible ✓  │
+  │      │    │                                               │
+  │      │    └─► Return Tuple v2                             │
+  │      │                                                    │
+  │      ├─── ExecQual(WHERE age=25) → passes                │
+  │      │    (B-Tree is exact, but recheck still exists)     │
+  │      │                                                    │
+  │      └─── ExecProject → project name column → return to   │
+  │           client                                          │
+  │                                                           │
+  └──────────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>Summary</h3>
+
+            <p>Key intuitions worth remembering:</p>
+
+            <ul>
+                <li><strong>Indexes don't store version information</strong>: Indexes only store key → TID mappings; all MVCC determination happens after the heap fetch. This means an index scan may retrieve a TID, find it invisible after fetching from the heap, and then get the next TID. Index Only Scan is the sole exception — it avoids heap fetches through the Visibility Map</li>
+                <li><strong>A snapshot is a data structure, not a point in time</strong>: <code>SnapshotData</code>'s xmin/xmax quickly eliminate most transactions, and the xip array precisely handles the middle interval. The difference between isolation levels is simply when the snapshot is taken</li>
+                <li><strong>Visibility = xmin committed + xmax invalid</strong>: This is the most essential intuition. All complex scenarios (rollback, in-progress, HOT chains) are variations of this rule</li>
+                <li><strong>Hint bits avoid repeated CLOG lookups</strong>: After the first visibility check, markers are set in the row header, and subsequent checks read the markers directly</li>
+                <li><strong>The storage engine is pluggable</strong>: <code>TableAmRoutine</code> defines 50+ function pointers, and heapam is just the default implementation. <code>IndexAmRoutine</code> works the same way — B-Tree, Hash, GIN, GiST all share the same call framework</li>
+            </ul>
+
+            <p>In the next post, we'll enter the world of WAL and Checkpoint: how a write becomes a WAL record, how WAL Writer flushes in-memory logs to disk, how Checkpoint creates consistent recovery points, and how all of this supports replication and crash recovery.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

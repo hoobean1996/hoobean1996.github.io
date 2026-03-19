@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <section class="posts">
+            <h3>Performance</h3>
+            <article>
+                <h4><a href="llm-inference-gpu.html">CPU から GPU へ：LLM 推論エンジンの CUDA 最適化への道</a></h4>
+                <time>2026-03-18</time>
+                <p>nsys プロファイリングで最適化を駆動：CUDA バックエンド、FP16 フルパイプライン、Flash Attention、caching allocator。33 tok/s から 504 tok/s へ、15 倍の高速化。</p>
+            </article>
+            <article>
+                <h4><a href="llm-inference-engine.html">ゼロから生成まで：純粋な C++ で LLM 推論エンジンを手作りした全記録</a></h4>
+                <time>2026-02-19</time>
+                <p>ML フレームワークを一切使わず、純粋な C++ で mmap による重み読み込みから自己回帰生成まで、Qwen2.5-0.5B を動かせる推論エンジンを手作りする。</p>
+            </article>
+            <article>
+                <h4><a href="matmul-optimization.html">0.98 から 267 GFLOPS へ：行列乗算パフォーマンス最適化の全記録</a></h4>
+                <time>2026-02-16</time>
+                <p>教科書的な三重ループからハードウェアピーク性能に近い GEMM 実装まで、段階的な最適化の完全記録。</p>
+            </article>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

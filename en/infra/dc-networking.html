@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Journey of a Request: A Panoramic View of Data Center Networking - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>The Journey of a Request: A Panoramic View of Data Center Networking</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/cezanne-viaduct.jpg" alt="Mont Sainte-Victoire and the Viaduct of the Arc River Valley, Paul Cézanne, 1882-85">
+                <figcaption>Paul Cézanne, "Mont Sainte-Victoire and the Viaduct of the Arc River Valley", 1882-85 — The viaduct connects two banks, just as backbone networks connect data centers. The beauty of infrastructure lies in how it disappears into the landscape while supporting everything</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>What you'll learn from this post</strong>: Most backend engineers know that a request goes from the browser to the server and back. But what happens in between? PoP nodes, backbone fiber optics, Clos switching fabrics, eBPF L4 load balancing, VXLAN container networking — this infrastructure determines what your system can and cannot do. This post traces a request's complete journey from a user's phone to a data center server, dissecting the key technologies at each layer along the way.
+            </blockquote>
+
+            <h3>The Big Picture: Three-Layer Architecture</h3>
+
+            <p>The network infrastructure of any large-scale internet company follows a three-layer structure:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Layer</th><th>Responsibility</th><th>Example</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Edge / PoP</strong></td><td>User traffic ingress, TLS termination, geographic routing</td><td>Tokyo PoP receives requests from Japanese users</td></tr>
+                    <tr><td><strong>Backbone</strong></td><td>High-speed private fiber between data centers, running SR/MPLS</td><td>Singapore DC ↔ US DC, ~120ms RTT</td></tr>
+                    <tr><td><strong>DC Internal</strong></td><td>Clos switching fabric connecting all servers within a DC</td><td>Leaf-Spine-Core three-layer switching</td></tr>
+                </tbody>
+            </table>
+
+            <p>A Tokyo user opens an app: Phone DNS resolves to the nearest Tokyo PoP IP → PoP terminates TLS, static content returned directly from CDN → Dynamic requests travel over the backbone (SR/MPLS) to the Singapore DC → Enter the DC through Katran (L4 LB) → Proxygen (L7 LB) → Application server → If data from the US DC is needed, another cross-ocean backbone hop → Response returns directly to the user via DSR, bypassing the L4 LB.</p>
+
+            <p>Let's dissect each layer along this path.</p>
+
+            <h3>DC Internal: Clos Architecture</h3>
+
+            <p>A single large switch cannot scale to hundreds of thousands of servers. Clos topology combines many cheap small switches into a non-blocking, horizontally scalable network.</p>
+
+            <h4>Three-Layer Structure</h4>
+
+<pre class="diagram"><code>                      ┌─────────┐   ┌─────────┐
+                      │  Core 1 │   │  Core 2 │        ← Layer 3: Connects Pods
+                      └────┬┬───┘   └───┬┬────┘
+                     ╱╱    ││    ╲╲    ╱╱││
+            ┌───────╱╱─────┘│     ╲╲─╱╱──┘│
+            │      ╱╱       │      ╲╱╱    │
+     ┌──────┼────╱╱─────────┼──────╱╲─────┼──────────┐
+     │ Pod A│   ╱╱          │     ╱╱ ╲╲   │    Pod B  │
+     │      ▼  ▼            ▼    ▼     ▼  ▼           │
+     │  ┌────────┐     ┌────────┐  ┌────────┐  ┌────────┐
+     │  │Spine 1 │     │Spine 2 │  │Spine 3 │  │Spine 4 │ ← Layer 2
+     │  └┬──┬──┬─┘     └┬──┬──┬─┘  └┬──┬──┬─┘  └┬──┬──┬─┘
+     │   │  │  │         │  │  │     │  │  │      │  │  │
+     │   ▼  ▼  ▼         ▼  ▼  ▼     ▼  ▼  ▼      ▼  ▼  ▼
+     │ ┌──┐┌──┐┌──┐   ┌──┐┌──┐┌──┐ ┌──┐┌──┐┌──┐ ┌──┐┌──┐┌──┐
+     │ │L1││L2││L3│   │L1││L2││L3│ │L1││L2││L3│ │L1││L2││L3│ ← Layer 1: Leaf (ToR)
+     │ └┬─┘└┬─┘└┬─┘   └┬─┘└┬─┘└┬─┘ └┬─┘└┬─┘└┬─┘ └┬─┘└┬─┘└┬─┘
+     │  │   │   │       │   │   │     │   │   │     │   │   │
+     │ ▓▓▓ ▓▓▓ ▓▓▓   ▓▓▓ ▓▓▓ ▓▓▓  ▓▓▓ ▓▓▓ ▓▓▓  ▓▓▓ ▓▓▓ ▓▓▓  ← Server racks
+     └────────────────────────────┘  └────────────────────────┘</code></pre>
+
+            <table>
+                <thead>
+                    <tr><th>Layer</th><th>Name</th><th>Responsibility</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Layer 1</td><td><strong>Leaf (ToR)</strong></td><td>Top-of-rack switch, directly connected to servers. One per rack</td></tr>
+                    <tr><td>Layer 2</td><td><strong>Spine</strong></td><td>Connects all Leafs within the same Pod, full-mesh connectivity</td></tr>
+                    <tr><td>Layer 3</td><td><strong>Core</strong></td><td>Connects different Pods, cross-Pod traffic goes through Core</td></tr>
+                </tbody>
+            </table>
+
+            <p>Traffic path hop counts:</p>
+            <ul>
+                <li><strong>Same rack</strong>: Leaf local switching, 0 hops</li>
+                <li><strong>Same Pod, different rack</strong>: Leaf → Spine → Leaf, 2 hops</li>
+                <li><strong>Cross Pod</strong>: Leaf → Spine → Core → Spine → Leaf, 4 hops</li>
+            </ul>
+
+            <h4>Pod: The Repeatable Building Block</h4>
+
+            <p>A Pod is a group of Leafs + corresponding Spines, the basic unit for DC scaling. Need more capacity? Add a Pod and connect it to Core.</p>
+
+            <p>Scale calculation using 64-port switches:</p>
+
+<pre><code>Leaf:  32 ports facing down to servers → 32 servers per rack
+Pod:   32 Leafs                        → 32 × 32 = 1,024 servers
+DC:    32 Pods                         → 32 × 1,024 = 32,768 servers</code></pre>
+
+            <p>Need more? Add another layer (5-stage Clos / Super Spine), supporting hundreds of thousands of servers. Large internet companies' F16 Fabric uses this multi-stage Clos design.</p>
+
+            <h4>ECMP: Equal-Cost Multi-Path</h4>
+
+            <p>The core design principle of Clos architecture. When Leaf 1 sends a packet to Leaf 4, there are multiple equal-cost paths through different Spines. Switches hash the five-tuple (source IP, destination IP, source port, destination port, protocol) to evenly distribute across all paths.</p>
+
+<pre class="diagram"><code>  Leaf 1 ──sends packet──►  To reach Leaf 4, there are 4 equal-cost paths:
+
+  Leaf 1 ─── Spine A ─── Leaf 4    ← hash(five-tuple) = 0
+  Leaf 1 ─── Spine B ─── Leaf 4    ← hash(five-tuple) = 1
+  Leaf 1 ─── Spine C ─── Leaf 4    ← hash(five-tuple) = 2
+  Leaf 1 ─── Spine D ─── Leaf 4    ← hash(five-tuple) = 3
+
+  Traffic evenly distributed → No bottleneck → If a Spine fails, auto-redistribute</code></pre>
+
+            <p>Why ECMP matters:</p>
+            <ul>
+                <li><strong>No bottleneck</strong>: Traffic is evenly distributed, no single link overloaded</li>
+                <li><strong>Fault tolerance</strong>: If one Spine goes down, traffic automatically redistributes to remaining Spines</li>
+                <li><strong>Linear scaling</strong>: Need more bandwidth? Just add Spines</li>
+            </ul>
+
+            <h4>Oversubscription</h4>
+
+            <p>The ratio between a Leaf switch's downstream bandwidth (facing servers) and upstream bandwidth (facing Spines).</p>
+
+            <table>
+                <thead>
+                    <tr><th>Ratio</th><th>Meaning</th><th>Use Case</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>1:1</strong></td><td>Non-blocking, all servers can communicate at full speed simultaneously</td><td>Latency-sensitive (DB clusters, ML training)</td></tr>
+                    <tr><td><strong>3:1</strong></td><td>Only 1/3 of server bandwidth can go upstream simultaneously</td><td>General compute (statistically sufficient)</td></tr>
+                    <tr><td><strong>4:1+</strong></td><td>Higher oversubscription, cheaper but riskier</td><td>Cold storage, batch processing</td></tr>
+                </tbody>
+            </table>
+
+            <p>Practical impact: When designing services, place frequently communicating services in the same rack or Pod to avoid oversubscription bottlenecks. This is why HDFS places one replica in the same rack and another cross-rack.</p>
+
+            <h3>Backbone: Segment Routing</h3>
+
+            <p>Data centers are connected via private backbone networks. Traditional MPLS requires each intermediate router to maintain forwarding state (via LDP/RSVP). Segment Routing (SR) is its evolution: <strong>encode the complete path in the packet header</strong>, intermediate routers just read the next instruction.</p>
+
+<pre><code>MPLS analogy: Taking a taxi, asking for directions at every intersection
+SR analogy:   Getting full GPS navigation before departure, just follow the next instruction at each turn</code></pre>
+
+<pre class="diagram"><code>  MPLS: Every router maintains forwarding state
+  ┌───┐    ┌───┐    ┌───┐    ┌───┐
+  │ A │───►│ B │───►│ C │───►│ D │     B,C each lookup LDP table to decide next hop
+  └───┘    └───┘    └───┘    └───┘
+
+  SR: Path encoded in packet header, intermediate routers just execute instructions
+  ┌───┐    ┌───┐    ┌───┐    ┌───┐
+  │ A │───►│ B │───►│ C │───►│ D │
+  └───┘    └───┘    └───┘    └───┘
+  Header: [B, C, D]   [C, D]    [D]       Pop one SID per hop</code></pre>
+
+            <p>Two types of Segment IDs:</p>
+            <ul>
+                <li><strong>Node SID</strong>: Take the shortest path to a specific router — "go to router D"</li>
+                <li><strong>Adjacency SID</strong>: Take a specific physical link — "use the B→C link"</li>
+            </ul>
+
+            <p>SRv6 is the direction being pushed by major hyperscalers. The 128-bit SID can simultaneously encode destination and operation (e.g., "decapsulate", "lookup VPN table"), far more flexible than SR-MPLS's 20-bit labels.</p>
+
+            <h3>Load Balancing: L4 + L7 Two Layers</h3>
+
+            <p>There are two fundamentally different types of "load balancing" working together in data centers. Many people conflate them, but they solve completely different problems:</p>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>ECMP (Network Layer)</th><th>Application Load Balancer</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Question answered</strong></td><td>Which physical path should this packet take?</td><td>Which server should handle this request?</td></tr>
+                    <tr><td><strong>Decision basis</strong></td><td>Five-tuple hash</td><td>Health checks, load, session, URL, headers</td></tr>
+                    <tr><td><strong>Application awareness</strong></td><td>None</td><td>Full awareness</td></tr>
+                    <tr><td><strong>OSI layer</strong></td><td>L3/L4 (switches)</td><td>L4/L7 (software)</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Katran: eBPF-Based L4 Load Balancer</h4>
+
+            <p>Katran is not a standalone device — it's an <strong>eBPF/XDP program</strong> running directly on the NIC of every L7 LB server.</p>
+
+<pre class="diagram"><code>                         User request
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │  DC Border    │
+                    │  Router       │
+                    └──┬─────┬────┬─┘
+                       │     │    │      ← ECMP + Anycast
+                       ▼     ▼    ▼
+                 ┌──────┐ ┌──────┐ ┌──────┐
+                 │Server│ │Server│ │Server│   Each runs Katran
+                 │  A   │ │  B   │ │  C   │
+                 └──┬───┘ └──┬───┘ └──┬───┘
+        ┌───────────┤        │        │
+        │           │        │        │
+        ▼           ▼        ▼        ▼
+   ┌─────────┐ ┌─────────────────────────────┐
+   │Local     │ │  Encap & forward to other   │
+   │processing│ │  backend servers             │
+   │Proxygen │ │                              │
+   │ (L7 LB) │ │  ┌──────┐┌──────┐┌──────┐   │
+   └─────────┘ │  │App 1 ││App 2 ││App 3 │   │
+               │  └──┬───┘└──┬───┘└──┬───┘   │
+               └─────┼───────┼───────┼────────┘
+                     │       │       │
+                     └───────┼───────┘
+                             │
+                             ▼
+                    DSR: Response goes directly
+                    to user (bypasses Katran)</code></pre>
+
+            <p>Three key design decisions:</p>
+
+            <ul>
+                <li><strong>XDP/eBPF</strong>: Packets processed at the NIC driver layer, bypassing the kernel network stack. A single machine can achieve millions of PPS</li>
+                <li><strong>Consistent hashing</strong>: The same TCP connection always maps to the same backend. When backends change, only a small fraction of connections need remapping</li>
+                <li><strong>DSR (Direct Server Return)</strong>: Responses go from backend servers directly to the user, <strong>bypassing Katran</strong>. Since responses are much larger than requests (think an HTTP request vs. a page with images), DSR prevents the LB from becoming a bandwidth bottleneck</li>
+            </ul>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Hardware LB (F5)</th><th>LVS/IPVS</th><th>Katran (eBPF)</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Performance</strong></td><td>High but capped</td><td>Medium-high</td><td>Millions of PPS</td></tr>
+                    <tr><td><strong>Cost</strong></td><td>$100K+ / unit</td><td>Free</td><td>Free</td></tr>
+                    <tr><td><strong>Single point of failure</strong></td><td>Yes</td><td>Depends on deployment</td><td>No (runs on every server)</td></tr>
+                    <tr><td><strong>Scaling method</strong></td><td>Buy more devices</td><td>Add servers</td><td>Add servers</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Overlay Networks: How Containers Communicate</h3>
+
+            <p>Your code runs in containers, containers have virtual IPs, and the physical network doesn't recognize these IPs. Overlay networks bridge this gap.</p>
+
+            <h4>Underlay vs Overlay</h4>
+
+            <table>
+                <thead>
+                    <tr><th>Layer</th><th>What it is</th><th>IP</th><th>Devices</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Underlay</strong></td><td>Clos physical switching fabric</td><td>192.168.x.x (host IP)</td><td>Leaf, Spine, Core</td></tr>
+                    <tr><td><strong>Overlay</strong></td><td>Container virtual network</td><td>10.244.x.x (Pod IP)</td><td>veth, bridge, VXLAN</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Linux Virtual Network Devices</h4>
+
+            <ul>
+                <li><strong>veth pair</strong>: A virtual cable connecting two network namespaces. Docker/K8s creates a pair: one end goes inside the container (eth0), the other stays on the host connected to a bridge</li>
+                <li><strong>bridge</strong>: A virtual L2 switch on the host. Containers on the same host communicate through it without touching the physical network</li>
+                <li><strong>VXLAN device (VTEP)</strong>: When a container needs to reach a container on another host, the VXLAN device encapsulates the original frame in a UDP packet (port 4789), using host IPs as the outer addresses. The physical network routes normally using ECMP, and the destination host's VXLAN device decapsulates and delivers to the target container</li>
+            </ul>
+
+            <h4>A Packet's Complete Journey: Cross-Host Container Communication</h4>
+
+<pre class="diagram"><code>  Host 1 (192.168.1.10)                          Host 2 (192.168.2.20)
+ ┌──────────────────────────┐                   ┌──────────────────────────┐
+ │                          │                   │                          │
+ │  ┌──────────────────┐    │                   │    ┌──────────────────┐  │
+ │  │ Container A       │    │                   │    │ Container B       │  │
+ │  │ IP: 10.244.1.5    │    │                   │    │ IP: 10.244.3.8    │  │
+ │  │      │ eth0        │    │                   │    │       eth0 │      │  │
+ │  └──────┼─────────────┘    │                   │    └────────────┼──────┘  │
+ │         │ veth pair        │                   │       veth pair │         │
+ │         ▼                  │                   │                 ▼         │
+ │  ┌─────────────┐          │                   │          ┌─────────────┐  │
+ │  │   Bridge     │          │                   │          │   Bridge     │  │
+ │  │  (cni0)      │          │                   │          │  (cni0)      │  │
+ │  └──────┬──────┘          │                   │          └──────┬──────┘  │
+ │         │ Dest not local   │                   │  Forward after  │         │
+ │         ▼                  │                   │  decapsulation  ▲         │
+ │  ┌─────────────┐          │                   │          ┌─────────────┐  │
+ │  │ VXLAN (VTEP)│          │                   │          │ VXLAN (VTEP)│  │
+ │  │ Encap       │          │                   │          │ Decap       │  │
+ │  │ UDP:4789    │          │                   │          │             │  │
+ │  └──────┬──────┘          │                   │          └──────┬──────┘  │
+ │         │                  │                   │                 ▲         │
+ │         ▼                  │                   │                 │         │
+ │  ┌─────────────┐          │                   │          ┌─────────────┐  │
+ │  │  Physical    │          │                   │          │  Physical    │  │
+ │  │  NIC         │          │                   │          │  NIC         │  │
+ │  └──────┬──────┘          │                   │          └──────┬──────┘  │
+ └─────────┼──────────────────┘                   └──────────────────┼────────┘
+            │                                                       ▲
+            │            Clos Physical Network                      │
+            │     ┌──────────────────────────┐                      │
+            └────►│  Leaf → Spine → Leaf     │──────────────────────┘
+                  │  (ECMP routes on outer IP)│
+                  └──────────────────────────┘</code></pre>
+
+            <p>Why VXLAN instead of VLAN? VLAN supports only 4,096 IDs (12 bits). VXLAN uses 24-bit VNI, supporting 16 million virtual networks — essential for multi-tenant DC environments.</p>
+
+            <h4>K8s CNI Plugin Comparison</h4>
+
+            <table>
+                <thead>
+                    <tr><th>CNI</th><th>Method</th><th>Performance</th><th>Complexity</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Flannel (VXLAN)</strong></td><td>VXLAN encapsulation</td><td>Good (encapsulation overhead)</td><td>Simple</td></tr>
+                    <tr><td><strong>Calico (IPIP)</strong></td><td>IP-in-IP encapsulation</td><td>Better (lighter encapsulation)</td><td>Medium</td></tr>
+                    <tr><td><strong>Calico (BGP)</strong></td><td>Direct routing, no encapsulation</td><td>Best (native routing)</td><td>Requires BGP-capable switches</td></tr>
+                    <tr><td><strong>Cilium (eBPF)</strong></td><td>eBPF, bypasses bridge/iptables</td><td>Excellent</td><td>Medium</td></tr>
+                </tbody>
+            </table>
+
+            <p>Hyperscale data centers most likely use a direct routing approach similar to Calico BGP — physical switches know container subnet routes, no encapsulation needed, best performance, but requires deep integration with network infrastructure.</p>
+
+            <h3>DC Internal vs Public Internet: Two Completely Different Worlds</h3>
+
+            <p>This is the most counterintuitive part. Textbook TCP/IP is designed for the public internet — high latency, high packet loss, unknown bandwidth. The DC interior is a <strong>completely different environment</strong> that requires different optimizations at every layer.</p>
+
+            <table>
+                <thead>
+                    <tr><th>Property</th><th>Public Internet</th><th>DC Internal</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>RTT</strong></td><td>10-200ms</td><td>10-100μs (1000x lower)</td></tr>
+                    <tr><td><strong>Packet loss</strong></td><td>1-5%</td><td>&lt;0.001%</td></tr>
+                    <tr><td><strong>Bandwidth</strong></td><td>Unknown, variable</td><td>Known (25G/100G/400G)</td></tr>
+                    <tr><td><strong>Hop count</strong></td><td>10-20</td><td>2-4</td></tr>
+                    <tr><td><strong>Trust</strong></td><td>Untrusted</td><td>Fully controlled</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Transport Layer Differences</h4>
+
+            <table>
+                <thead>
+                    <tr><th>Public Internet Approach</th><th>DC Approach</th><th>Why</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>TCP: halve window on packet loss</td><td>DCTCP: fine-grained rate adjustment based on ECN</td><td>Packet loss signal too coarse; ECN provides early, proportional congestion feedback</td></tr>
+                    <tr><td>New TCP connection per request</td><td>Connection pooling + gRPC/HTTP2 multiplexing</td><td>Millions of inter-service calls, handshake overhead unacceptable</td></tr>
+                    <tr><td>Use TCP for everything</td><td>RDMA/RoCE for ML training</td><td>GPU gradient exchange needs &lt;2μs latency, bypassing CPU</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Kernel Bypass Technologies</h4>
+
+            <p>The kernel network stack adds latency through context switches and protocol processing. DC workloads bypass it directly:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Technology</th><th>Principle</th><th>Use Case</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>DPDK</strong></td><td>Userspace packet processing, completely bypasses kernel</td><td>High-performance LB, NFV</td></tr>
+                    <tr><td><strong>RDMA/RoCE</strong></td><td>NIC directly reads/writes remote memory, CPU not involved</td><td>GPU training, distributed storage</td></tr>
+                    <tr><td><strong>XDP/eBPF</strong></td><td>Intercepts packets at NIC driver layer (kernel's earliest hook point)</td><td>Katran LB, Cilium</td></tr>
+                    <tr><td><strong>io_uring</strong></td><td>Async I/O, reduces syscall overhead</td><td>High-performance storage engines</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Incast: A DC-Specific Congestion Pattern</h4>
+
+            <p>A request fans out to N servers (e.g., distributed query), N servers respond simultaneously, <strong>instantly overwhelming the requester's Leaf switch buffer</strong>. Result: packet loss, TCP retransmissions, latency spikes.</p>
+
+            <p>Solutions:</p>
+            <ul>
+                <li><strong>ECN</strong>: Switches mark packets when buffer reaches threshold (e.g., 30%), senders slow down before packet loss occurs</li>
+                <li><strong>DCTCP</strong>: Proportionally reduces speed based on the fraction of ECN-marked packets, rather than a binary "halve"</li>
+                <li><strong>Application-level staggering</strong>: Add jitter to response times to avoid synchronized bursts</li>
+            </ul>
+
+            <h3>The Complete Request Path</h3>
+
+            <p>Now let's string all layers together:</p>
+
+<pre class="diagram"><code>  ┌──────────┐
+  │ User's   │  Tokyo
+  │ Phone    │
+  └────┬─────┘
+       │ DNS → Anycast IP
+       ▼
+  ┌──────────┐
+  │ PoP Tokyo│  TLS termination
+  │          │  Static content → CDN direct return
+  └────┬─────┘
+       │ Dynamic request
+       ▼
+  ═══════════════════════  Backbone (SR/MPLS, private fiber, ~120ms)
+       │
+       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ Singapore DC                                          │
+  │                                                      │
+  │  ┌──────────────┐                                    │
+  │  │ Border Router │  ECMP + Anycast                   │
+  │  └──────┬───────┘                                    │
+  │         ▼                                            │
+  │  ┌──────────────┐                                    │
+  │  │ Katran        │  L4 LB (XDP/eBPF)                │
+  │  │ Consistent    │                                   │
+  │  │ hashing       │                                   │
+  │  └──────┬───────┘                                    │
+  │         ▼                                            │
+  │  ┌──────────────┐                                    │
+  │  │ Proxygen      │  L7 LB (TLS, URL routing,        │
+  │  │               │  health checks)                   │
+  │  └──────┬───────┘                                    │
+  │         ▼                                            │
+  │  ┌──────────────┐       ┌──────────────┐             │
+  │  │ App Server   │──────►│ Other        │             │
+  │  │ (container)  │ VXLAN │ services     │             │
+  │  │              │       │(cross-Pod/   │             │
+  │  │              │       │ cross-host)  │             │
+  │  └──────┬───────┘       └──────────────┘             │
+  │         │                                            │
+  └─────────┼────────────────────────────────────────────┘
+            │
+            │ DSR: Response goes directly to user, bypasses Katran
+            ▼
+  ┌──────────┐
+  │ User's   │
+  │ Phone    │
+  └──────────┘</code></pre>
+
+            <p>From the moment a user sends a request to receiving the response, it passes through DNS, CDN, PoP, backbone, border router, ECMP, eBPF L4 LB, L7 LB, container overlay network — each layer solves a specific problem, and each layer's design is constrained by the laws of physics (speed of light, bandwidth, buffer size).</p>
+
+            <h3>Summary</h3>
+
+            <p>Key intuitions worth remembering:</p>
+
+            <ul>
+                <li><strong>Clos + ECMP</strong>: Combine cheap small switches into a large network, distributing traffic evenly via hashing. The physical foundation of DC networking</li>
+                <li><strong>Katran + DSR</strong>: eBPF does load balancing at the NIC layer, responses bypass the LB and go directly to users. Solves the bandwidth bottleneck and single point of failure of traditional LBs</li>
+                <li><strong>DC RTT is 1000x lower than the public internet</strong>: This order-of-magnitude difference changes all assumptions. Public internet TCP congestion control, connection management, and security models don't apply inside DCs — specialized solutions are needed (DCTCP, RDMA, Zero Trust)</li>
+                <li><strong>Overlay networks are the glue</strong>: Containers' virtual IPs are mapped to the physical network via VXLAN/BGP. Understanding this encapsulation/decapsulation explains why cross-host container communication is slower than same-host</li>
+                <li><strong>Oversubscription determines service deployment strategy</strong>: Placing frequently communicating services in the same rack or Pod isn't "optimization" — it's a necessary measure to avoid oversubscription bottlenecks</li>
+            </ul>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

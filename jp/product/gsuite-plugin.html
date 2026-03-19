@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Workspace プラグイン向け Webpack スキャフォールドの構築 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Google Workspace プラグイン向け Webpack スキャフォールドの構築</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/celestial-globe-clockwork.jpg" alt="Celestial Globe with Clockwork, Metropolitan Museum of Art">
+                <figcaption>天球儀と時計機構 — 精密な制約のフレームワーク内で、歯車を組み合わせて複雑な動作メカニズムを生み出す。GSuite のサンドボックス向けにビルドツールチェーンを設計するのも、同様のエンジニアリング</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：Google Workspace プラグインの開発体験は非常に原始的——npm なし、ビルドツールなし、すべてのリソースを単一の HTML ファイルにインラインで含める必要がある。この記事では、React + TypeScript で GSuite プラグインを開発できる Webpack スキャフォールドを共有する。新しいエントリの自動検出、JS/CSS の自動インライン化、1 回のビルドですべての GSuite プロダクトをカバー。GSuite プラグインで複雑な UI インタラクションが必要な場合、このスキャフォールドで大量の反復作業を省ける。
+            </blockquote>
+
+            <h3>Google Workspace プラグインとは</h3>
+
+            <p>Google Workspace（旧 GSuite）では、Docs、Sheets、Slides、Forms などのプロダクト向けにプラグインを開発できる。プラグインの UI 形態は 2 つ：<strong>Sidebar</strong>（サイドバー、常駐）と <strong>Dialog</strong>（ダイアログ、一時的）。</p>
+
+            <p>プラグインのアーキテクチャは 2 層に分かれる：</p>
+
+<pre><code>┌──────────────────────────────────────────┐
+│           Google Docs / Sheets / ...      │
+│                                           │
+│   ┌─────────────┐    ┌───────────────┐   │
+│   │   Sidebar    │    │    Dialog     │   │
+│   │  (HTML/JS)   │    │  (HTML/JS)   │   │
+│   │  ← iframe →  │    │  ← iframe → │   │
+│   └──────┬───────┘    └──────┬───────┘   │
+│          │                    │           │
+│          │  google.script.run │           │
+│          ▼                    ▼           │
+│   ┌──────────────────────────────────┐   │
+│   │        AppScript (サーバーサイド)  │   │
+│   │  - Drive / Gmail / Sheets にアクセス │   │
+│   │  - ドキュメント内容の操作            │   │
+│   │  - メール送信                      │   │
+│   └──────────────────────────────────┘   │
+└──────────────────────────────────────────┘</code></pre>
+
+            <ul>
+                <li><strong>フロントエンド</strong>：iframe サンドボックス内で動作する HTML ページ、AppScript の <code>HtmlService</code> がホスティング</li>
+                <li><strong>バックエンド</strong>：AppScript コード、Google のサーバー上で動作し、Google API（Drive、Gmail、Sheets など）を呼び出せる</li>
+                <li><strong>通信</strong>：フロントエンドは <code>google.script.run</code> 経由でバックエンド関数を非同期呼び出し</li>
+            </ul>
+
+            <p>このモデルには 3 つの必須制約があり、ビルド方針を直接決定する：</p>
+
+            <ol>
+                <li><strong>CSP 制限</strong>：iframe サンドボックスは外部スクリプトとスタイルシートの読み込みを禁止。すべての JS と CSS を HTML ファイル内にインラインで含める必要がある</li>
+                <li><strong>単一ファイル配信</strong>：<code>HtmlService.createHtmlOutputFromFile("sidebar")</code> は HTML ファイル名を 1 つだけ受け付ける。複数ファイルに分割できない</li>
+                <li><strong>クロスプロダクトデプロイ</strong>：同じプラグインを Docs、Sheets、Slides、Forms にそれぞれデプロイする必要があり、各プロダクトは独立した AppScript プロジェクト</li>
+            </ol>
+
+            <p>公式が推奨する開発方法は、Apps Script エディタ内で直接 HTML + JavaScript を書くこと。シンプルなプラグインにはこれで十分だが、UI に状態管理、マルチステップフォーム、条件レンダリングなどの要件があると、コンポーネント化とビルドツールなしの開発体験は苦痛になる。</p>
+
+            <p>以下に、これらの問題を解決するために Webpack で構築したスキャフォールドを紹介する。</p>
+
+            <h3>スキャフォールドの目標</h3>
+
+            <p>このスキャフォールドが達成すべきこと：</p>
+
+            <ol>
+                <li><strong>React + TypeScript 開発</strong>：モダンフロントエンドの方法で GSuite プラグイン UI を書く</li>
+                <li><strong>自己完結型 HTML 出力</strong>：ビルド成果物は単一の HTML ファイルで、JS/CSS はすべてインライン化され、GSuite の CSP 制限を直接満たす</li>
+                <li><strong>自動検出</strong>：新しい dialog を追加するには、規約のディレクトリにフォルダを作るだけで、ビルド設定の変更は不要</li>
+                <li><strong>マルチプロダクトマトリクスビルド</strong>：1 回のビルドで、各 GSuite プロダクト向けに独立したデプロイディレクトリを生成</li>
+                <li><strong>ローカル開発</strong>：GSuite にデプロイしなくてもブラウザで UI をデバッグ可能</li>
+            </ol>
+
+            <h3>プロジェクト構造の規約</h3>
+
+<pre><code>project/
+├── src/
+│   ├── sidebar/           # メイン sidebar（必須）
+│   │   ├── App.tsx
+│   │   └── index.tsx
+│   └── dialogs/           # dialog ディレクトリ（自動検出）
+│       ├── about/
+│       │   ├── App.tsx
+│       │   └── index.tsx
+│       └── settings/
+│           ├── App.tsx
+│           └── index.tsx
+├── appscript/
+│   └── shared.gs          # AppScript サーバーサイドコード
+├── clasp/
+│   ├── docs/
+│   │   ├── .clasp.json    # Docs の AppScript プロジェクト ID
+│   │   └── appsscript.json
+│   ├── sheets/
+│   │   └── .clasp.json    # Sheets の AppScript プロジェクト ID
+│   └── ...
+├── webpack.config.js
+└── package.json</code></pre>
+
+            <p>この構造のコア規約：<strong><code>src/sidebar/</code> は固定エントリで、<code>src/dialogs/</code> 以下の <code>index.tsx</code> を含むサブディレクトリが自動的に dialog エントリになる</strong>。</p>
+
+            <h3>第 1 ステップ：Entry Points の自動検出</h3>
+
+            <p>Webpack の <code>entry</code> は通常手動で設定するが、dialog を追加する際に設定を変更したくない。そこで Webpack 起動時にファイルシステムをスキャンする：</p>
+
+<pre><code>const path = require("path");
+const fs = require("fs");
+
+function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(item => item.isDirectory())
+    .filter(dir => {
+      return fs.existsSync(
+        path.join(dialogsPath, dir.name, "index.tsx")
+      );
+    })
+    .map(dir => dir.name);
+}
+
+// entry points を動的生成
+const dialogs = discoverDialogs();
+const entry = { sidebar: "./src/sidebar/index.tsx" };
+dialogs.forEach(name => {
+  entry[name] = `./src/dialogs/${name}/index.tsx`;
+});</code></pre>
+
+            <p>こうすると <code>entry</code> は <code>{ sidebar: "...", about: "...", settings: "..." }</code> になる。新しい dialog を追加したい場合は、<code>src/dialogs/</code> にフォルダを作り <code>index.tsx</code> を置くだけで、次のビルドで自動的に有効になる。</p>
+
+            <h3>第 2 ステップ：JS と CSS のインライン化</h3>
+
+            <p>通常の Webpack ビルド成果物は独立した <code>.js</code> と <code>.css</code> ファイルで、HTML が <code>&lt;script src&gt;</code> と <code>&lt;link rel="stylesheet"&gt;</code> で参照する。GSuite ではこれが機能しない——iframe サンドボックスがこれらの外部リソースの読み込みをブロックする。</p>
+
+            <p>解決策は 2 つのプラグインの組み合わせ：</p>
+
+<pre><code>const HtmlWebpackPlugin = require("html-webpack-plugin");
+const HtmlInlineScriptPlugin =
+  require("html-inline-script-webpack-plugin");
+
+// JS インライン：HtmlInlineScriptPlugin が Webpack 出力の JS バンドルを
+//          直接 HTML の &lt;script&gt; タグに埋め込む
+plugins: [
+  new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    chunks: ["sidebar"],
+    inject: "body",
+  }),
+  new HtmlInlineScriptPlugin(),
+]
+
+// CSS インライン：mini-css-extract-plugin の代わりに style-loader を使用
+module: {
+  rules: [
+    {
+      test: /\.css$/,
+      use: ["style-loader", "css-loader"],
+      // style-loader はランタイムに CSS を &lt;style&gt; タグに注入
+      // 独立した .css ファイルを生成しない
+    },
+  ],
+}</code></pre>
+
+            <p>ビルド後、各 HTML ファイルは完全に自己完結型——外部依存ゼロ。<code>HtmlService.createHtmlOutputFromFile("sidebar")</code> でそのまま使用可能。</p>
+
+            <h3>第 3 ステップ：マルチプロダクトマトリクス生成</h3>
+
+            <p>同じプラグインを Docs、Sheets、Slides、Forms の 4 つのプロダクトにデプロイする必要がある。各プロダクトは独立した AppScript プロジェクトで、独立したデプロイディレクトリが必要。Webpack 設定ですべての <code>HtmlWebpackPlugin</code> インスタンスを動的生成する：</p>
+
+<pre><code>const GSUITE_PRODUCTS = ["docs", "slides", "sheets", "forms"];
+const htmlPlugins = [];
+
+GSUITE_PRODUCTS.forEach(product => {
+  // sidebar
+  htmlPlugins.push(new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+    inject: "body",
+  }));
+
+  // 自動検出された各 dialog
+  dialogs.forEach(name => {
+    htmlPlugins.push(new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+      inject: "body",
+    }));
+  });
+});</code></pre>
+
+            <p>ビルド成果物の構造：</p>
+
+<pre><code>dist/
+├── docs/
+│   ├── sidebar.html       # 自己完結型 HTML
+│   ├── about.html
+│   ├── settings.html
+│   └── appscript/
+│       └── shared.gs      # コピーされた AppScript コード
+├── sheets/
+│   ├── sidebar.html
+│   ├── about.html
+│   └── settings.html
+├── slides/
+│   └── ...
+└── forms/
+    └── ...</code></pre>
+
+            <p>4 プロダクト × 3 エントリ = 12 の HTML ファイルがすべて自動生成される。JS コードは 1 回だけコンパイルされ、<code>chunks</code> 設定で対応する HTML に配布される。</p>
+
+            <h3>第 4 ステップ：AppScript ファイルのコピー</h3>
+
+            <p>AppScript の <code>.gs</code> ファイルはコンパイル不要だが、各プロダクトの出力ディレクトリにコピーする必要がある。<code>CopyWebpackPlugin</code> を使用：</p>
+
+<pre><code>const CopyWebpackPlugin = require("copy-webpack-plugin");
+
+GSUITE_PRODUCTS.forEach(product => {
+  plugins.push(new CopyWebpackPlugin({
+    patterns: [{
+      from: "appscript/",
+      to: `${product}/appscript/`,
+    }],
+  }));
+});</code></pre>
+
+            <p>これにより <code>clasp push</code> 時、各プロダクトディレクトリに HTML と <code>.gs</code> の両方があり、完全な AppScript プロジェクトになる。</p>
+
+            <h3>第 5 ステップ：ローカル開発サポート</h3>
+
+            <p><code>google.script.run</code> は GSuite 環境内でのみ存在する。ローカルブラウザで開発する際は <code>undefined</code>。解決方針はシンプル：環境を検出し、存在しない場合はモックデータを使用。</p>
+
+<pre><code>// AppScript 呼び出しのラッパー
+function callAppScript&lt;T&gt;(
+  methodName: string,
+  ...args: any[]
+): Promise&lt;T&gt; {
+  return new Promise((resolve, reject) => {
+    if (typeof google !== "undefined" && google.script) {
+      const runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject);
+      runner[methodName](...args);
+    } else {
+      // ローカル開発：モックデータを返す
+      resolve(getMockData(methodName, args) as T);
+    }
+  });
+}
+
+// 使用
+const sheets = await callAppScript&lt;Sheet[]&gt;("getGoogleSheets");</code></pre>
+
+            <p>これには 2 つの利点がある：</p>
+
+            <ol>
+                <li><strong>ローカル開発が GSuite 環境に依存しない</strong>：<code>webpack-dev-server</code> でローカルサービスを起動し、ブラウザで UI とインタラクションロジックをデバッグ</li>
+                <li><strong>コールバックスタイルの <code>google.script.run</code> を Promise にラップ</strong>：React コンポーネント内で async/await が使え、コードがよりクリーンに</li>
+            </ol>
+
+            <h3>第 6 ステップ：TypeScript 型宣言</h3>
+
+            <p><code>google.script.run</code> には公式の型定義がない。手動で宣言し、TypeScript にどの AppScript 関数が呼び出し可能か伝える必要がある：</p>
+
+<pre><code>// types/google.d.ts
+interface AppScriptRunner {
+  getGoogleSheets: () => void;
+  getWorksheets: (spreadsheetId: string) => void;
+  getSelectedSheetData: (
+    spreadsheetId: string,
+    worksheetName: string
+  ) => void;
+  getDocumentHtml: (docId: string) => void;
+  sendMailMerge: (
+    spreadsheetId: string,
+    worksheetName: string,
+    docId: string,
+    subject: string,
+    replyTo: string,
+    testMode: boolean
+  ) => void;
+}
+
+declare const google: {
+  script: {
+    run: {
+      withSuccessHandler: (cb: (result: any) => void) => {
+        withFailureHandler: (
+          cb: (error: any) => void
+        ) => AppScriptRunner;
+      };
+    };
+  };
+};</code></pre>
+
+            <p>新しい AppScript 関数を追加するたびに、ここに 1 行の宣言を追加。戻り値の型はまだ <code>any</code>（AppScript は動的型付け）だが、少なくとも呼び出しパラメータの型チェックがある。</p>
+
+            <h3>第 7 ステップ：デプロイパイプライン</h3>
+
+            <p>Google の <code>clasp</code> CLI でビルド成果物を AppScript プロジェクトにプッシュする。各 GSuite プロダクトは独立した AppScript プロジェクトで、独立した <code>.clasp.json</code> を持つ：</p>
+
+<pre><code># clasp/docs/.clasp.json
+{
+  "scriptId": "1a2b3c...",        # Docs の AppScript プロジェクト ID
+  "rootDir": "../../dist/docs"    # ビルド成果物を指す
+}
+
+# デプロイフロー
+npm run build                     # すべてのプロダクトの HTML をビルド
+cd clasp/docs && clasp push       # Docs の AppScript プロジェクトにプッシュ
+cd clasp/sheets && clasp push     # Sheets の AppScript プロジェクトにプッシュ
+# ... 各プロダクトを個別にプッシュ</code></pre>
+
+            <p><code>clasp push</code> は <code>rootDir</code> 以下のすべての <code>.html</code> と <code>.gs</code> ファイルを Google Apps Script にアップロードする。すべてのプロダクトのプッシュをまとめるスクリプトを書ける：</p>
+
+<pre><code># deploy.sh
+npm run build
+for product in docs sheets slides forms; do
+  echo "Deploying to $product..."
+  (cd clasp/$product && clasp push)
+done</code></pre>
+
+            <h3>完全な webpack.config.js</h3>
+
+            <p>上記のすべてのステップを組み合わせる：</p>
+
+<pre><code>const path = require("path");
+const fs = require("fs");
+const HtmlWebpackPlugin = require("html-webpack-plugin");
+const HtmlInlineScriptPlugin =
+  require("html-inline-script-webpack-plugin");
+const CopyWebpackPlugin = require("copy-webpack-plugin");
+const TerserPlugin = require("terser-webpack-plugin");
+
+// ---- 自動検出 ----
+function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .filter(d =>
+      fs.existsSync(path.join(dialogsPath, d.name, "index.tsx"))
+    )
+    .map(d => d.name);
+}
+
+const dialogs = discoverDialogs();
+const PRODUCTS = ["docs", "slides", "sheets", "forms"];
+
+// ---- Entry ----
+const entry = { sidebar: "./src/sidebar/index.tsx" };
+dialogs.forEach(name => {
+  entry[name] = `./src/dialogs/${name}/index.tsx`;
+});
+
+// ---- HTML + Copy プラグイン ----
+const plugins = [];
+
+PRODUCTS.forEach(product => {
+  // sidebar HTML
+  plugins.push(new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+    inject: "body",
+  }));
+  // dialog HTMLs
+  dialogs.forEach(name => {
+    plugins.push(new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+      inject: "body",
+    }));
+  });
+  // AppScript ファイルのコピー
+  plugins.push(new CopyWebpackPlugin({
+    patterns: [{
+      from: "appscript/",
+      to: `${product}/appscript/`,
+    }],
+  }));
+});
+
+plugins.push(new HtmlInlineScriptPlugin());
+
+// ---- エクスポート ----
+module.exports = {
+  mode: "production",
+  entry,
+  output: {
+    path: path.resolve(__dirname, "dist"),
+    clean: true,
+  },
+  resolve: {
+    extensions: [".ts", ".tsx", ".js", ".jsx"],
+  },
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: "ts-loader",
+        exclude: /node_modules/,
+      },
+      {
+        test: /\.css$/,
+        use: ["style-loader", "css-loader"],
+      },
+    ],
+  },
+  plugins,
+  optimization: {
+    minimizer: [
+      new TerserPlugin({
+        terserOptions: { compress: { drop_console: true } },
+      }),
+    ],
+  },
+};</code></pre>
+
+            <h3>GSuite AppScript 側のパターン</h3>
+
+            <p>スキャフォールドはフロントエンドのビルド問題を解決するが、AppScript 側にも記録に値するパターンがある。</p>
+
+            <p><strong>クロスプロダクト適応</strong>：同じプラグインが Docs/Sheets/Slides/Forms で動作するが、AppScript には「現在どのプロダクトか」を示す API がない。try/catch で検出するしかない：</p>
+
+<pre><code>function getUi() {
+  try { return DocumentApp.getUi(); } catch(e) {}
+  try { return SpreadsheetApp.getUi(); } catch(e) {}
+  try { return SlidesApp.getUi(); } catch(e) {}
+  try { return FormApp.getUi(); } catch(e) {}
+  return null;
+}
+
+function showSidebar() {
+  var ui = getUi();
+  if (!ui) return;
+  var html = HtmlService.createHtmlOutputFromFile("sidebar")
+    .setTitle("My Plugin").setWidth(320);
+  ui.showSidebar(html);
+}</code></pre>
+
+            <p><strong>google.script.run の仕組み</strong>：フロントエンドがバックエンド関数を呼び出し、コールバックで結果を取得。AppScript のすべてのグローバル関数がフロントエンドから呼び出し可能：</p>
+
+<pre><code>// AppScript 側——グローバル関数を定義
+function getGoogleSheets() {
+  var files = DriveApp.getFilesByType(MimeType.GOOGLE_SHEETS);
+  var sheets = [];
+  while (files.hasNext()) {
+    var file = files.next();
+    sheets.push({
+      id: file.getId(),
+      name: file.getName(),
+      url: file.getUrl(),
+    });
+  }
+  return { success: true, sheets: sheets };
+}
+
+// React 側——呼び出し
+google.script.run
+  .withSuccessHandler((result) => {
+    setSheets(result.sheets);
+  })
+  .withFailureHandler((error) => {
+    console.error(error);
+  })
+  .getGoogleSheets();</code></pre>
+
+            <p><strong>実用 API</strong>：AppScript は Google Docs の HTML エクスポート、Sheets データの読み取り、Gmail の送信などを呼び出せる。これらが GSuite プラグインのコア機能：</p>
+
+<pre><code>// Sheets データの読み取り
+function getSheetData(spreadsheetId, worksheetName) {
+  var spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = spreadsheet.getSheetByName(worksheetName);
+  var values = sheet.getDataRange().getValues();
+  return { headers: values[0], rows: values.slice(1) };
+}
+
+// Docs コンテンツの読み取り（HTML としてエクスポート、フォーマット保持）
+function getDocumentHtml(docId) {
+  var url = "https://docs.google.com/feeds/download/"
+    + "documents/export/Export?id=" + docId
+    + "&exportFormat=html";
+  var response = UrlFetchApp.fetch(url, {
+    headers: {
+      Authorization: "Bearer " + ScriptApp.getOAuthToken()
+    }
+  });
+  return response.getContentText();
+}
+
+// メール送信
+function sendEmail(to, subject, htmlBody) {
+  GmailApp.sendEmail(to, subject, "", {
+    htmlBody: htmlBody,
+  });
+}</code></pre>
+
+            <h3>実際のケース：Mail Merge</h3>
+
+            <p>このスキャフォールドで Mail Merge 機能を作った：Google Sheets から受信者リストを読み取り、Google Docs をテンプレートとして使い、パーソナライズされたメールを一括送信。</p>
+
+<pre><code>ユーザー操作（sidebar 内の 4 ステップウィザード）：
+
+Step 1: データソース選択 → Drive 内の Sheets を一覧 → sheet タブを選択 → ヘッダーをプレビュー
+Step 2: テンプレート選択 → Drive 内の Docs を一覧 → HTML コンテンツをプレビュー
+Step 3: 設定       → メール件名（{{Name}} マージフィールド対応）→ reply-to アドレス
+Step 4: 実行       → サマリー確認 → テストモード → 送信して結果を表示</code></pre>
+
+            <p>フロントエンドは標準的な React マルチステップフォーム（state で step を制御）で、各ステップのデータは <code>callAppScript</code> 経由でバックエンドから取得。バックエンドがフィールド置換とメール送信を行う：</p>
+
+<pre><code>function sendMailMerge(spreadsheetId, worksheetName,
+                       docId, subject, replyTo, testMode) {
+  var data = getSheetData(spreadsheetId, worksheetName);
+  var template = getDocumentHtml(docId);
+  var results = [];
+
+  for (var i = 0; i &lt; data.rows.length; i++) {
+    var row = {};
+    data.headers.forEach(function(h, j) { row[h] = data.rows[i][j]; });
+
+    var body = template.replace(/\{\{([^}]+)\}\}/g,
+      function(match, field) {
+        return row[field.trim()] || match;
+      });
+    var emailSubject = subject.replace(/\{\{([^}]+)\}\}/g,
+      function(match, field) {
+        return row[field.trim()] || match;
+      });
+
+    var recipient = testMode
+      ? Session.getActiveUser().getEmail()
+      : row["Email"];
+
+    try {
+      GmailApp.sendEmail(recipient, emailSubject, "", {
+        htmlBody: body,
+        replyTo: replyTo || undefined,
+      });
+      results.push({ row: i + 1, status: "sent" });
+    } catch (e) {
+      results.push({ row: i + 1, status: "error", error: e.message });
+    }
+
+    Utilities.sleep(100); // 送信速度の制御
+  }
+
+  return { success: true, results: results };
+}</code></pre>
+
+            <p>この Mail Merge はスキャフォールドの価値を示している：フロントエンドは複雑なマルチステップインタラクション（ファイル選択、データプレビュー、マージフィールドの設定、送信結果の表示）で、ネイティブ HTML で書くのは苦痛。React のコンポーネント化と状態管理がここで明確な優位性を持つ。</p>
+
+            <h3>開発体験のペインポイント</h3>
+
+            <p>このアプローチは完璧ではない。回避できない問題がいくつかある：</p>
+
+            <ul>
+                <li><strong>ホットリロードなし</strong>：AppScript コードを変更したら <code>clasp push</code> + GSuite ページのリフレッシュが必要。フロントエンド部分は <code>webpack-dev-server</code> でローカルデバッグ可能だが、AppScript インタラクションに関わるロジックは GSuite 内でしかテストできない</li>
+                <li><strong>バンドルサイズ</strong>：React を HTML にインライン化すると、各ファイルは約 1MB。4 プロダクト × N エントリ = 総成果物がかなり大きくなる可能性。Preact で React を置き換えるか、<code>TerserPlugin</code> で圧縮可能</li>
+                <li><strong>AppScript の 6 分実行制限</strong>：長いタスク（例えば 1000 通のメール送信）はタイムアウトする可能性。ループ内で速度を制御するか、バッチ処理が必要</li>
+                <li><strong>デバッグの困難さ</strong>：iframe 内の console.log が見えない場合がある。AppScript 側は <code>Logger.log()</code> を使い、Apps Script エディタの実行ログで確認</li>
+            </ul>
+
+            <h3>まとめ</h3>
+
+            <p>このスキャフォールドの核心的アプローチ：<strong>Webpack で「モダンフロントエンド開発」と「GSuite サンドボックス制約」をブリッジする</strong>。</p>
+
+            <ul>
+                <li><code>HtmlInlineScriptPlugin</code> + <code>style-loader</code> が CSP 制限を解決——自己完結型 HTML を生成</li>
+                <li>ファイルシステムスキャンで dialog の自動検出を実現——ゼロ設定で新しいエントリを追加</li>
+                <li>プロダクト × エントリのマトリクスループで <code>HtmlWebpackPlugin</code> を生成——1 回のビルドですべてのプロダクトをカバー</li>
+                <li><code>clasp</code> + <code>rootDir</code> 設定でプロダクト別デプロイを実現——各プロダクトを独立してプッシュ</li>
+                <li>環境検出 + モックデータでローカル開発を実現——GSuite 環境に依存せず UI をデバッグ</li>
+            </ul>
+
+            <p>GSuite プラグインで複雑な UI インタラクションが必要な場合、このスキャフォールドで多くの反復作業を省ける。ボタン 1-2 個のシンプルなプラグインなら、ネイティブ HTML を直接書けば十分——このツールは不要。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

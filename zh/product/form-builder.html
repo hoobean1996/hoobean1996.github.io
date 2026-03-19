@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema 驱动表单（上）：数据模型与渲染器 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Schema 驱动表单（上）：数据模型与渲染器</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/roman-mosaic-floor.jpg" alt="Roman Mosaic Floor Panel, 2nd century CE">
+                <figcaption>罗马马赛克地板，公元2世纪 — 每一块小石子按照严格的规则排列，拼出完整的图案。Schema 驱动的表单也是如此：用结构化的规则，拼出灵活的界面</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：B 端产品的表单需求永远做不完——注册、审批、问卷、配置，每个场景都不同。与其为每个表单写一个组件，不如设计一套 JSON Schema 来描述表单结构，让前端自动渲染。这篇文章分享一个经过生产验证的数据模型：FormSpec → Question → QuestionResponse 三层结构，支持 15+ 字段类型、分页、校验，并且非开发者也能通过编辑 JSON 来创建表单。
+            </blockquote>
+
+            <h3>问题的起点</h3>
+
+            <p>几乎每个 B 端产品都会遇到同一个问题：<strong>表单太多了</strong>。</p>
+
+            <p>注册表单、审批表单、调查问卷、配置页面、数据录入……每一个业务场景都需要一套表单，每套表单的字段、校验规则、布局都不一样。如果每个表单都手写一个 React 组件，代码量会爆炸式增长，而且改一个字段就要发一次版。</p>
+
+            <p>更糟糕的是，很多表单的创建者不是开发者——是产品经理、运营、HR。他们需要一个"拖拖拽拽就能建表单"的工具，而不是等排期。</p>
+
+            <p>这就是 Schema 驱动表单的用武之地：<strong>用一份 JSON 描述表单的结构，前端根据这份 JSON 自动渲染出完整的表单</strong>。改字段？改 JSON。加校验？改 JSON。换布局？还是改 JSON。不需要改代码，不需要发版。</p>
+
+            <h3>核心思想</h3>
+
+            <p>Schema 驱动表单的核心是一个简单的分离：</p>
+
+<pre><code>表单定义（What）  →  JSON Schema  →  存在数据库里
+表单渲染（How）   →  通用渲染器   →  一套代码搞定所有表单
+表单数据（Data）  →  JSON 响应    →  结构化存储和查询</code></pre>
+
+            <p>这三者之间的关系：</p>
+
+<pre><code>┌─────────────────────────────────────────────────────┐
+│                    Form Builder                      │
+│  产品经理/运营 通过可视化界面创建表单                      │
+│  输出：FormSpec（JSON Schema）                        │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                    Form Schema                       │
+│  {                                                   │
+│    "title": "入职信息收集",                             │
+│    "groups": [                                       │
+│      { "label": "基本信息",                            │
+│        "questions": [                                │
+│          { "type": "short_text", "label": "姓名",     │
+│            "required": true },                       │
+│          { "type": "date", "label": "入职日期" },      │
+│          { "type": "drop_down", "label": "部门",      │
+│            "options": ["工程", "产品", "设计"] }        │
+│        ] }                                           │
+│    ]                                                 │
+│  }                                                   │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                  Form Renderer                       │
+│  根据 Schema 自动渲染表单 UI                           │
+│  收集用户输入 → FormResponse                          │
+└─────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>数据模型设计</h3>
+
+            <p>一个完整的 Schema 驱动表单系统需要三层数据模型：</p>
+
+            <p><strong>第一层：FormSpec（表单定义）</strong></p>
+
+<pre><code>// FormSpec —— 一张表单的元数据
+type FormSpec struct {
+    ID          int
+    Name        string       // "入职信息收集"
+    Description string       // 表单说明
+    Cover       string       // 封面图 URL
+    Enabled     bool         // 是否启用
+    CreatedBy   int          // 创建者
+    Groups      []QuestionGroup  // 问题分组
+}
+
+// QuestionGroup —— 问题分组（用于表单分页或分区）
+type QuestionGroup struct {
+    ID        int
+    Label     string       // "基本信息" / "工作经历"
+    Order     int          // 排序
+    Questions []Question
+}</code></pre>
+
+            <p><strong>第二层：Question（问题定义）</strong></p>
+
+<pre><code>type QuestionType string
+
+const (
+    ShortText   QuestionType = "short_text"
+    Paragraph   QuestionType = "paragraph"
+    MultiChoice QuestionType = "multi_choice"
+    Checkboxes  QuestionType = "checkboxes"
+    DropDown    QuestionType = "drop_down"
+    FileUpload  QuestionType = "file"
+    LinearScale QuestionType = "linear_scale"
+    Date        QuestionType = "date"
+    Time        QuestionType = "time"
+)
+
+type Question struct {
+    ID       int
+    Label    string         // "你的姓名"
+    Type     QuestionType   // "short_text"
+    Required bool           // 是否必填
+    Options  []string       // 选择题的选项
+    Config   QuestionConfig // 额外配置
+}
+
+type QuestionConfig struct {
+    Placeholder  string  // 输入提示
+    MinLength    *int    // 最小长度
+    MaxLength    *int    // 最大长度
+    MinValue     *int    // linear_scale 最小值
+    MaxValue     *int    // linear_scale 最大值
+    FileTypes    []string // 允许的文件类型
+}</code></pre>
+
+            <p><strong>第三层：QuestionResponse（用户回答）</strong></p>
+
+<pre><code>type QuestionResponse struct {
+    ID             int
+    QuestionID     int      // 关联到 Question
+    FormInstanceID int      // 关联到某次填写
+    Label          string   // 冗余存储问题标签（方便查询）
+    Value          string   // 用户的回答（统一用 string 存储）
+}
+
+type FormInstance struct {
+    ID         int
+    FormSpecID int          // 关联到 FormSpec
+    SubmittedBy int         // 填写者
+    SubmittedAt time.Time
+    Responses  []QuestionResponse
+}</code></pre>
+
+            <p>这里有一个关键设计决策：<strong>QuestionResponse.Value 统一用 string 存储</strong>。不管是日期、数字、还是多选，都序列化成字符串。这样做的好处是 schema 简单，不需要为每种类型建不同的列。坏处是查询时需要反序列化，但对于表单场景，大多数查询是"导出某次填写的所有回答"，而不是"找出所有年龄大于 25 的回答"，所以这个 trade-off 是值得的。</p>
+
+            <h3>前端渲染器</h3>
+
+            <p>渲染器的核心是一个 switch 语句——根据 Question 的 type 字段渲染不同的 UI 组件：</p>
+
+<pre><code>// Question.tsx
+function Question({ question, value, onChange }) {
+  switch (question.type) {
+    case "short_text":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}{question.required && " *"}&lt;/label&gt;
+          &lt;input
+            type="text"
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            placeholder={question.config?.placeholder}
+            required={question.required}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    case "paragraph":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;textarea
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            rows={4}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    case "multi_choice":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          {question.options.map(opt => (
+            &lt;label key={opt} className="radio-option"&gt;
+              &lt;input
+                type="radio"
+                name={`q-${question.id}`}
+                value={opt}
+                checked={value === opt}
+                onChange={() => onChange(opt)}
+              /&gt;
+              {opt}
+            &lt;/label&gt;
+          ))}
+        &lt;/div&gt;
+      );
+
+    case "checkboxes":
+      const selected = value ? JSON.parse(value) : [];
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          {question.options.map(opt => (
+            &lt;label key={opt} className="checkbox-option"&gt;
+              &lt;input
+                type="checkbox"
+                checked={selected.includes(opt)}
+                onChange={() => {
+                  const next = selected.includes(opt)
+                    ? selected.filter(s => s !== opt)
+                    : [...selected, opt];
+                  onChange(JSON.stringify(next));
+                }}
+              /&gt;
+              {opt}
+            &lt;/label&gt;
+          ))}
+        &lt;/div&gt;
+      );
+
+    case "drop_down":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;select value={value} onChange={e => onChange(e.target.value)}&gt;
+            &lt;option value=""&gt;请选择&lt;/option&gt;
+            {question.options.map(opt => (
+              &lt;option key={opt} value={opt}&gt;{opt}&lt;/option&gt;
+            ))}
+          &lt;/select&gt;
+        &lt;/div&gt;
+      );
+
+    case "date":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;input type="date" value={value} onChange={e => onChange(e.target.value)} /&gt;
+        &lt;/div&gt;
+      );
+
+    case "file":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;input
+            type="file"
+            accept={question.config?.fileTypes?.join(",")}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (file) uploadAndGetUrl(file).then(onChange);
+            }}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    default:
+      return &lt;div&gt;Unsupported question type: {question.type}&lt;/div&gt;;
+  }
+}</code></pre>
+
+            <p>这个 switch 语句看起来很"笨"，但这正是它的优势：<strong>每种类型的渲染逻辑完全独立，互不干扰</strong>。加一种新类型？加一个 case。改某种类型的 UI？只改那个 case。不存在"修改单选框影响了多选框"的问题。</p>
+
+            <h3>完整的表单渲染</h3>
+
+            <p>把 Question 组件组合起来，渲染整个表单：</p>
+
+<pre><code>function FormRenderer({ formSpec }) {
+  const [responses, setResponses] = useState({});
+
+  const handleChange = (questionId, value) => {
+    setResponses(prev => ({ ...prev, [questionId]: value }));
+  };
+
+  const handleSubmit = async () => {
+    // 校验必填项
+    for (const group of formSpec.groups) {
+      for (const q of group.questions) {
+        if (q.required && !responses[q.id]) {
+          alert(`请填写：${q.label}`);
+          return;
+        }
+      }
+    }
+
+    // 构造提交数据
+    const payload = Object.entries(responses).map(([qId, value]) => ({
+      questionId: parseInt(qId),
+      value: String(value),
+    }));
+
+    await submitFormResponse(formSpec.id, payload);
+  };
+
+  return (
+    &lt;form onSubmit={e => { e.preventDefault(); handleSubmit(); }}&gt;
+      &lt;h2&gt;{formSpec.name}&lt;/h2&gt;
+      &lt;p&gt;{formSpec.description}&lt;/p&gt;
+
+      {formSpec.groups.map(group => (
+        &lt;fieldset key={group.id}&gt;
+          &lt;legend&gt;{group.label}&lt;/legend&gt;
+          {group.questions.map(q => (
+            &lt;Question
+              key={q.id}
+              question={q}
+              value={responses[q.id] || ""}
+              onChange={v => handleChange(q.id, v)}
+            /&gt;
+          ))}
+        &lt;/fieldset&gt;
+      ))}
+
+      &lt;button type="submit"&gt;提交&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+            <h3>后端 API 设计</h3>
+
+            <p>用 GraphQL 来设计 API 特别自然，因为表单的数据结构本身就是嵌套的：</p>
+
+<pre><code>type FormSpec {
+  id: ID!
+  name: String!
+  description: String
+  enabled: Boolean!
+  groups: [QuestionGroup!]!
+}
+
+type QuestionGroup {
+  id: ID!
+  label: String!
+  order: Int!
+  questions: [Question!]!
+}
+
+type Question {
+  id: ID!
+  label: String!
+  type: QuestionType!
+  required: Boolean!
+  options: [String!]
+  config: QuestionConfig
+}
+
+enum QuestionType {
+  SHORT_TEXT
+  PARAGRAPH
+  MULTI_CHOICE
+  CHECKBOXES
+  DROP_DOWN
+  FILE
+  LINEAR_SCALE
+  DATE
+  TIME
+}
+
+# 查询
+type Query {
+  formSpec(id: ID!): FormSpec
+  formInstances(formSpecId: ID!): [FormInstance!]!
+}
+
+# 提交
+input QuestionResponseInput {
+  questionId: ID!
+  value: String!
+}
+
+type Mutation {
+  submitForm(formSpecId: ID!, responses: [QuestionResponseInput!]!): FormInstance!
+}</code></pre>
+
+            <p>GraphQL 的嵌套查询让前端可以一次请求拿到完整的表单定义（FormSpec → Groups → Questions），不需要多次往返。配合 Relay 或 Apollo 的 fragment 机制，Question 组件可以声明自己需要的数据，框架自动合并查询。</p>
+
+            <h3>用 ORM 代码生成简化后端</h3>
+
+            <p>如果你用 Go + Ent ORM，可以通过 schema 定义直接生成 CRUD 代码和 GraphQL resolver：</p>
+
+<pre><code>// ent/schema/formspec.go
+func (FormSpec) Fields() []ent.Field {
+    return []ent.Field{
+        field.String("name").NotEmpty(),
+        field.String("description").Optional(),
+        field.String("cover").Optional(),
+        field.Bool("enabled").Default(true),
+        field.Time("created_at").Default(time.Now),
+        field.Int("created_by"),
+    }
+}
+
+func (FormSpec) Edges() []ent.Edge {
+    return []ent.Edge{
+        edge.To("question_groups", QuestionGroup.Type),
+    }
+}
+
+// ent/schema/question.go
+func (Question) Fields() []ent.Field {
+    return []ent.Field{
+        field.String("label").NotEmpty(),
+        field.Enum("type").Values(
+            "short_text", "paragraph", "multi_choice",
+            "checkboxes", "drop_down", "file",
+            "linear_scale", "date", "time",
+        ),
+        field.Bool("required").Default(false),
+        field.JSON("options", []string{}).Optional(),
+    }
+}</code></pre>
+
+            <p>Ent 会根据这些 schema 定义自动生成：数据库 migration、Go 类型定义、CRUD 方法、GraphQL type 和 resolver（配合 entgql）。从 schema 到可用的 API，中间几乎不需要写胶水代码。</p>
+
+            <h3>校验策略</h3>
+
+            <p>表单校验分两层：</p>
+
+            <p><strong>前端校验（即时反馈）：</strong></p>
+
+<pre><code>function validate(question, value) {
+  if (question.required && !value) {
+    return `${question.label} 是必填项`;
+  }
+
+  const config = question.config;
+  if (!config) return null;
+
+  switch (question.type) {
+    case "short_text":
+    case "paragraph":
+      if (config.minLength && value.length < config.minLength)
+        return `最少输入 ${config.minLength} 个字符`;
+      if (config.maxLength && value.length > config.maxLength)
+        return `最多输入 ${config.maxLength} 个字符`;
+      break;
+
+    case "file":
+      if (config.fileTypes && !config.fileTypes.some(t => value.endsWith(t)))
+        return `只支持 ${config.fileTypes.join(", ")} 格式`;
+      break;
+  }
+  return null;
+}</code></pre>
+
+            <p><strong>后端校验（安全保障）：</strong></p>
+
+<pre><code>func ValidateResponse(spec *ent.FormSpec, responses []ResponseInput) error {
+    questionMap := buildQuestionMap(spec)
+
+    for _, resp := range responses {
+        q, ok := questionMap[resp.QuestionID]
+        if !ok {
+            return fmt.Errorf("unknown question ID: %d", resp.QuestionID)
+        }
+        if q.Required && resp.Value == "" {
+            return fmt.Errorf("question %q is required", q.Label)
+        }
+        if err := validateType(q.Type, resp.Value); err != nil {
+            return fmt.Errorf("question %q: %w", q.Label, err)
+        }
+    }
+
+    // 检查是否所有必填项都有回答
+    for id, q := range questionMap {
+        if q.Required && !hasResponse(responses, id) {
+            return fmt.Errorf("missing required question: %q", q.Label)
+        }
+    }
+    return nil
+}</code></pre>
+
+            <p>前端校验是为了用户体验（不用等服务器往返就能看到错误），后端校验是为了数据完整性（前端校验可以被绕过）。两层都不能省。</p>
+
+            <h3>实际中会遇到的问题</h3>
+
+            <ul>
+                <li><strong>Schema 版本控制</strong>：表单发布后，如果修改了 Schema（比如删掉一个问题），已经提交的 Response 怎么办？常见做法是创建新版本而不是修改原版本，或者 soft delete 问题但保留历史回答。</li>
+                <li><strong>条件逻辑</strong>：现实中的表单经常有"如果选了 A，则显示问题 X"这样的逻辑。这需要在 Schema 里加一个 <code>visibility_rules</code> 字段，渲染器根据当前回答动态显示/隐藏问题。这是复杂度的主要来源。</li>
+                <li><strong>性能</strong>：大表单（100+ 问题）渲染时，每个 Question 组件的 re-render 会成为瓶颈。解决方案：<code>React.memo</code> + 把 onChange 回调用 <code>useCallback</code> 包起来，确保只有值变化的 Question 才重新渲染。</li>
+                <li><strong>文件上传</strong>：文件类型的问题需要特殊处理——先上传到 OSS 拿到 URL，再把 URL 作为 value 存储。这意味着文件上传和表单提交是两个独立的流程。</li>
+                <li><strong>导出和分析</strong>：表单数据最终需要导出成 Excel 或做统计分析。因为 Value 是 string 类型，导出时需要根据 Question Type 做格式化（日期转 Date 格式、多选转逗号分隔等）。</li>
+            </ul>
+
+            <h3>和市面上方案的对比</h3>
+
+            <table>
+                <tr>
+                    <th>方案</th>
+                    <th>Schema 存储</th>
+                    <th>渲染</th>
+                    <th>适用场景</th>
+                </tr>
+                <tr>
+                    <td>Google Forms</td>
+                    <td>私有格式</td>
+                    <td>Google 托管</td>
+                    <td>简单问卷</td>
+                </tr>
+                <tr>
+                    <td>JSON Schema + react-jsonschema-form</td>
+                    <td>标准 JSON Schema</td>
+                    <td>自动生成</td>
+                    <td>开发者工具、配置表单</td>
+                </tr>
+                <tr>
+                    <td>Formily / XRender</td>
+                    <td>自定义 DSL</td>
+                    <td>可视化编辑器 + 渲染器</td>
+                    <td>企业级复杂表单</td>
+                </tr>
+                <tr>
+                    <td>自建 FormSpec 模型</td>
+                    <td>数据库 + ORM</td>
+                    <td>自定义渲染器</td>
+                    <td>需要深度定制的产品</td>
+                </tr>
+            </table>
+
+            <p><code>react-jsonschema-form</code> 用的是标准 JSON Schema（Draft 7），优势是生态好、有现成的校验库（ajv）。但标准 JSON Schema 是为描述数据结构设计的，不是为描述表单 UI 设计的——它没有"分组"、"占位符"、"条件显示"这些概念，需要通过 <code>uiSchema</code> 额外补充。</p>
+
+            <p>自建 FormSpec 模型的优势是完全控制数据结构，可以针对业务需求做深度定制（比如加审批流、加权限控制、加模板市场）。代价是需要自己写渲染器和校验逻辑。</p>
+
+            <h3>架构上的思考</h3>
+
+            <ul>
+                <li><strong>Schema 即合约</strong>：FormSpec 是前后端的唯一合约。后端不需要知道前端怎么渲染，前端不需要知道后端怎么存储。只要 Schema 的格式不变，两边可以独立演进。</li>
+                <li><strong>代码生成 vs 手写</strong>：用 Ent + gqlgen 这样的代码生成工具，从 Schema 定义到 API 端点几乎是全自动的。手写 CRUD 代码没有任何价值——让机器生成，把精力放在业务逻辑上。</li>
+                <li><strong>Switch 语句的美学</strong>：渲染器里的大 switch 看起来很"原始"，但它是正确的抽象层次。不要过度抽象成"注册器模式"或"插件系统"——除非你真的需要第三方开发者来扩展问题类型。大多数时候，9 种类型就够了。</li>
+                <li><strong>关于 Value 的 string 存储</strong>：这是一个经典的"灵活性 vs 查询能力"的 trade-off。如果你的场景需要对回答做复杂查询（"找出所有选了 A 选项的用户"），可以考虑用 PostgreSQL 的 JSONB 类型，或者在提交时额外写入一张宽表做分析。</li>
+            </ul>
+
+            <h3>总结</h3>
+
+            <p>Schema 驱动表单的本质是一个古老的软件工程思想的具体应用：<strong>数据和行为分离</strong>。表单的结构（数据）用 Schema 描述，表单的渲染和校验（行为）用通用代码处理。这让非开发者可以创建和修改表单，让开发者可以用一套代码服务所有表单场景。</p>
+
+            <p>这个模式不仅限于表单。配置页面、审批流程、数据看板——任何"结构可变但行为固定"的场景，都可以用 Schema 驱动的方式来实现。核心永远是：定义一个好的 Schema，写一个好的渲染器。</p>
+
+            <p>但到目前为止，我们的 Schema 还只能描述扁平的表单字段。如果需要条件渲染、动态表达式、布局嵌套、交互动作呢？下一篇我们来把 Schema 的能力扩展到整个 UI 树。</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>下篇：</strong><a href="schema-driven-ui.html">Schema 驱动表单（下）：表达式引擎与通用 UI 渲染</a>
+            </p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

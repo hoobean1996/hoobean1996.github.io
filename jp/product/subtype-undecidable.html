@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>なぜ Union + Intersection 型で部分型検査が決定不能になるのか？ - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>なぜ Union + Intersection 型で部分型検査が決定不能になるのか？</h2>
+            <time>2026-03-13</time>
+
+            <figure class="post-cover">
+                <img src="../../images/el-greco-jerome-scholar.jpg" alt="Saint Jerome as Scholar, El Greco, c. 1610">
+                <figcaption>El Greco、《学者としての聖ヒエロニムス》、c. 1610 — 学者の前に広げられた典籍は幾重にも重なり、一頁めくるたびに新たな注釈と相互参照が現れ、永遠に読み終わらない。これは union + intersection + 再帰型における部分型検査の困難と同じだ：一層型を展開するたびに新たな分岐、新たな選択、新たな展開が生まれ——終わりがない</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：TypeScript を使ったことがあれば、型チェックがフリーズしたり、意味不明なエラーが出たり、IDE がグルグル回り続ける経験があるかもしれない。これはバグではなく、型システムの根本的な制約である。型システムが union（<code>|</code>）、intersection（<code>&</code>）、関数型、再帰型を同時にサポートすると、部分型検査は理論上決定不能になる。この記事ではエンジニアにも理解できる形で、一段ずつこの結論を導出する：最もシンプルな部分型システムから始め、union、intersection、関数の反変性、再帰型を段階的に加え、各ステップがどう問題を難しくし、最終的にアルゴリズムが処理できる限界を超えるかを見る。この「なぜ」を理解することで、TypeScript がなぜ特定の設計上の妥協をしているのか、そしてコンパイラを爆発させる型の書き方をどう避けるかが分かる。
+            </blockquote>
+
+            <h3>問題定義：部分型検査は判定問題である</h3>
+
+            <p>まず問題を明確にしよう。<strong>部分型検査</strong>とは yes/no の質問に答えることである：型 A と型 B が与えられたとき、<code>A &lt;: B</code> は成り立つか？</p>
+
+            <p>あなたは毎日これをやっている。TypeScript を書く時：</p>
+
+<pre><code>function greet(name: string) { ... }
+greet(42)  // コンパイルエラー：number は string の部分型ではない</code></pre>
+
+            <p>コンパイラが裏で行っているのは部分型検査である：<code>number &lt;: string</code>？成り立たない、エラー。</p>
+
+            <p><strong>決定可能</strong>とは、任意の入力 A と B に対して有限ステップで正しい答えを出せるアルゴリズムが存在することを意味する。<strong>決定不能</strong>とは、そのようなアルゴリズムが存在しないことを意味する——ある入力に対して、正しいアルゴリズムは永遠に計算が終わらないか、誤った答えを出すことになる。</p>
+
+            <p>この記事が答える核心的な問いは：<strong>なぜ union と intersection 型を加えると部分型検査が決定不能になるのか？</strong></p>
+
+            <h3>ベースライン：シンプルな部分型システムは決定可能</h3>
+
+            <p>まず最もシンプルなケースを見よう。型は基本型と関数型のみ：</p>
+
+<pre><code>類型 ::= number | string | A → B</code></pre>
+
+            <p>部分型ルールは素直である：</p>
+
+<pre><code>number &lt;: number                                // 反射性
+string &lt;: string                                // 反射性
+A → B &lt;: C → D   当且仅当   C &lt;: A 且 B &lt;: D   // 関数型</code></pre>
+
+            <p>関数型のルールは立ち止まって説明する価値がある：<strong>引数は反変、戻り値は共変</strong>。直感的には、「Cat を食べて Animal を吐く」関数が必要な場合、「Animal を食べて Cat を吐く」関数で代替できる。より広い入力を受け入れ（より多くを食べ）、より具体的な出力を返す（より精密に吐く）からだ。</p>
+
+            <p>このシステムの部分型検査は明らかに決定可能である：ルールを適用するたびに型が小さくなり、循環もなく、分岐もなく、線形時間で完了する。重要なのはこのプロセスが<strong>構文指向（syntax-directed）</strong>であること——型の構造がどのルールを使うかを直接教えてくれ、選択の必要がない。</p>
+
+            <h3>第一段階の複雑化：Union と Intersection が探索を導入する</h3>
+
+            <h4>Union 型：選言 / OR</h4>
+
+            <p><code>A | B</code> は「A または B」を表す。TypeScript では至る所にある：</p>
+
+<pre><code>type Result = Success | Error
+type ID = string | number</code></pre>
+
+            <p>部分型ルール：</p>
+
+<pre><code>A &lt;: A | B          // 左注入：A は当然「A または B」
+B &lt;: A | B          // 右注入
+A | B &lt;: C  需要  A &lt;: C 且 B &lt;: C   // union 消去：両方の分岐が満たす必要</code></pre>
+
+            <p>しかし逆方向は厄介で、<code>C &lt;: A | B</code> を判定する時、単純に <code>C &lt;: A</code> または <code>C &lt;: B</code> をチェックするだけでは済まない。この例を見よう：</p>
+
+<pre><code>(string | number) &lt;: (string | number)   // 成立
+(string | number) &lt;: string              // 不成立
+(string | number) &lt;: number              // 也不成立</code></pre>
+
+            <p>C の「メンバー」を分解して見る必要があり、各メンバーが A か B のいずれかに属する必要がある。これは一手で判定できるものではなくなり、探索が必要になる。</p>
+
+            <h4>Intersection 型：連言 / AND</h4>
+
+            <p><code>A &amp; B</code> は「A でありかつ B でもある」を表す。TypeScript では mixin パターンでよく見る：</p>
+
+<pre><code>type Serializable = { serialize(): string }
+type Loggable = { log(): void }
+type Entity = Serializable &amp; Loggable  // 両方のインターフェースを同時に満たす</code></pre>
+
+            <p>部分型ルール：</p>
+
+<pre><code>A &amp; B &lt;: A          // 左射影
+A &amp; B &lt;: B          // 右射影
+C &lt;: A &amp; B  需要  C &lt;: A 且 C &lt;: B   // intersection 導入</code></pre>
+
+            <p>逆方向にも同じ問題がある：<code>A &amp; B &lt;: C</code> は単純に <code>A &lt;: C</code> または <code>B &lt;: C</code> に分割できない。</p>
+
+            <h4>最初の重要な変化：部分型検査が探索問題になる</h4>
+
+            <p>以前のシンプルなシステムでは、各ステップの推論ルールは一意に決定されていた。Union と intersection が加わると、選択が必要になる：</p>
+
+            <ul>
+                <li><code>C &lt;: A | B</code> を判定する時、C のどの部分が A に行き、どの部分が B に行くか「推測」する必要があるかもしれない</li>
+                <li><code>A &amp; B &lt;: C</code> を判定する時、A の情報を使うか B の情報を使うか「選択」する必要があるかもしれない</li>
+            </ul>
+
+            <p>部分型検査は「確定的計算」から「探索問題」に変わった。しかし探索だけでは十分ではない——NP 問題も探索問題だが、それでも決定可能である（遅いだけ）。決定不能に達するには、もっと多くの要素が必要だ。</p>
+
+            <h3>決定的な一歩：関数の反変が Union と Intersection を相互に反転させる</h3>
+
+            <p>これが推論チェーン全体で最も重要なステップである。関数型の引数位置は反変であり、この性質が union/intersection と衝突すると、重要な等価関係（分配律）が生まれる：</p>
+
+<pre class="diagram"><code>  分配律（函数参数位 = 逆变位）：
+
+  (A | B) → C   ≡   (A → C) &amp; (B → C)     ① union が引数位を通過 → intersection になる
+  (A &amp; B) → C   ≡   (A → C) | (B → C)     ② intersection が引数位を通過 → union になる
+
+  分配律（函数返回位 = 协变位）：
+
+  A → (B | C)   ≡   (A → B) | (A → C)     ③ union は union のまま
+  A → (B &amp; C)   ≡   (A → B) &amp; (A → C)     ④ intersection は intersection のまま</code></pre>
+
+            <p>式 (1) と (2) が決定打である。それらが意味するのは：<strong>関数型の引数位置を一層通過するたびに、union と intersection が互いに反転する</strong>ということだ。</p>
+
+            <p>エンジニアリングの直感で式 (1) を理解すると：<code>string | number</code> を受け取る関数は、本質的に string も number も両方処理できる関数であり、「<code>string → C</code> でありかつ <code>number → C</code> でもある」と等価だ。だから引数位の union が全体の intersection になる。</p>
+
+            <p>これにより部分型判定過程の探索性質が絶え間なく反転する：</p>
+
+<pre class="diagram"><code>  第 0 層：AND 条件の検証が必要（intersection）
+     │
+     ▼  関数引数を一層通過
+  第 1 層：OR 選択に変わる（union）
+     │
+     ▼  さらに一層関数引数を通過
+  第 2 層：再び AND 条件に戻る（intersection）
+     │
+     ▼
+    ...交互に続く</code></pre>
+
+            <p>これは単純な SAT 式の探索（純粋な OR 分岐）ではなく、<strong>AND-OR 交互探索</strong>——ゲーム木（自分が一手打ち、相手が一手打ち、また自分が一手打ち...）に似ている。ゲーム木の判定は SAT よりもはるかに難しい。</p>
+
+            <h3>火に油を注ぐ：再帰型が無限展開を提供する</h3>
+
+            <p>ここまでの時点で、すべての型が有限サイズ（再帰なし）であれば、探索木は複雑ではあるが深さに上界がある——依然として決定可能（EXPTIME 以上かもしれないが、必ず終了する）。</p>
+
+            <p>再帰型がこの制約を打ち破る。型が自身を参照できるようになる：</p>
+
+<pre><code>// TypeScript の再帰型
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
+
+// 形式的な記法
+type List = μX. Nil | Cons(number, X)    // X = Nil | Cons(number, X) の不動点</code></pre>
+
+            <p>equi-recursive 意味論（最も一般的な解釈方法）の下で、再帰型はその一回の展開に等しい：</p>
+
+<pre><code>μX. F(X)  =  F(μX. F(X))    // 無限に展開可能</code></pre>
+
+            <p>これは<strong>型が無限に膨張できる</strong>ことを意味する。前述の結論と組み合わせると：</p>
+
+            <ol>
+                <li>関数引数を一層通過するたびに union/intersection が反転する</li>
+                <li>再帰型は無限に展開でき、新しい関数層を次々と生み出す</li>
+                <li>各展開が新たな union/intersection の分岐を導入する</li>
+                <li>分岐の AND/OR 性質が展開の深さに応じて交互に変わる</li>
+                <li><strong>自然な停止条件がない</strong></li>
+            </ol>
+
+            <p>具体例を見よう：</p>
+
+<pre><code>type T = μX. (X → X) | number
+
+// 一回展開：
+T = (T → T) | number
+
+// T → T の中の T を展開：
+T = (((T → T) | number) → ((T → T) | number)) | number
+
+// 各展開が新たな union を生み、→ を通過すると intersection に変わり、さらに続く...</code></pre>
+
+            <p>部分型検査アルゴリズムがこのような型に直面すると、無限に展開、反転、分岐できる。<code>A &lt;: B</code> を判定しようとするどんなアルゴリズムも、このような再帰構造上で永遠に走り続ける可能性がある。</p>
+
+            <h3>究極の問い：なぜチューリングマシンをエンコードできるのか</h3>
+
+            <p>前の四ステップですべてのパーツが揃った。これらがどうチューリング完全な計算に組み立てられるか見よう。</p>
+
+            <h4>チューリングマシンに必要なもの vs 型システムが提供するもの</h4>
+
+            <table>
+                <thead>
+                    <tr><th>チューリングマシンの構成要素</th><th>型システムの対応物</th><th>提供するもの</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>有限状態</td><td>異なる型構成（union の異なる分岐）</td><td>Union 型</td></tr>
+                    <tr><td>無限テープ</td><td>再帰型の無限展開</td><td>再帰型</td></tr>
+                    <tr><td>状態遷移関数</td><td>関数の反変 + union/intersection 分配律</td><td>関数型 + 反変</td></tr>
+                    <tr><td>分岐判断</td><td>AND-OR 交互探索</td><td>Union + Intersection + 反変</td></tr>
+                    <tr><td>計算ステップ</td><td>部分型検査の一ステップの推論</td><td>部分型ルール</td></tr>
+                </tbody>
+            </table>
+
+            <h4>エンコードの直感</h4>
+
+            <p>核心的なアイデアは、二つの再帰型 A と B を構成し、<code>A &lt;: B</code> が成り立つことと、あるチューリングマシンが停止することが同値になるようにすることだ。</p>
+
+            <ul>
+                <li><strong>union の分岐で現在のシンボルをエンコード</strong>：<code>Symbol = Zero | One</code>、異なる分岐がテープ上の異なる値を表す</li>
+                <li><strong>再帰でテープの続きをエンコード</strong>：<code>Tape = μX. Symbol &amp; (Unit → X)</code>、再帰的に無限長のテープを表す</li>
+                <li><strong>intersection で「複数条件の同時充足」をエンコード</strong>：状態遷移は現在のシンボルと現在の状態の両方をチェックする必要がある</li>
+                <li><strong>関数の反変で読み書きをエンコード</strong>：読み取りは反変位置（入力）、書き込みは共変位置（出力）</li>
+            </ul>
+
+            <p>部分型検査が再帰型を一ステップ展開するたびに、チューリングマシンが一ステップ実行されるのに相当する。チューリングマシンが停止しなければ、部分型検査は永遠に計算が終わらない。</p>
+
+            <h4>標準的な帰着経路</h4>
+
+            <p>古典的な証明は通常二段階の帰着で行われる：</p>
+
+<pre class="diagram"><code>  停止問題（既知の決定不能問題）
+     │
+     │  帰着
+     ▼
+  Post 対応問題 (PCP)
+  文字列ペア (u₁,v₁), ..., (uₙ,vₙ) が与えられた時
+  列 i₁,...,iₖ が存在して
+  u_{i₁}...u_{iₖ} = v_{i₁}...v_{iₖ} となるか？
+     │
+     │  帰着
+     ▼
+  部分型検査問題
+  A &lt;: B ?</code></pre>
+
+            <p>PCP から部分型検査へのエンコード：</p>
+
+            <ul>
+                <li>PCP の各文字列ペア → 一組の型構成子</li>
+                <li>文字列の連結 → 型のネスト/組み合わせ（再帰を利用）</li>
+                <li>文字列の「等しさ」 → 部分型関係</li>
+                <li>「ある列が存在する」 → union 型の選択</li>
+            </ul>
+
+            <h3>直感の検証：いずれかの構成要素を取り除くとどうなるか？</h3>
+
+            <p>上記の分析が正しければ、いずれかの重要な構成要素を取り除くと問題は再び決定可能になるはずだ。実際にその通りである：</p>
+
+            <table>
+                <thead>
+                    <tr><th>構成</th><th>決定可能？</th><th>理由</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Union のみ、Intersection なし</td><td>決定可能</td><td>intersection がなければ、関数引数位が union を intersection に反転させず、AND-OR 交互が出現しない</td></tr>
+                    <tr><td>Intersection のみ、Union なし</td><td>通常決定可能</td><td>制御しやすくなるが、一部の組み合わせ（bounded quantification など）は依然として問題がある場合も</td></tr>
+                    <tr><td>Union + Intersection あり、再帰なし</td><td>決定可能</td><td>すべての型が有限サイズ、探索木の深さも有限。EXPTIME かもしれないが、必ず終了する</td></tr>
+                    <tr><td>Union + Intersection + 再帰あり、関数型なし</td><td>決定可能</td><td>反変位置がなく、union と intersection が互いに反転しないため、集合包含検査に退化する</td></tr>
+                </tbody>
+            </table>
+
+            <p><strong>結論：決定不能には四つの構成要素の共同作用が必要であり、一つでも欠けてはならない。</strong></p>
+
+<pre class="diagram"><code>  Union（OR 分岐を提供）
+    + Intersection（AND 分岐を提供）
+    + 関数型の反変（OR ↔ AND の相互反転を可能にする）
+    + 再帰型（このプロセスを無限に続ける）
+    ────────────────────────────────
+    = チューリングマシンをエンコード可能 → 決定不能</code></pre>
+
+            <h3>完全な因果チェーン</h3>
+
+<pre class="diagram"><code>  WHY-0: 停止問題は決定不能
+            ↓
+  WHY-1: チューリングマシンをエンコードできる形式体系の判定問題は決定不能
+            ↓
+  WHY-2: Union + Intersection + 関数型 + 再帰型はチューリングマシンをエンコードできる
+            ↓ なぜなら
+  WHY-3: Union は OR 選択をエンコード、Intersection は AND 連言をエンコード
+            ↓ それに加えて
+  WHY-4: 関数引数の反変が union ↔ intersection の相互反転を可能にする
+            ↓ その結果
+  WHY-5: 部分型検査が AND-OR 交互探索になる
+            ↓ さらに
+  WHY-6: 再帰型が展開プロセスに終了点をなくす
+            ↓ 最終的に
+  WHY-7: 部分型検査は任意のチューリングマシンをエンコード可能 → 決定不能</code></pre>
+
+            <h3>実際の型システムはどう対処しているか？</h3>
+
+            <p>理論上は決定不能だが、私たちが毎日使っている TypeScript、Flow、Scala は問題なく動いている。どうやっているのか？本質的には「完全性」か「完全な再帰」を放棄して決定可能性を得ている。</p>
+
+            <h4>戦略一：不完全だが健全（TypeScript のアプローチ）</h4>
+
+            <p>TypeScript の部分型検査アルゴリズムは <strong>sound but incomplete</strong>——誤った部分型関係を受け入れることはない（健全）が、実際に成り立つ一部の部分型関係を拒否する可能性がある（不完全）。</p>
+
+<pre><code>// TypeScript の部分型検査は特定のケースで諦める
+type A = { x: string } &amp; { y: number }
+type B = { x: string, y: number }
+// A &lt;: B かつ B &lt;: A、TypeScript はこれを処理できる
+
+// しかし深くネストした再帰 + union + intersection の組み合わせに対しては
+// コンパイラが直接エラーを出すかタイムアウトする場合がある</code></pre>
+
+            <p>実践での表れ：複雑な TypeScript の型パズル（conditional types + infer + 再帰）を書いたことがあれば、<code>Type instantiation is excessively deep and possibly infinite</code> というエラーを見たことがあるかもしれない。これは TypeScript の深さ制限が作動しているもので、再帰展開が一定の深さ（通常 50 層）を超えると直接停止する。</p>
+
+            <h4>戦略二：意味論的部分型（CDuce、Ballerina のアプローチ）</h4>
+
+            <p>型を値の集合として解釈し、部分型を集合包含とする。再帰型の形式を制限することで決定可能性を回復する：</p>
+
+            <ul>
+                <li><strong>Contractive 条件</strong>：再帰本体が変数そのもの（<code>μX. X</code> は不正）であってはならず、少なくとも一つの型構成子を通る必要がある</li>
+                <li>この制限は「無意味な無限展開」を遮断するが、有用な再帰型（リスト、木など）は保持する</li>
+            </ul>
+
+            <h4>戦略三：union/intersection の出現位置を制限する</h4>
+
+            <p>一部の型システムでは union/intersection を特定の位置にのみ許可する——例えばトップレベルにのみ出現可能で、関数引数内にはネストできないなど。これにより反変反転のチェーンが直接遮断される。</p>
+
+            <h4>戦略四：Equi-recursive の代わりに Iso-recursive を使う</h4>
+
+            <p>Iso-recursive 型は明示的な <code>fold</code>/<code>unfold</code> 操作がないと再帰を展開できない。展開のたびにプログラマが能動的にトリガーし、型チェッカーが自動的に無限展開するのではない。これにより展開の深さが制限される。</p>
+
+            <h4>戦略五：MLsub の巧みな制限</h4>
+
+            <p>Dolan と Mycroft の 2017 年の MLsub システムは巧妙な方法を示した：union と intersection を特定の「極性（polarity）」の位置にのみ出現させることで——union は共変位にのみ、intersection は反変位にのみ——AND-OR 交互の可能性を完全に排除し、決定可能かつ効率的なシステムを得た。</p>
+
+            <h3>エンジニアリング実践への示唆</h3>
+
+            <p>決定不能の根源を理解することで、より「フレンドリー」な型を書く指針が得られる：</p>
+
+            <ul>
+                <li><strong>関数引数位に union + intersection + 再帰をネストしない</strong>。これが AND-OR 交互探索をトリガーする正確な条件である。複雑な型を名前付き型エイリアスとして抽出し、ネストの深さを減らす</li>
+                <li><strong>再帰型をシンプルに保つ</strong>。<code>type Tree = Leaf | Node(Tree, Tree)</code> は安全。<code>type T = (T → T) | number</code> は危険——関数引数位の T が反変反転をトリガーするため</li>
+                <li><strong>"excessively deep" エラーを見たら <code>// @ts-ignore</code> を付けてはいけない</strong>。型定義を見直し、union/intersection が再帰の中で関数引数位を通じて絶え間なく反転する状況がないか確認する</li>
+                <li><strong>型パズルはほどほどに</strong>。TypeScript の conditional type + infer は本質的に union/intersection の再帰的探索を行っている。ネストが一層増えるごとに、探索空間は指数的に膨張する可能性がある</li>
+            </ul>
+
+            <h3>参考文献</h3>
+
+            <ul>
+                <li>Pierce, B.C. (1994): "Bounded quantification is undecidable" — F&lt;: における部分型の決定不能性を証明した古典的論文</li>
+                <li>Barbanera, Dezani-Ciancaglini, de'Liguoro (1995): Intersection types + bounded quantification の決定不能性</li>
+                <li>Frisch, Castagna, Hosoya (2002/2008): Semantic Subtyping — 制限条件により決定可能性を回復する方法の提示</li>
+                <li>Dolan, Mycroft (2017): "Polymorphism, Subtyping, and Type Inference in MLsub" — 決定可能な union + intersection 部分型システム</li>
+                <li>Castagna (2022): "Programming with Union, Intersection, and Negation Types" — 最新の総合リファレンス</li>
+            </ul>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

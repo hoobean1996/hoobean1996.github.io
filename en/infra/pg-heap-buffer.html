@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL Storage Engine Internals (Part 1): Heap Pages and Buffer Pool - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL Storage Engine Internals (Part 1): Heap Pages and Buffer Pool</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/coin-cabinet-percier.jpg" alt="Coin Cabinet, designed by Charles Percier, made by Martin-Guillaume Biennais, ca. 1809-19">
+                <figcaption>Designed by Charles Percier, "Coin Cabinet", ca. 1809-19 — Open the cabinet doors and 44 fixed-size drawers are neatly arranged, each holding different coins. This mirrors PostgreSQL's storage structure: files are the cabinet, Pages are the drawers, and Tuples are the coins inside</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL Storage Engine Internals</strong><br>
+                <span class="current">Part 1: Heap Pages and Buffer Pool</span> ·
+                <a href="pg-index-mvcc.html">Part 2: Index Scans and MVCC</a> ·
+                <a href="pg-wal-checkpoint.html">Part 3: WAL, Checkpoint, and Durability</a>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>What you'll learn from this post</strong>: When you execute <code>SELECT * FROM users WHERE id = 123</code>, how does the data travel from disk to your screen? This post traces the lowest layer of that path: what the inside of an 8KB Page looks like, how the Buffer Pool manages in-memory page caching, how sequential scans read data page by page, and how HOT Chains optimize update operations. Understanding these will help you truly grasp why VACUUM is necessary, why cross-host container communication is slower than same-host, and the fundamental storage-layer differences between PG and MySQL.
+            </blockquote>
+
+            <h3>The Big Picture: From Files to Tuples</h3>
+
+            <p>PostgreSQL's storage is a four-layer structure. Understanding the nesting of these four layers is the foundation for everything that follows.</p>
+
+<pre class="diagram"><code>  ┌─────────────────────────────────────────────────────────┐
+  │ Relation (table/index)                                    │
+  │                                                         │
+  │  Data directory: $PGDATA/base/{dbOid}/{relFileNumber}   │
+  │                                                         │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐                │
+  │  │ Segment 0 │ │ Segment 1 │ │ Segment 2 │  ...         │
+  │  │  (1 GB)   │ │  (1 GB)   │ │  (1 GB)   │              │
+  │  └─────┬────┘ └──────────┘ └──────────┘                │
+  │        │                                                │
+  │        ▼                                                │
+  │  ┌────────┬────────┬────────┬────────┬─────┐           │
+  │  │ Page 0 │ Page 1 │ Page 2 │ Page 3 │ ... │  8KB each  │
+  │  └────┬───┘ └────────┘ └────────┘ └────────┘           │
+  │       │                                                 │
+  │       ▼                                                 │
+  │  ┌──────────────────────────────────┐                   │
+  │  │ PageHeader │ ItemId[] │ Tuples[] │  Inside a Page    │
+  │  └──────────────────────────────────┘                   │
+  └─────────────────────────────────────────────────────────┘</code></pre>
+
+            <table>
+                <thead>
+                    <tr><th>Layer</th><th>Size</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Relation</strong></td><td>Unlimited</td><td>A table or an index. Corresponds to one or more files on disk</td></tr>
+                    <tr><td><strong>Segment</strong></td><td>1 GB</td><td>Auto-segmented when file exceeds 1GB (relFileNumber, relFileNumber.1, ...)</td></tr>
+                    <tr><td><strong>Page (Block)</strong></td><td>8 KB</td><td>The basic unit of storage. Called Block on disk, Page when read into memory</td></tr>
+                    <tr><td><strong>Tuple</strong></td><td>Variable</td><td>A row of data. Contains row header + user data + alignment padding</td></tr>
+                </tbody>
+            </table>
+
+            <p>How to calculate single-table capacity limit? <code>Page size (8KB) × max Block count (2^32) = 32 TB</code>. This is a hard-coded upper limit.</p>
+
+            <p>Each Relation also has several "fork files" on disk:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Fork</th><th>Number</th><th>File Suffix</th><th>Contents</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Main</strong></td><td>0</td><td>(none)</td><td>Main data file, stores actual row data</td></tr>
+                    <tr><td><strong>FSM</strong></td><td>1</td><td>_fsm</td><td>Free Space Map, records available space per Page</td></tr>
+                    <tr><td><strong>VM</strong></td><td>2</td><td>_vm</td><td>Visibility Map, marks which Pages have all Tuples visible (used by VACUUM)</td></tr>
+                    <tr><td><strong>Init</strong></td><td>3</td><td>_init</td><td>Initialization fork, used for crash recovery of unlogged tables</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Inside a Page: An 8KB Micro-World</h3>
+
+            <p>This is the most important diagram in this entire post. Each Page is a fixed-size 8192-byte block with the following internal structure:</p>
+
+<pre class="diagram"><code>  0 bytes                                                  8192 bytes
+  ┌──────────────────────────────────────────────────────────────┐
+  │                     PageHeaderData (24 bytes)                 │
+  │  pd_lsn │ pd_checksum │ pd_flags │ pd_lower │ pd_upper │... │
+  ├──────────────────────────────────────────────────────────────┤
+  │ ItemId[1] │ ItemId[2] │ ItemId[3] │ ... │ ItemId[N] │       │
+  │ (4 bytes)  (4 bytes)    (4 bytes)         (4 bytes)          │
+  │                                          ↓ pd_lower          │
+  ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤
+  │                                                              │
+  │                     Free  Space                               │
+  │                                                              │
+  ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤
+  │                                          ↑ pd_upper          │
+  │  Tuple N  │  ...  │  Tuple 3  │  Tuple 2  │  Tuple 1        │
+  │                                                              │
+  ├──────────────────────────────────────────────────────────────┤
+  │                   Special Space                     ↑pd_special│
+  └──────────────────────────────────────────────────────────────┘
+
+  ← ItemId array grows left to right    Tuple data grows right to left →
+
+  The two grow toward each other, with free space in the middle.</code></pre>
+
+            <p>This "growing toward each other from both ends" design is a classic — the same idea as heap and stack growing toward each other in operating systems. The advantage: you don't need to know in advance how much space ItemIds and Tuples each require; the free space is shared between them.</p>
+
+            <h4>PageHeaderData: Page Metadata</h4>
+
+            <table>
+                <thead>
+                    <tr><th>Field</th><th>Size</th><th>Meaning</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>pd_lsn</code></td><td>8 bytes</td><td>LSN of the last WAL record that modified this Page. Determines whether replay is needed during recovery</td></tr>
+                    <tr><td><code>pd_checksum</code></td><td>2 bytes</td><td>Page checksum, detects storage-level data corruption</td></tr>
+                    <tr><td><code>pd_flags</code></td><td>2 bytes</td><td>Flag bits (has free space, all-visible, etc.)</td></tr>
+                    <tr><td><code>pd_lower</code></td><td>2 bytes</td><td>Points to the start of free space (end of ItemId array)</td></tr>
+                    <tr><td><code>pd_upper</code></td><td>2 bytes</td><td>Points to the end of free space (start of Tuple data)</td></tr>
+                    <tr><td><code>pd_special</code></td><td>2 bytes</td><td>Start offset of Special Space (used by index pages)</td></tr>
+                </tbody>
+            </table>
+
+            <p><code>pd_upper - pd_lower</code> = available space in the current Page. When INSERTing a new row, PG checks if this value is large enough to fit a new Tuple + a new ItemId.</p>
+
+            <h4>ItemId: The Indirection Layer</h4>
+
+            <p>An ItemId is a 4-byte structure containing three pieces of information:</p>
+
+            <ul>
+                <li><strong>offset</strong> (15 bits): Byte offset of the Tuple within the Page</li>
+                <li><strong>len</strong> (15 bits): Length of the Tuple</li>
+                <li><strong>flags</strong> (2 bits): Status (normal / dead / redirect)</li>
+            </ul>
+
+            <p>Why this extra layer of indirection? Because VACUUM needs to defragment within Pages. After defragmentation, Tuples' physical positions may change, but ItemId <strong>slot numbers (OffsetNumber) remain stable</strong>. External references (index entries, foreign keys from other rows) always locate a row via <code>(BlockNumber, OffsetNumber)</code> — this is the <strong>TID (Tuple Identifier)</strong>.</p>
+
+<pre class="diagram"><code>  TID = (BlockNumber, OffsetNumber)
+        (  page #   ,   slot #     )
+
+  e.g., TID = (5, 3) means:
+  The Tuple pointed to by ItemId[3] in Block 5
+
+  Index entry:  age=25 → TID(5, 3)
+                         │
+                         ▼
+  Page 5:   ItemId[3] = {offset: 6800, len: 120, flags: NORMAL}
+                            │
+                            ▼
+            Offset 6800:  HeapTupleHeader + user data</code></pre>
+
+            <p>This indirection layer lets VACUUM freely move Tuples' physical positions — it just needs to update the corresponding ItemId, without modifying any indexes.</p>
+
+            <h4>TID, ItemId, Tuple: The Relationship Between the Three</h4>
+
+            <p>These three concepts are often confused, so let's clarify their relationship thoroughly. In one sentence: <strong>TID is the address, ItemId is the mapping from door number to room number, and Tuple is the person in the room</strong>.</p>
+
+            <table>
+                <thead>
+                    <tr><th>Concept</th><th>What it is</th><th>Where it lives</th><th>Is it stable?</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>TID</strong></td><td>Logical address (BlockNumber, OffsetNumber)</td><td>In index entries, in references from other rows</td><td>Stable — VACUUM won't change it</td></tr>
+                    <tr><td><strong>ItemId</strong></td><td>Indirect pointer within the Page (offset, len, flags)</td><td>In the ItemId array after the Page header</td><td>Slot number is stable, but internal offset can change</td></tr>
+                    <tr><td><strong>Tuple</strong></td><td>Actual row data (row header + user data)</td><td>In the Tuple area at the end of the Page</td><td>Not stable — physical position can change after VACUUM defragmentation</td></tr>
+                </tbody>
+            </table>
+
+            <p>Key insight: The OffsetNumber in a TID is not a byte offset, but an <strong>index into the ItemId array</strong> (starting from 1). The actual byte offset is hidden inside the ItemId. This indirection layer is the essence of the entire design.</p>
+
+<pre class="diagram"><code>  A complete row lookup process:
+
+  Externally held: TID = (5, 3)
+                   │  │
+                   │  └─ OffsetNumber = 3 (3rd slot in ItemId array)
+                   └──── BlockNumber = 5  (5th Page)
+
+  Step 1: Find the Page using BlockNumber
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Page 5                                                       │
+  │                                                              │
+  │  Step 2: Look up OffsetNumber in the ItemId array             │
+  │                                                              │
+  │  ItemId[1]    ItemId[2]    ItemId[3]                         │
+  │  off:7100     off:6900     off:6700  ◄── this one            │
+  │  len:120      len:80       len:150                           │
+  │  flags:NORM   flags:DEAD   flags:NORM                        │
+  │                               │                              │
+  │                               │ Step 3: Jump to Tuple via    │
+  │                               │ offset                       │
+  │                               ▼                              │
+  │                    ┌──────────────────────┐                  │
+  │  Offset 6700 ──►  │ HeapTupleHeader      │                  │
+  │                    │  t_xmin = 100        │                  │
+  │                    │  t_xmax = 0          │                  │
+  │                    │  t_ctid = (5, 3)     │  ← points to     │
+  │                    │                      │    self = latest  │
+  │                    ├──────────────────────┤                  │
+  │                    │ User data            │                  │
+  │                    │  id=42               │                  │
+  │                    │  name='Alice'        │                  │
+  │                    │  age=25              │                  │
+  │                    └──────────────────────┘                  │
+  │                    ◄──── 150 bytes ────►                     │
+  └─────────────────────────────────────────────────────────────┘</code></pre>
+
+            <p>Understanding these three layers explains the following behaviors:</p>
+
+            <ul>
+                <li><strong>VACUUM defragmentation</strong>: Moves a Tuple's physical position (e.g., from offset 6700 to 7000), only needs to update ItemId[3]'s offset field. TID (5, 3) stays unchanged, no index entries need modification</li>
+                <li><strong>DELETE a row</strong>: Doesn't immediately delete the Tuple data, but marks ItemId's flags as DEAD. Space is only truly reclaimed during VACUUM</li>
+                <li><strong>HOT UPDATE</strong>: Old and new versions stay in the same Page, linked via the Tuple header's <code>t_ctid</code>. Index entries still point to the old version's TID, traversing the chain to find the new version</li>
+                <li><strong>Index scan heap fetch</strong>: Index provides TID → read Page → use OffsetNumber to find ItemId → use ItemId's offset to find Tuple → perform MVCC visibility check</li>
+            </ul>
+
+            <p>A common misconception is that "TID is the physical address of a row." It's not — TID is a <strong>logical address</strong>, with the ItemId indirection layer in between. It's precisely this indirection that allows PG to move rows' physical positions without modifying any external references.</p>
+
+            <h4>HeapTupleHeader: The Row Header</h4>
+
+            <p>The first 23 bytes of each Tuple are the row header, recording all information needed for MVCC:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Field</th><th>Meaning</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>t_xmin</code></td><td>Transaction ID that inserted this row — "who created me"</td></tr>
+                    <tr><td><code>t_xmax</code></td><td>Transaction ID that deleted/updated this row — "who killed me" (0 means still alive)</td></tr>
+                    <tr><td><code>t_cid</code></td><td>Command sequence number, operation order within the same transaction</td></tr>
+                    <tr><td><code>t_ctid</code></td><td>TID of the current version (if updated, points to new version → forms a version chain)</td></tr>
+                    <tr><td><code>t_infomask</code></td><td>Flag bits (committed, has NULL columns, has TOAST, etc.)</td></tr>
+                    <tr><td><code>t_hoff</code></td><td>Start offset of user data (skips past NULL bitmap)</td></tr>
+                </tbody>
+            </table>
+
+            <p>Key point: PG's MVCC information is <strong>stored directly in the row header</strong>, on the same Page as user data. This means old versions of rows don't disappear — they pile up in the Heap until VACUUM cleans them up. This is one of the biggest differences between PG and MySQL InnoDB, which we'll compare in detail later.</p>
+
+            <h3>Buffer Pool: In-Memory Page Cache</h3>
+
+            <p>Blocks on disk are never accessed directly. All reads and writes go through the Buffer Pool — a page cache maintained by PostgreSQL in shared memory.</p>
+
+<pre class="diagram"><code>                       ┌──────────────────────────────┐
+                       │       Backend Process         │
+                       │    (your SQL query process)   │
+                       └──────────┬───────────────────┘
+                                  │ Request Page (5, 0)
+                                  │ = Block 5, main data file
+                                  ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │                   Shared Buffer Pool                       │
+  │                  (shared_buffers parameter)                 │
+  │                                                            │
+  │  ┌──────────────────────────────────────────────────┐      │
+  │  │            Buffer Table (hash table)              │      │
+  │  │                                                   │      │
+  │  │  BufferTag → Buffer ID                            │      │
+  │  │  {spc, db, rel, fork, block} → slot number        │      │
+  │  └──────────────────────────────────────────────────┘      │
+  │                         │                                   │
+  │                         ▼                                   │
+  │  ┌────────┬────────┬────────┬────────┬────────┐            │
+  │  │ Slot 0 │ Slot 1 │ Slot 2 │ Slot 3 │  ...   │  Buffer   │
+  │  │ 8KB    │ 8KB    │ 8KB    │ 8KB    │        │  array     │
+  │  └────────┘ └────────┘ └────────┘ └────────┘            │
+  │                                                            │
+  │  ┌──────────────────────────────────────────────────┐      │
+  │  │         Buffer Descriptors (descriptor array)     │      │
+  │  │  Each slot has a corresponding descriptor:        │      │
+  │  │  - tag: which page this slot caches               │      │
+  │  │  - state: pin count + usage count + dirty flag    │      │
+  │  │  - buf_id: corresponding slot number              │      │
+  │  └──────────────────────────────────────────────────┘      │
+  └───────────────────────────────────────────────────────────┘
+                                  │
+                                  │ Cache miss → read from disk
+                                  ▼
+                       ┌──────────────────────┐
+                       │   Disk file           │
+                       │   base/12345/67890    │
+                       └──────────────────────┘</code></pre>
+
+            <h4>BufferTag: Five-Tuple Identification</h4>
+
+            <p>A single BufferTag can pinpoint the exact location of data on disk, without consulting system tables:</p>
+
+<pre><code>typedef struct buftag {
+    Oid         spcOid;     // Tablespace OID
+    Oid         dbOid;      // Database OID
+    RelFileNumber relNumber; // File number
+    ForkNumber  forkNum;    // Fork (0=main data, 1=FSM, 2=VM)
+    BlockNumber blockNum;   // Block number
+} BufferTag;
+
+// e.g.: {spcOid=1663, dbOid=12345, relNumber=67890, forkNum=0, blockNum=5}
+// → The 5th 8KB block of $PGDATA/base/12345/67890</code></pre>
+
+            <p>The self-contained nature of this design is important: the background dirty page flushing process may start working before the corresponding transaction has committed, and it must not depend on system tables to locate data.</p>
+
+            <h4>Shared Buffer vs Local Buffer</h4>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Shared Buffer</th><th>Local Buffer</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Purpose</strong></td><td>Regular tables</td><td>Temporary tables, unlogged tables</td></tr>
+                    <tr><td><strong>Visibility</strong></td><td>Shared across all backend processes</td><td>Visible only to current process</td></tr>
+                    <tr><td><strong>Buffer ID</strong></td><td>&gt; 0 (buffer - 1)</td><td>&lt; 0 (-buffer - 1)</td></tr>
+                    <tr><td><strong>Needs locking</strong></td><td>Yes (multi-process concurrency)</td><td>No (single-process exclusive)</td></tr>
+                    <tr><td><strong>Parameter</strong></td><td><code>shared_buffers</code></td><td><code>temp_buffers</code></td></tr>
+                </tbody>
+            </table>
+
+            <p>In production, <code>shared_buffers</code> is typically set to 25% of physical memory. PG relies on the OS Page Cache as a second-level cache — data might not be in the Buffer Pool, but still in the OS cache, making reads still fast.</p>
+
+            <h4>Clock Sweep Algorithm</h4>
+
+            <p>When the Buffer Pool is full and pages need to be evicted, PG uses the <strong>Clock Sweep</strong> algorithm. Each buffer descriptor maintains a <code>usage_count</code>:</p>
+
+            <ul>
+                <li>When a page is accessed, <code>usage_count++</code> (capped at 5)</li>
+                <li>When the clock hand reaches a buffer: if <code>usage_count > 0</code>, decrement by 1 and skip; if <code>usage_count == 0</code>, evict the page</li>
+                <li>If the page is dirty, it must be flushed to disk before eviction</li>
+                <li>If the page is pinned (a process is currently using it), skip</li>
+            </ul>
+
+<pre class="diagram"><code>  Clock hand →
+
+  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐  ┌───┐
+  │ 3 │  │ 1 │  │ 0 │  │ 2 │  │ 0 │  │ 1 │  │ 0 │  │ 4 │
+  └───┘  └───┘  └─┬─┘  └───┘  └─┬─┘  └───┘  └─┬─┘  └───┘
+                   │              │              │
+                  Decremented    Decremented    Decremented
+                  to 0 → Evict!  to 0 → Evict!  to 0 → Evict!
+
+  Higher usage_count → "hotter" → harder to evict</code></pre>
+
+            <p>This is better suited for databases than LRU: a single full-table scan won't flush all hot data from the cache (because the scan only gives each page +1, while hot pages may have a usage_count of 5).</p>
+
+            <h3>The Complete I/O Path of a Sequential Scan</h3>
+
+            <p>When you execute <code>SELECT * FROM users</code>, the executor calls <code>ExecSeqScan</code>, which ultimately reaches the storage layer's <code>heap_getnextslot</code>. Let's trace the complete path:</p>
+
+<pre class="diagram"><code>  ExecSeqScan
+      │
+      ▼
+  ExecScanExtended(SeqNext, SeqRecheck)
+      │
+      ▼
+  SeqNext
+      │ First call: table_beginscan() initializes scan descriptor
+      │ Subsequent calls:
+      ▼
+  table_scan_getnextslot
+      │ → heapam_methods.scan_getnextslot
+      ▼
+  heap_getnextslot
+      │
+      ├─── Page Mode (default):
+      │    heapgettup_pagemode
+      │    1. heap_fetch_next_buffer → read next Page into Buffer Pool
+      │    2. heap_prepare_pagescan → check visibility of all Tuples on the page at once
+      │    3. Build rs_vistuples[] array (list of visible Tuple OffsetNumbers)
+      │    4. Iterate through rs_vistuples[], returning Tuples one by one
+      │
+      └─── Tuple Mode:
+           heapgettup
+           Read Tuples one by one, each with individual visibility check</code></pre>
+
+            <p>Page Mode is the default strategy with better performance: it gets the visibility results for the entire page at once, avoiding repeated locking.</p>
+
+            <h4>heap_fetch_next_buffer: Read-Ahead Mechanism</h4>
+
+            <p>Sequential scans don't read one page at a time — PG has a streaming read-ahead (Read Stream) mechanism:</p>
+
+            <ul>
+                <li>Maintains a <code>distance</code> parameter to control read-ahead depth</li>
+                <li>Consecutive blocks are merged into a single large I/O request (I/O coalescing)</li>
+                <li>Fast path: if there's only one pinned buffer and read-ahead distance is 1, read the next block directly, skipping complex logic</li>
+                <li>Checks for interrupt requests (<code>CHECK_FOR_INTERRUPTS</code>) after each Page read, preventing long scans from being uncancellable</li>
+            </ul>
+
+            <h4>Traversal Within a Page</h4>
+
+            <p>After obtaining a Page, here's how the Tuples inside are read:</p>
+
+<pre><code>// Core loop of heapgettup_pagemode (simplified)
+
+page = BufferGetPage(scan->rs_cbuf);      // Get Page pointer
+
+for (i = 0; i < scan->rs_ntuples; i++) {
+    OffsetNumber lineoff = scan->rs_vistuples[i];     // Visible Tuple's slot number
+    ItemId lpp = PageGetItemId(page, lineoff);         // Get pointer from ItemId array
+
+    tuple->t_data = (HeapTupleHeader) PageGetItem(page, lpp);  // Locate Tuple data
+    tuple->t_len = ItemIdGetLength(lpp);                        // Tuple length
+    ItemPointerSetOffsetNumber(&tuple->t_self, lineoff);        // Set TID
+
+    // Check scan conditions (if there's a scan key)
+    if (key != NULL && !HeapKeyTest(tuple, ...))
+        continue;
+
+    return;  // Return this Tuple to upper layer
+}</code></pre>
+
+            <p>Note that the TID is "reconstructed" into <code>tuple->t_self</code> during scanning — it's a (BlockNumber, OffsetNumber) combination, determined at write time and derived from the current position during scanning for use by upper layers.</p>
+
+            <h3>HOT Chain: Updates Within a Page</h3>
+
+            <p>PG's UPDATE is actually INSERT new version + DELETE old version. This means every UPDATE: creates a new Tuple, allocates a new ItemId, updates all indexes pointing to that row. The cost is significant.</p>
+
+            <p><strong>HOT (Heap Only Tuple)</strong> is a key optimization: if an UPDATE doesn't modify any indexed columns, and the new Tuple fits on the same Page, PG creates a HOT chain and <strong>doesn't update indexes</strong>.</p>
+
+<pre class="diagram"><code>  UPDATE users SET name = 'Alice2' WHERE id = 123;
+  UPDATE users SET name = 'Alice3' WHERE id = 123;
+
+  Index entry: (id=123) → TID(5, 1)    Only one index entry!
+                          │
+                          ▼
+  Page 5:
+  ┌────────────────────────────────────────────────────────┐
+  │ ItemId[1]          ItemId[2]         ItemId[3]         │
+  │ offset→A           offset→B          offset→C          │
+  │ flags: REDIRECT    flags: NORMAL     flags: NORMAL     │
+  ├────────────────────────────────────────────────────────┤
+  │                                                        │
+  │  Tuple C (latest)  ←  Tuple B (old)  ←  Tuple A (oldest)│
+  │  name='Alice3'      name='Alice2'     name='Alice'      │
+  │  t_xmax=0           t_xmax=103        t_xmax=102        │
+  │  t_ctid=(5,3)       t_ctid=(5,3)      t_ctid=(5,2)      │
+  │                                                        │
+  └────────────────────────────────────────────────────────┘
+
+  During index scan:
+  1. Index provides TID(5, 1)
+  2. Read ItemId[1], find REDIRECT → follow it
+  3. Traverse t_ctid chain: A → B → C
+  4. Perform MVCC visibility check on each version
+  5. Return the version visible to the current transaction</code></pre>
+
+            <p>Three conditions for HOT:</p>
+            <ul>
+                <li>UPDATE doesn't modify any indexed columns (otherwise index entries must be updated)</li>
+                <li>New Tuple fits on the same Page (otherwise can't link via in-page pointers)</li>
+                <li>HOT chain for the same row cannot span Pages</li>
+            </ul>
+
+            <p>Benefits of HOT:</p>
+            <ul>
+                <li><strong>Reduces index bloat</strong>: One index entry can cover multiple updates</li>
+                <li><strong>Improves UPDATE performance</strong>: Saves I/O from index updates</li>
+                <li><strong>Simplifies VACUUM</strong>: HOT chains within a Page can be quickly cleaned up at the Page level (Pruning)</li>
+            </ul>
+
+            <p>The logic for index scans following HOT chains is in the <code>heap_hot_search_buffer</code> function — starting from the TID given by the index, it traverses along <code>t_ctid</code> to the end of the chain, performing visibility checks on each version.</p>
+
+            <h3>PG vs InnoDB: Two Storage Philosophies</h3>
+
+            <p>Finally, let's compare the fundamental storage-layer design differences between PostgreSQL and MySQL InnoDB:</p>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>PostgreSQL (Heap)</th><th>MySQL InnoDB (Clustered Index)</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Data organization</strong></td><td>Heap: rows are piled up in insertion order, unordered</td><td>Clustered index: rows stored in primary key order in B+ Tree leaf nodes</td></tr>
+                    <tr><td><strong>UPDATE method</strong></td><td>Append new version to Heap (multiple versions coexist)</td><td>In-place update, old version moved to Undo Log</td></tr>
+                    <tr><td><strong>Where are old versions</strong></td><td>Mixed with new versions in the same Heap Page</td><td>Separate Undo Log space</td></tr>
+                    <tr><td><strong>Bloat issue</strong></td><td>Severe — old versions keep occupying space if not cleaned</td><td>Lighter — Undo Log can be independently reclaimed</td></tr>
+                    <tr><td><strong>VACUUM requirement</strong></td><td>Essential — otherwise table and indexes keep bloating</td><td>No equivalent needed (Purge thread automatically cleans Undo)</td></tr>
+                    <tr><td><strong>Primary key lookup</strong></td><td>Requires index scan + heap fetch (TID → Heap Page)</td><td>Data found directly on B+ Tree (index is data)</td></tr>
+                    <tr><td><strong>Secondary index lookup</strong></td><td>Secondary index → TID → one Heap I/O</td><td>Secondary index → primary key → another clustered index traversal</td></tr>
+                    <tr><td><strong>Write amplification</strong></td><td>HOT optimization reduces index writes</td><td>Change Buffer defers secondary index updates</td></tr>
+                </tbody>
+            </table>
+
+            <p>The core trade-offs of the two philosophies:</p>
+
+            <ul>
+                <li><strong>PG chose a simpler write path</strong>: Appending is always simpler and safer than in-place updates. The cost is needing VACUUM to reclaim space, with higher operational complexity</li>
+                <li><strong>InnoDB chose compact storage</strong>: In-place updates + Undo Log avoids bloat. The cost is more complex Undo Log management logic, and secondary index lookups require two B+ Tree traversals</li>
+            </ul>
+
+            <h3>Summary</h3>
+
+            <p>Key intuitions worth remembering:</p>
+
+            <ul>
+                <li><strong>Pages are the foundation of everything</strong>: 8KB fixed size, ItemId array and Tuple data grow toward each other. Understanding Page internal layout explains why PG designs TID this way and why VACUUM can defragment at the Page level</li>
+                <li><strong>ItemId is the indirection layer</strong>: External references use (BlockNumber, OffsetNumber) to reference a row, and VACUUM can move Tuples without modifying indexes</li>
+                <li><strong>Buffer Pool is the intermediary for all I/O</strong>: BufferTag five-tuple for self-contained location, Clock Sweep algorithm better suited for database workloads than LRU, read-ahead mechanism reduces random I/O</li>
+                <li><strong>HOT Chain is PG's compensation for the cost of "append-style updates"</strong>: Updates that don't modify indexed columns can be completed within a Page without triggering index updates</li>
+                <li><strong>MVCC info lives in the row header</strong>: This is the most fundamental difference between PG and InnoDB — old versions aren't in Undo Log but in the Heap itself, directly causing bloat issues and the necessity of VACUUM</li>
+            </ul>
+
+            <p>In the next post, we'll enter the world of MVCC and VACUUM: how snapshots determine visibility, the implementation of transaction isolation levels, and why VACUUM is the most important daily task for PG DBAs.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

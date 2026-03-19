@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building a Distributed Async Job Queue from Scratch: Lessons from Shopee - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Building a Distributed Async Job Queue from Scratch: Lessons from Shopee</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/clock-watch-astronomical.jpg" alt="Clock Watch with Astronomical Dial, ca. 1605-10, Metropolitan Museum of Art">
+                <figcaption>Jan Jansen Bockeltz, "Clock Watch with Astronomical Dial", c. 1605-10 — Precision gear mechanisms drive timekeeping, just as a scheduling system drives the punctual execution of tasks</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: Every backend system of a certain scale needs async tasks — deferred execution, scheduled jobs, failure retries. Open-source solutions (Celery, Bull) are often too heavy or not flexible enough. This article shares the complete experience of building a distributed async job queue from scratch at Shopee: the storage model, scheduling strategies, failure retries, priority queues, and the pitfalls encountered in production.
+            </blockquote>
+
+            <h3>Why Every Company Ends Up Building Their Own Async Task System</h3>
+
+            <p>Almost every backend system that reaches a certain scale encounters the same problem: some things can't be done synchronously within a user request.</p>
+
+            <p>After a user places an order, you need to check 30 minutes later whether they've paid — if not, cancel it. After a user registers, you need to asynchronously send a welcome email. Every day at midnight, you need to run a reconciliation job. Every hour, you need to sync external data. These "do it later" tasks are async tasks.</p>
+
+            <p>The problem is, "do it later" sounds simple but is anything but:</p>
+
+            <ul>
+                <li><strong>Reliability</strong>: If the service restarts, are the tasks still there? If there's a network hiccup, will tasks be lost?</li>
+                <li><strong>Delay control</strong>: "Execute in 30 minutes" — who keeps track of the time? What's the precision?</li>
+                <li><strong>Concurrency control</strong>: With 10 instances running simultaneously, how do you ensure the same task isn't executed twice?</li>
+                <li><strong>Failure handling</strong>: If a task fails, how many retries? What's the retry interval? When do you give up?</li>
+                <li><strong>Observability</strong>: How many tasks are currently queued? What's the average latency? Which tasks have failed?</li>
+            </ul>
+
+            <p>This is why projects like Celery, Sidekiq, Bull, and Temporal exist — they all solve the same problem. But in large companies, generic solutions often aren't enough: you need to integrate with internal RPC frameworks, adapt to the company's deployment platform, and connect with existing monitoring systems. So almost every company of a certain scale ends up building their own.</p>
+
+            <h3>The Situation at Shopee</h3>
+
+            <p>In 2019, I joined Shopee's platform team, responsible for middleware services targeting business development teams. At the time, each business line had its own "async task" solution — some used crontab + scripts, some wrote infinite loops polling the database, and some just spawned goroutines in business code and prayed they wouldn't lose tasks.</p>
+
+            <p>The problems were obvious: no unified task management, no monitoring, no retries, and lost tasks went unnoticed. Even worse, every team was repeatedly stepping on the same pitfalls — retries without idempotency leading to duplicate charges, crontab machines crashing unnoticed causing reconciliation to break for a week. The platform team decided to build a distributed async job queue system from scratch to provide standardized async task capabilities.</p>
+
+            <p>This article documents the complete process from design to production. Over three years, it went from 0 to 10+ business integrations, QPS grew from 2K to 25K+, and handled 50K peak during Double 11.</p>
+
+            <h3>Requirements Analysis</h3>
+
+            <p>After talking with various business teams, async task requirements fell into roughly three categories:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Example Scenarios</th>
+                        <th>Latency Requirement</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Short-delay tasks</td>
+                        <td>Order timeout cancellation, coupon expiration, push notifications</td>
+                        <td>Seconds to minutes</td>
+                    </tr>
+                    <tr>
+                        <td>Long-delay tasks</td>
+                        <td>T+1 reconciliation, weekly report generation, data archiving</td>
+                        <td>Hours to days</td>
+                    </tr>
+                    <tr>
+                        <td>Cron scheduled tasks</td>
+                        <td>Daily midnight batch jobs, hourly data sync, heartbeat checks</td>
+                        <td>Per cron expression</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>Beyond functional requirements, there were several hard constraints:</p>
+
+            <ul>
+                <li><strong>At-least-once delivery</strong>: Tasks can be executed multiple times (business handles idempotency), but they must never be lost</li>
+                <li><strong>Multi-language support</strong>: Business teams use Go and Python, so SDKs for both languages were required</li>
+                <li><strong>Integration with internal RPC platform</strong>: Task triggering calls business services through the company's internal RPC framework, without introducing additional network protocols</li>
+                <li><strong>Observability</strong>: The status, duration, and retry count of every task must be queryable</li>
+            </ul>
+
+            <h3>System Architecture</h3>
+
+<pre class="diagram"><code>
+  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+  │  Order Svc   │   │  Payment Svc │   │  Report Svc  │    Business Services
+  │  (Go SDK)    │   │  (Go SDK)    │   │ (Python SDK) │
+  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+         │                  │                   │
+         └──────────────────┼───────────────────┘
+                            │ Submit (RPC)
+                            ▼
+               ┌───────────────────────────┐
+               │        API Server         │
+               │  ┌─────────┐ ┌─────────┐ │
+               │  │Param    │ │Delay    │ │
+               │  │Validate │ │Routing  │ │
+               │  └─────────┘ └─────────┘ │
+               └─────┬─────────────┬───────┘
+                     │             │
+        delay ≤ 10m  │             │  delay > 10m / Cron
+                     ▼             ▼
+            ┌──────────────┐ ┌──────────────┐
+            │    Kafka     │ │    MySQL     │
+            │              │ │              │
+            │ topic-order  │ │ async_tasks  │    Persistence Layer
+            │ topic-pay    │ │ cron_registry│
+            │ topic-report │ │              │
+            └──────┬───────┘ └──────┬───────┘
+                   │                │
+                   ▼                ▼
+            ┌─────────────────────────────────────────┐
+            │            Dispatcher (N instances)       │
+            │                                          │
+            │  ┌────────────┐  ┌───────────────────┐  │
+            │  │   Kafka    │  │   MySQL Poller     │  │
+            │  │  Consumer  │  │   (second-level    │  │
+            │  │            │  │    scanning)        │  │
+            │  └─────┬──────┘  └────────┬──────────┘  │
+            │        │                  │              │
+            │        ▼                  ▼              │
+            │  ┌──────────────────────────────────┐   │
+            │  │    ETA Priority Queue (Heap)      │   │    Scheduling Layer
+            │  │    Sorted by trigger time,        │   │
+            │  │    dispatched when due             │   │
+            │  └───────────────┬──────────────────┘   │
+            │                  │                       │
+            └──────────────────┼───────────────────────┘
+                               │ Dispatch (RPC)
+                               ▼
+            ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+            │  Order Svc   │ │ Payment Svc  │ │  Report Svc  │    Executors
+            │  (Executor)  │ │  (Executor)  │ │  (Executor)  │
+            └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+                   │                │                 │
+                   └────────────────┼─────────────────┘
+                                    │ Result Callback (RPC)
+                                    ▼
+            ┌─────────────────────────────────────────┐
+            │           Prometheus + Grafana           │    Observability
+            │  Latency · Throughput · Success Rate ·   │
+            │  Queue Depth · Retries                   │
+            └─────────────────────────────────────────┘
+</code></pre>
+
+            <h3>Why Kafka + MySQL, Not Pure Kafka or Pure Redis</h3>
+
+            <p>This was the most debated decision during the design phase.</p>
+
+            <p><strong>The pure Kafka approach</strong> had problems: Kafka doesn't support arbitrary delayed delivery. While you can simulate different delay levels with multiple topics (1s/5s/30s/1min/...), the granularity is too coarse and the number of topics explodes. For "trigger in 3 days" long delays, Kafka is completely unsuitable — messages pile up on brokers, wasting resources with rebalance risks.</p>
+
+            <p><strong>The pure Redis approach</strong> (Sorted Set + ZRANGEBYSCORE): store trigger time as the score for delayed tasks, periodically scan for due tasks. The problem is Redis persistence isn't reliable enough — RDB has time windows, and AOF performance degrades under high QPS. For the hard requirement of "at-least-once delivery," Redis as the sole storage is too risky.</p>
+
+            <p><strong>The final approach</strong>: Kafka handles immediate and short-delay tasks (≤ 10 minutes), MySQL handles long-delay and Cron tasks.</p>
+
+            <ul>
+                <li><strong>Kafka</strong>: High throughput, native support for consumer groups and partition-level parallelism. Short-delay tasks are consumed and placed into an in-memory ETA priority queue (min-heap), triggered when due.</li>
+                <li><strong>MySQL</strong>: ACID guarantees that tasks aren't lost. Long-delay tasks are written with a trigger time, and the Dispatcher scans for due tasks every second. Cron tasks have their next trigger time pre-calculated by the Scheduler.</li>
+            </ul>
+
+            <h3>Short-Delay Tasks: ETA Priority Queue</h3>
+
+            <p>After consuming short-delay tasks from Kafka, instead of simply sleeping to wait, they're placed into a min-heap-based priority queue sorted by ETA (Expected Time of Arrival):</p>
+
+<pre><code>// ETA Priority Queue — based on container/heap
+type Task struct {
+    ID        string
+    Type      string
+    Payload   string
+    ETA       time.Time  // Expected trigger time
+    Priority  int        // Business priority (tiebreak for same ETA)
+    index     int        // Internal heap index
+}
+
+type ETAQueue []*Task
+
+func (q ETAQueue) Len() int { return len(q) }
+func (q ETAQueue) Less(i, j int) bool {
+    if q[i].ETA.Equal(q[j].ETA) {
+        return q[i].Priority > q[j].Priority  // Same ETA, higher priority first
+    }
+    return q[i].ETA.Before(q[j].ETA)
+}
+func (q ETAQueue) Swap(i, j int) {
+    q[i], q[j] = q[j], q[i]
+    q[i].index = i
+    q[j].index = j
+}
+func (q *ETAQueue) Push(x any) {
+    t := x.(*Task)
+    t.index = len(*q)
+    *q = append(*q, t)
+}
+func (q *ETAQueue) Pop() any {
+    old := *q
+    n := len(old)
+    t := old[n-1]
+    old[n-1] = nil
+    t.index = -1
+    *q = old[:n-1]
+    return t
+}</code></pre>
+
+            <p>The Dispatcher's scheduling loop:</p>
+
+<pre><code>func (d *Dispatcher) Run() {
+    pq := &ETAQueue{}
+    heap.Init(pq)
+
+    for {
+        // 1. Consume new tasks from Kafka, push onto heap
+        for _, task := range d.consumeBatch() {
+            heap.Push(pq, task)
+        }
+
+        // 2. Pop all due tasks
+        now := time.Now()
+        for pq.Len() > 0 && (*pq)[0].ETA.Before(now) {
+            task := heap.Pop(pq).(*Task)
+            go d.dispatch(task)  // Async execution
+        }
+
+        // 3. Calculate next wake time: heap top's ETA or fallback 100ms
+        var sleepUntil time.Duration
+        if pq.Len() > 0 {
+            sleepUntil = time.Until((*pq)[0].ETA)
+            if sleepUntil < 0 {
+                sleepUntil = 0
+            }
+        } else {
+            sleepUntil = 100 * time.Millisecond
+        }
+        time.Sleep(sleepUntil)
+    }
+}</code></pre>
+
+            <p>Why a heap instead of a Timer Wheel:</p>
+
+            <ul>
+                <li><strong>Intuitive semantics</strong>: Each task has an ETA, and the heap top is always the next task to trigger. The code logic is clear — no need to understand concepts like cascade or tick.</li>
+                <li><strong>Flexible precision</strong>: Timer Wheel precision is limited by tick granularity (e.g., 100ms per slot), while the heap has no such limitation — ETA is precise to nanoseconds.</li>
+                <li><strong>Natural priority support</strong>: The <code>Less</code> function can compare both ETA and business priority simultaneously. Among tasks due within the same second, higher priority ones execute first.</li>
+                <li><strong>O(log n) is sufficient</strong>: Heap insertion and extraction are O(log n). For our scenario (typically thousands to tens of thousands of tasks in the heap), performance is not a bottleneck. Timer Wheel's O(1) advantage only shows at the millions-of-tasks scale.</li>
+                <li><strong>Go standard library built-in</strong>: <code>container/heap</code> already provides a complete interface, no extra dependencies needed.</li>
+            </ul>
+
+            <h3>Long-Delay Tasks: MySQL Poller</h3>
+
+            <p>Long-delay tasks are stored in MySQL with this core table structure:</p>
+
+<pre><code>CREATE TABLE async_tasks (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_type   VARCHAR(128) NOT NULL,
+    payload     TEXT NOT NULL,
+    trigger_at  DATETIME NOT NULL,    -- Trigger time
+    status      TINYINT DEFAULT 0,    -- 0=pending, 1=dispatched, 2=success, 3=failed
+    retry_count INT DEFAULT 0,
+    max_retries INT DEFAULT 3,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_trigger (status, trigger_at)
+);</code></pre>
+
+            <p>The Dispatcher's poller executes every second:</p>
+
+<pre><code>SELECT id, task_type, payload
+FROM async_tasks
+WHERE status = 0 AND trigger_at &lt;= NOW()
+ORDER BY trigger_at
+LIMIT 1000
+FOR UPDATE SKIP LOCKED;</code></pre>
+
+            <p><code>FOR UPDATE SKIP LOCKED</code> is the key — when multiple Dispatcher instances scan in parallel, rows already locked by other instances are skipped, avoiding the complexity of distributed locks. This is a feature introduced in MySQL 8.0, perfectly suited for this scenario.</p>
+
+            <p>Scanned tasks are immediately updated to <code>dispatched</code> status, then the business service's executor is called via RPC. If the RPC fails or times out, the task status reverts to <code>pending</code>, <code>retry_count</code> is incremented, and <code>trigger_at</code> is set to the current time plus a backoff delay (exponential backoff + jitter).</p>
+
+            <h3>Cron Scheduled Tasks</h3>
+
+            <p>Cron task implementation has two layers:</p>
+
+            <ol>
+                <li><strong>Cron Scheduler</strong>: Parses cron expressions, calculates the next trigger time, and writes to MySQL's <code>async_tasks</code> table. Essentially, it converts Cron tasks into long-delay tasks.</li>
+                <li><strong>Cron Registry</strong>: Stores cron rule metadata (cron expression, associated task_type, owner, etc.).</li>
+            </ol>
+
+<pre><code>// Cron Scheduler core loop
+func (s *CronScheduler) Run() {
+    for {
+        rules := s.loadActiveRules()  // Load from cron_registry
+        for _, rule := range rules {
+            next := rule.NextTriggerTime()
+            if !s.taskExistsForTime(rule.TaskType, next) {
+                s.createTask(rule.TaskType, rule.Payload, next)
+            }
+        }
+        time.Sleep(10 * time.Second)  // Check every 10 seconds
+    }
+}</code></pre>
+
+            <p>The beauty of this design is that the Cron Scheduler is stateless — it only ensures "the next trigger task exists in MySQL." Even if the Scheduler crashes and restarts, no tasks are lost because it's idempotent (checks existence before creating).</p>
+
+            <h3>SDK Design</h3>
+
+            <p>The Go SDK and Python SDK are the interfaces directly used by business teams. Design principle: be as simple as possible, hiding underlying complexity.</p>
+
+<pre><code>// Go SDK - Submit task
+client := asyncd.NewClient(asyncd.WithServiceName("order-service"))
+
+// Immediate task
+err := client.Submit(ctx, &asyncd.Task{
+    Type:    "cancel_expired_order",
+    Payload: `{"order_id": 12345}`,
+})
+
+// Delayed task
+err := client.SubmitDelayed(ctx, &asyncd.Task{
+    Type:    "send_review_reminder",
+    Payload: `{"user_id": 67890}`,
+}, 3 * 24 * time.Hour)  // 3 days later
+
+// Register executor
+client.RegisterExecutor("cancel_expired_order", func(ctx context.Context, payload string) error {
+    var req CancelOrderRequest
+    json.Unmarshal([]byte(payload), &req)
+    return orderService.Cancel(ctx, req.OrderID)
+})</code></pre>
+
+            <p>The SDK handles several things internally:</p>
+
+            <ul>
+                <li><strong>Serialization</strong>: Payload is uniformly JSON strings, avoiding cross-language serialization compatibility issues</li>
+                <li><strong>RPC integration</strong>: Services are registered through the company's internal RPC framework. When the Dispatcher calls executors, it goes through the standard RPC path (service discovery, load balancing, and timeout control are all handled by the framework)</li>
+                <li><strong>Idempotency reminders</strong>: SDK documentation and code reviews repeatedly emphasize — executors must be idempotent, because "at-least-once delivery" means the same task may be executed multiple times</li>
+            </ul>
+
+            <h3>Kubernetes Operator</h3>
+
+            <p>The system is deployed on Kubernetes. Initially we used standard Deployment + ConfigMap, but operational pain points quickly emerged:</p>
+
+            <ul>
+                <li>Onboarding new business required manually creating Kafka topics, updating routing configs, and adjusting consumer counts</li>
+                <li>Dispatcher partition assignment and MySQL poller concurrency needed dynamic adjustment based on QPS</li>
+                <li>Cron rule changes required restarting the Scheduler</li>
+            </ul>
+
+            <p>So we developed a Custom Operator, introducing a CRD:</p>
+
+<pre><code>apiVersion: asyncd.example.io/v1
+kind: AsyncJobConfig
+metadata:
+  name: order-cancel-job
+spec:
+  taskType: cancel_expired_order
+  executor:
+    service: order-service
+    method: CancelExpiredOrder
+    timeout: 30s
+  retry:
+    maxRetries: 3
+    backoff: exponential
+  kafka:
+    topic: asyncd-order-cancel
+    partitions: 6
+    consumerGroup: asyncd-order-cancel-cg</code></pre>
+
+            <p>The Operator watches CRD changes and automatically:</p>
+
+            <ul>
+                <li>Creates/updates Kafka topics and consumer groups</li>
+                <li>Updates the Dispatcher's routing table (via ConfigMap hot reload)</li>
+                <li>Automatically adjusts consumer replica count based on QPS metrics (HPA integration)</li>
+            </ul>
+
+            <p>This dramatically lowered the barrier for business onboarding — from "file a ticket for the platform team to configure" to "submit a YAML."</p>
+
+            <h3>Monitoring and Alerting</h3>
+
+            <p>Every component exposes Prometheus metrics:</p>
+
+<pre><code>// Task submission
+asyncd_task_submitted_total{task_type, source_service}
+asyncd_task_submit_latency_seconds{task_type}
+
+// Task scheduling
+asyncd_task_dispatched_total{task_type}
+asyncd_task_dispatch_delay_seconds{task_type}  // Actual trigger time - expected trigger time
+
+// Task execution
+asyncd_task_executed_total{task_type, status}   // status: success/failed/timeout
+asyncd_task_execution_duration_seconds{task_type}
+asyncd_task_retry_total{task_type}
+
+// Queue health
+asyncd_kafka_consumer_lag{topic, partition}
+asyncd_mysql_pending_tasks{task_type}
+asyncd_mysql_poll_duration_seconds</code></pre>
+
+            <p>The most critical alerting rules:</p>
+
+            <ul>
+                <li><strong>dispatch_delay > 5s</strong>: Task scheduling latency exceeds 5 seconds, indicating insufficient consumption capacity or a stuck MySQL poller</li>
+                <li><strong>kafka_consumer_lag continuously growing</strong>: Consumers can't keep up with producers, need to scale out</li>
+                <li><strong>mysql_pending_tasks continuously growing</strong>: Due tasks are piling up, poller may have issues</li>
+                <li><strong>task retry rate > 10%</strong>: Downstream service may be having problems</li>
+            </ul>
+
+            <h3>Double 11: From 25K to 50K QPS</h3>
+
+            <p>The 2021 Double 11 was the biggest test for this system. Daily QPS was around 25K, with an estimated peak requirement of 50K+.</p>
+
+            <p>Several things were done in advance:</p>
+
+            <ul>
+                <li><strong>Kafka partition expansion</strong>: Core topics went from 12 to 24 partitions, with corresponding consumer scaling</li>
+                <li><strong>MySQL read-write splitting</strong>: Poller queries go to replicas, status updates go to the primary, preventing scan queries from impacting writes</li>
+                <li><strong>Batch submission optimization</strong>: SDK added a <code>SubmitBatch</code> interface, submitting multiple tasks in a single RPC call, reducing network round trips</li>
+                <li><strong>Pre-warming</strong>: The day before Double 11, all Cron tasks' next trigger records were pre-created to avoid write spikes at midnight</li>
+            </ul>
+
+            <p>The actual peak reached approximately 48K QPS. The system held up with zero task loss. Key metrics:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Daily</th>
+                        <th>Double 11 Peak</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>QPS</td>
+                        <td>~25K</td>
+                        <td>~48K</td>
+                    </tr>
+                    <tr>
+                        <td>P99 scheduling latency</td>
+                        <td>180ms</td>
+                        <td>520ms</td>
+                    </tr>
+                    <tr>
+                        <td>Task loss</td>
+                        <td>0</td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td>Retry rate</td>
+                        <td>0.3%</td>
+                        <td>1.2%</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Pitfalls Encountered</h3>
+
+            <h3>1. MySQL datetime Precision</h3>
+
+            <p>MySQL's <code>DATETIME</code> defaults to second-level precision. When multiple tasks have <code>trigger_at</code> within the same second, the order of <code>ORDER BY trigger_at</code> is non-deterministic. For second-level delay tasks, this caused out-of-order execution. Solution: switch to <code>DATETIME(3)</code> (millisecond precision) and add <code>id</code> as a tiebreaker in <code>ORDER BY</code>.</p>
+
+            <h3>2. Kafka Rebalance Storms</h3>
+
+            <p>Early on, consumers didn't have reasonable <code>session.timeout.ms</code> and <code>heartbeat.interval.ms</code> settings. Occasional slow requests from business executors caused consumers to be deemed dead, triggering rebalances. During rebalance, all consumers stopped consuming, causing latency spikes. Finally adjusted to <code>session.timeout=30s</code>, <code>heartbeat.interval=10s</code>, <code>max.poll.interval=5min</code>, and executor calls were made asynchronous — messages are committed immediately after consumption, with execution results reported via callbacks.</p>
+
+            <h3>3. Poller Thundering Herd Effect</h3>
+
+            <p>Multiple Dispatcher instances scanning MySQL simultaneously — while <code>FOR UPDATE SKIP LOCKED</code> prevented duplicate execution, heavy lock contention caused MySQL CPU to spike. Solution: each Dispatcher instance handles specific <code>task_type</code> ranges (assigned via consistent hashing), preventing all instances from scanning the same data.</p>
+
+            <h3>4. Timezone Issues</h3>
+
+            <p>Shopee's business covers multiple Southeast Asian countries with different timezones. The cron expression <code>0 0 * * *</code> (daily at midnight) — which midnight exactly? Final solution: all internal times are stored and calculated in UTC. Cron rules must explicitly specify timezone <code>CRON_TZ=Asia/Singapore 0 0 * * *</code>. The SDK validates whether cron expressions include timezone information and rejects those that don't.</p>
+
+            <h3>5. The Difficulty of Promoting Idempotency</h3>
+
+            <p>Technically the simplest but hardest to promote. "At-least-once delivery" requires business executors to be idempotent, but many business developers didn't understand or didn't take it seriously. After launch, there were several incidents of "duplicate charges" and "duplicate coupon issuance," all because executors weren't idempotent. Eventually, the SDK layer was updated to require an <code>idempotency_key</code>, along with a Redis-based deduplication helper, reducing error probability at the tooling level.</p>
+
+            <h3>Retrospective and Reflections</h3>
+
+            <p>This system started design in mid-2019, had its first business integration in early 2020, and survived 50K QPS during the 2021 Double 11. A few insights from those three years:</p>
+
+            <ul>
+                <li><strong>Storage choice determines the system's ceiling</strong>: The Kafka + MySQL combination isn't glamorous, but it wins on maturity and reliability. In middleware systems, "never lose data" is far more important than "low latency." Kafka's persistence and at-least-once semantics are the foundation of this system — any alternative must pass this bar first.</li>
+                <li><strong>SDK usability determines the system's adoption speed</strong>: No matter how good the system is, if the SDK is cumbersome to use, business teams won't adopt it. Time spent on SDK design is never wasted.</li>
+                <li><strong>Kubernetes Operator is leverage for middleware teams</strong>: Encoding operational procedures as CRD + Controller allows business teams to self-serve onboarding, and the platform team is no longer the bottleneck. This pattern was later reused by other middleware (config center, message queue).</li>
+                <li><strong>Monitoring isn't an afterthought — it should be there from day one</strong>: The system had a complete Prometheus + Grafana dashboard from the first day of launch. Many early issues were discovered proactively through metrics, rather than waiting for business teams to report problems.</li>
+                <li><strong>Idempotency is a social problem, not a technical problem</strong>: You can provide tools, but ultimately business developers need to understand and take it seriously. Documentation, training, code reviews, and incident retrospectives are all essential.</li>
+            </ul>
+
+            <h3>If I Were to Do It Again</h3>
+
+            <p>The biggest lesson: <strong>model use cases clearly first, then make technology choices</strong>.</p>
+
+            <p>At the time, we treated "async tasks" as a unified concept for system design, but in reality, different tasks vary enormously in key attributes. If I were to start over, I would first spend enough time with business teams to map out each task type's core attributes:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Attribute</th>
+                        <th>Possible Values</th>
+                        <th>Design Decisions Affected</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Delay type</strong></td>
+                        <td>Immediate / Short delay / Long delay / Cron</td>
+                        <td>Storage choice (Kafka vs MySQL), scheduling strategy</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Priority</strong></td>
+                        <td>High (order cancellation) / Medium / Low (reports)</td>
+                        <td>Queue isolation strategy, resource allocation</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Uniqueness</strong></td>
+                        <td>Allow duplicates / Unique at a given time / Globally unique</td>
+                        <td>Deduplication mechanism, idempotency requirements</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Delivery semantics</strong></td>
+                        <td>At-least-once / At-most-once / Exactly-once</td>
+                        <td>Acknowledgment mechanism, retry strategy, message persistence</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Execution duration</strong></td>
+                        <td>Milliseconds / Seconds / Minutes+</td>
+                        <td>Timeout settings, heartbeat detection, resource isolation</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Failure handling</strong></td>
+                        <td>Retry / Discard / Manual intervention</td>
+                        <td>Retry strategy, dead letter queue, alerting rules</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Dependencies</strong></td>
+                        <td>Independent / Has prerequisites / DAG</td>
+                        <td>Task orchestration, state machine</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>Different combinations of these attributes mean completely different design trade-offs. A few examples:</p>
+
+            <ul>
+                <li><strong>Order timeout cancellation</strong> (short delay + high priority + globally unique + at-least-once): Needs a dedicated high-priority queue, the deduplication mechanism must be reliable, and messages absolutely cannot be lost — Kafka is the right choice, Redis won't do.</li>
+                <li><strong>Statistics report generation</strong> (Cron + low priority + allow duplicates + at-most-once): Running twice doesn't matter, but it shouldn't block high-priority tasks — needs queue isolation rather than sharing with order tasks.</li>
+                <li><strong>Data export</strong> (immediate + long execution time + has prerequisites): Needs heartbeat detection to prevent false timeout detection, needs DAG orchestration rather than manual chaining.</li>
+            </ul>
+
+            <p>Our mistake was cramming these vastly different tasks into a single model. The result: high-priority tasks blocked by low-priority tasks (no queue isolation), tasks requiring uniqueness executed repeatedly (no deduplication mechanism), tasks needing orchestration manually chained by business teams (no DAG support).</p>
+
+            <p>Other specific improvements:</p>
+
+            <ul>
+                <li><strong>Introduce a dead letter queue</strong>: Tasks that exhaust retries should enter a dead letter queue instead of just being marked as failed. Without this mechanism, some failed tasks were forgotten.</li>
+                <li><strong>Isolate queues by priority</strong>: High-priority tasks should use dedicated Kafka topics and consumer groups to avoid being slowed by low-priority task backlogs. This was added later, but if identified during the use case modeling phase, the implementation would have been much cleaner.</li>
+                <li><strong>Task uniqueness constraints</strong>: Provide declarative uniqueness configuration (e.g., <code>unique_key = "order:{order_id}"</code>), with the system guaranteeing that tasks with the same key won't be executed repeatedly, rather than relying entirely on business-side idempotency.</li>
+                <li><strong>DAG-style task orchestration</strong>: Business frequently needs "trigger task B after task A completes." At the time, business teams manually submitted the next task in their executors, which was error-prone. Declarative DAG orchestration capabilities should have been provided.</li>
+            </ul>
+
+            <p>In one sentence: <strong>technology choices serve use cases, not the other way around</strong>. Spend time first to clearly map out the task attribute matrix, think through the trade-offs for each combination, then start writing code. This is far more valuable than immediately agonizing over "Kafka or Redis."</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

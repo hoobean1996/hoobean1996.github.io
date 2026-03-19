@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema 駆動フォーム（上）：データモデルとレンダラー - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Schema 駆動フォーム（上）：データモデルとレンダラー</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/roman-mosaic-floor.jpg" alt="Roman Mosaic Floor Panel, 2nd century CE">
+                <figcaption>ローマのモザイク床、紀元 2 世紀 — 一つひとつの小石が厳格なルールに従って配置され、完全な模様を作り出す。Schema 駆動のフォームも同様：構造化されたルールで柔軟なインターフェースを組み立てる</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：B 向けプロダクトのフォーム要件は尽きることがない——登録、承認、アンケート、設定、シナリオごとに異なる。各フォームにコンポーネントを書くのではなく、JSON Schema でフォーム構造を記述し、フロントエンドが自動レンダリングする方が良い。この記事では本番検証済みのデータモデルを共有する：FormSpec → Question → QuestionResponse の 3 層構造で、15 以上のフィールドタイプ、ページ分割、バリデーションをサポートし、非開発者も JSON を編集してフォームを作成できる。
+            </blockquote>
+
+            <h3>問題の出発点</h3>
+
+            <p>ほぼすべての B 向けプロダクトが同じ問題に直面する：<strong>フォームが多すぎる</strong>。</p>
+
+            <p>登録フォーム、承認フォーム、アンケート、設定ページ、データ入力……各ビジネスシナリオにフォームが必要で、各フォームのフィールド、バリデーションルール、レイアウトが異なる。各フォームを手書きで React コンポーネントにすると、コード量が爆発的に増え、フィールドを 1 つ変えるだけでリリースが必要になる。</p>
+
+            <p>さらに悪いことに、多くのフォームの作成者は開発者ではない——プロダクトマネージャー、運用担当者、HR である。彼らが必要としているのは「ドラッグ&ドロップでフォームを作れる」ツールであり、開発スケジュールを待つことではない。</p>
+
+            <p>これが Schema 駆動フォームの出番：<strong>JSON でフォームの構造を記述し、フロントエンドがその JSON に基づいて完全なフォームを自動レンダリングする</strong>。フィールド変更？JSON を変更。バリデーション追加？JSON を変更。レイアウト変更？やはり JSON を変更。コードの変更もリリースも不要。</p>
+
+            <h3>核心的アイデア</h3>
+
+            <p>Schema 駆動フォームの核心はシンプルな分離：</p>
+
+<pre><code>フォーム定義（What） →  JSON Schema  →  データベースに保存
+フォームレンダリング（How） →  汎用レンダラー →  1 セットのコードですべてのフォームに対応
+フォームデータ（Data） →  JSON レスポンス →  構造化された保存とクエリ</code></pre>
+
+            <p>これら 3 つの関係：</p>
+
+<pre><code>┌─────────────────────────────────────────────────────┐
+│                    Form Builder                      │
+│  PM/運用がビジュアルインターフェースでフォームを作成          │
+│  出力：FormSpec（JSON Schema）                        │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                    Form Schema                       │
+│  {                                                   │
+│    "title": "入社情報収集",                             │
+│    "groups": [                                       │
+│      { "label": "基本情報",                            │
+│        "questions": [                                │
+│          { "type": "short_text", "label": "氏名",     │
+│            "required": true },                       │
+│          { "type": "date", "label": "入社日" },        │
+│          { "type": "drop_down", "label": "部署",      │
+│            "options": ["エンジニアリング", "プロダクト", "デザイン"] } │
+│        ] }                                           │
+│    ]                                                 │
+│  }                                                   │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                  Form Renderer                       │
+│  Schema に基づいてフォーム UI を自動レンダリング            │
+│  ユーザー入力を収集 → FormResponse                      │
+└─────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>データモデル設計</h3>
+
+            <p>完全な Schema 駆動フォームシステムには 3 層のデータモデルが必要：</p>
+
+            <p><strong>第 1 層：FormSpec（フォーム定義）</strong></p>
+
+<pre><code>// FormSpec —— 1 つのフォームのメタデータ
+type FormSpec struct {
+    ID          int
+    Name        string       // "入社情報収集"
+    Description string       // フォーム説明
+    Cover       string       // カバー画像 URL
+    Enabled     bool         // 有効かどうか
+    CreatedBy   int          // 作成者
+    Groups      []QuestionGroup  // 質問グループ
+}
+
+// QuestionGroup —— 質問グループ（フォームのページ分けまたはセクション分けに使用）
+type QuestionGroup struct {
+    ID        int
+    Label     string       // "基本情報" / "職歴"
+    Order     int          // ソート順
+    Questions []Question
+}</code></pre>
+
+            <p><strong>第 2 層：Question（質問定義）</strong></p>
+
+<pre><code>type QuestionType string
+
+const (
+    ShortText   QuestionType = "short_text"
+    Paragraph   QuestionType = "paragraph"
+    MultiChoice QuestionType = "multi_choice"
+    Checkboxes  QuestionType = "checkboxes"
+    DropDown    QuestionType = "drop_down"
+    FileUpload  QuestionType = "file"
+    LinearScale QuestionType = "linear_scale"
+    Date        QuestionType = "date"
+    Time        QuestionType = "time"
+)
+
+type Question struct {
+    ID       int
+    Label    string         // "あなたの氏名"
+    Type     QuestionType   // "short_text"
+    Required bool           // 必須かどうか
+    Options  []string       // 選択肢の選択肢
+    Config   QuestionConfig // 追加設定
+}
+
+type QuestionConfig struct {
+    Placeholder  string  // 入力ヒント
+    MinLength    *int    // 最小長
+    MaxLength    *int    // 最大長
+    MinValue     *int    // linear_scale 最小値
+    MaxValue     *int    // linear_scale 最大値
+    FileTypes    []string // 許可されるファイルタイプ
+}</code></pre>
+
+            <p><strong>第 3 層：QuestionResponse（ユーザーの回答）</strong></p>
+
+<pre><code>type QuestionResponse struct {
+    ID             int
+    QuestionID     int      // Question に関連付け
+    FormInstanceID int      // 特定の記入に関連付け
+    Label          string   // 質問ラベルの冗長保存（クエリの便宜のため）
+    Value          string   // ユーザーの回答（統一的に string で保存）
+}
+
+type FormInstance struct {
+    ID         int
+    FormSpecID int          // FormSpec に関連付け
+    SubmittedBy int         // 記入者
+    SubmittedAt time.Time
+    Responses  []QuestionResponse
+}</code></pre>
+
+            <p>ここに重要な設計上の決定がある：<strong>QuestionResponse.Value を統一的に string で保存する</strong>。日付、数値、複数選択のいずれもすべて文字列にシリアライズする。この利点は schema がシンプルで、各タイプに異なるカラムを作る必要がないこと。欠点はクエリ時にデシリアライズが必要だが、フォームのシナリオでは、ほとんどのクエリは「特定の記入のすべての回答をエクスポート」であり、「年齢が 25 歳以上のすべての回答を見つける」ではないため、このトレードオフは価値がある。</p>
+
+            <h3>フロントエンドレンダラー</h3>
+
+            <p>レンダラーの核心は switch 文——Question の type フィールドに基づいて異なる UI コンポーネントをレンダリングする：</p>
+
+<pre><code>// Question.tsx
+function Question({ question, value, onChange }) {
+  switch (question.type) {
+    case "short_text":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}{question.required && " *"}&lt;/label&gt;
+          &lt;input
+            type="text"
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            placeholder={question.config?.placeholder}
+            required={question.required}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    case "paragraph":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;textarea
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            rows={4}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    case "multi_choice":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          {question.options.map(opt => (
+            &lt;label key={opt} className="radio-option"&gt;
+              &lt;input
+                type="radio"
+                name={`q-${question.id}`}
+                value={opt}
+                checked={value === opt}
+                onChange={() => onChange(opt)}
+              /&gt;
+              {opt}
+            &lt;/label&gt;
+          ))}
+        &lt;/div&gt;
+      );
+
+    case "checkboxes":
+      const selected = value ? JSON.parse(value) : [];
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          {question.options.map(opt => (
+            &lt;label key={opt} className="checkbox-option"&gt;
+              &lt;input
+                type="checkbox"
+                checked={selected.includes(opt)}
+                onChange={() => {
+                  const next = selected.includes(opt)
+                    ? selected.filter(s => s !== opt)
+                    : [...selected, opt];
+                  onChange(JSON.stringify(next));
+                }}
+              /&gt;
+              {opt}
+            &lt;/label&gt;
+          ))}
+        &lt;/div&gt;
+      );
+
+    case "drop_down":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;select value={value} onChange={e => onChange(e.target.value)}&gt;
+            &lt;option value=""&gt;選択してください&lt;/option&gt;
+            {question.options.map(opt => (
+              &lt;option key={opt} value={opt}&gt;{opt}&lt;/option&gt;
+            ))}
+          &lt;/select&gt;
+        &lt;/div&gt;
+      );
+
+    case "date":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;input type="date" value={value} onChange={e => onChange(e.target.value)} /&gt;
+        &lt;/div&gt;
+      );
+
+    case "file":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;input
+            type="file"
+            accept={question.config?.fileTypes?.join(",")}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (file) uploadAndGetUrl(file).then(onChange);
+            }}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    default:
+      return &lt;div&gt;Unsupported question type: {question.type}&lt;/div&gt;;
+  }
+}</code></pre>
+
+            <p>この switch 文は一見「愚直」に見えるが、これこそが利点：<strong>各タイプのレンダリングロジックが完全に独立し、互いに干渉しない</strong>。新しいタイプを追加？case を追加。あるタイプの UI を変更？その case だけを変更。「ラジオボタンの修正がチェックボックスに影響する」という問題は存在しない。</p>
+
+            <h3>完全なフォームレンダリング</h3>
+
+            <p>Question コンポーネントを組み合わせて、フォーム全体をレンダリングする：</p>
+
+<pre><code>function FormRenderer({ formSpec }) {
+  const [responses, setResponses] = useState({});
+
+  const handleChange = (questionId, value) => {
+    setResponses(prev => ({ ...prev, [questionId]: value }));
+  };
+
+  const handleSubmit = async () => {
+    // 必須項目のバリデーション
+    for (const group of formSpec.groups) {
+      for (const q of group.questions) {
+        if (q.required && !responses[q.id]) {
+          alert(`入力してください：${q.label}`);
+          return;
+        }
+      }
+    }
+
+    // 送信データの構築
+    const payload = Object.entries(responses).map(([qId, value]) => ({
+      questionId: parseInt(qId),
+      value: String(value),
+    }));
+
+    await submitFormResponse(formSpec.id, payload);
+  };
+
+  return (
+    &lt;form onSubmit={e => { e.preventDefault(); handleSubmit(); }}&gt;
+      &lt;h2&gt;{formSpec.name}&lt;/h2&gt;
+      &lt;p&gt;{formSpec.description}&lt;/p&gt;
+
+      {formSpec.groups.map(group => (
+        &lt;fieldset key={group.id}&gt;
+          &lt;legend&gt;{group.label}&lt;/legend&gt;
+          {group.questions.map(q => (
+            &lt;Question
+              key={q.id}
+              question={q}
+              value={responses[q.id] || ""}
+              onChange={v => handleChange(q.id, v)}
+            /&gt;
+          ))}
+        &lt;/fieldset&gt;
+      ))}
+
+      &lt;button type="submit"&gt;送信&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+            <h3>バックエンド API 設計</h3>
+
+            <p>GraphQL で API を設計するのは非常に自然で、フォームのデータ構造自体がネストされているため：</p>
+
+<pre><code>type FormSpec {
+  id: ID!
+  name: String!
+  description: String
+  enabled: Boolean!
+  groups: [QuestionGroup!]!
+}
+
+type QuestionGroup {
+  id: ID!
+  label: String!
+  order: Int!
+  questions: [Question!]!
+}
+
+type Question {
+  id: ID!
+  label: String!
+  type: QuestionType!
+  required: Boolean!
+  options: [String!]
+  config: QuestionConfig
+}
+
+enum QuestionType {
+  SHORT_TEXT
+  PARAGRAPH
+  MULTI_CHOICE
+  CHECKBOXES
+  DROP_DOWN
+  FILE
+  LINEAR_SCALE
+  DATE
+  TIME
+}
+
+# クエリ
+type Query {
+  formSpec(id: ID!): FormSpec
+  formInstances(formSpecId: ID!): [FormInstance!]!
+}
+
+# 送信
+input QuestionResponseInput {
+  questionId: ID!
+  value: String!
+}
+
+type Mutation {
+  submitForm(formSpecId: ID!, responses: [QuestionResponseInput!]!): FormInstance!
+}</code></pre>
+
+            <p>GraphQL のネストクエリにより、フロントエンドは 1 回のリクエストで完全なフォーム定義（FormSpec → Groups → Questions）を取得でき、複数回のラウンドトリップが不要。Relay や Apollo の fragment メカニズムと組み合わせると、Question コンポーネントが必要なデータを宣言し、フレームワークが自動的にクエリを統合する。</p>
+
+            <h3>ORM コード生成でバックエンドを簡素化</h3>
+
+            <p>Go + Ent ORM を使えば、schema 定義から直接 CRUD コードと GraphQL リゾルバーを生成できる：</p>
+
+<pre><code>// ent/schema/formspec.go
+func (FormSpec) Fields() []ent.Field {
+    return []ent.Field{
+        field.String("name").NotEmpty(),
+        field.String("description").Optional(),
+        field.String("cover").Optional(),
+        field.Bool("enabled").Default(true),
+        field.Time("created_at").Default(time.Now),
+        field.Int("created_by"),
+    }
+}
+
+func (FormSpec) Edges() []ent.Edge {
+    return []ent.Edge{
+        edge.To("question_groups", QuestionGroup.Type),
+    }
+}
+
+// ent/schema/question.go
+func (Question) Fields() []ent.Field {
+    return []ent.Field{
+        field.String("label").NotEmpty(),
+        field.Enum("type").Values(
+            "short_text", "paragraph", "multi_choice",
+            "checkboxes", "drop_down", "file",
+            "linear_scale", "date", "time",
+        ),
+        field.Bool("required").Default(false),
+        field.JSON("options", []string{}).Optional(),
+    }
+}</code></pre>
+
+            <p>Ent はこれらの schema 定義から自動生成する：データベースマイグレーション、Go 型定義、CRUD メソッド、GraphQL type とリゾルバー（entgql と組み合わせ）。schema から使用可能な API まで、ほとんどグルーコードを書く必要がない。</p>
+
+            <h3>バリデーション戦略</h3>
+
+            <p>フォームバリデーションは 2 層に分かれる：</p>
+
+            <p><strong>フロントエンドバリデーション（即時フィードバック）：</strong></p>
+
+<pre><code>function validate(question, value) {
+  if (question.required && !value) {
+    return `${question.label} は必須項目です`;
+  }
+
+  const config = question.config;
+  if (!config) return null;
+
+  switch (question.type) {
+    case "short_text":
+    case "paragraph":
+      if (config.minLength && value.length < config.minLength)
+        return `最低 ${config.minLength} 文字入力してください`;
+      if (config.maxLength && value.length > config.maxLength)
+        return `最大 ${config.maxLength} 文字まで入力できます`;
+      break;
+
+    case "file":
+      if (config.fileTypes && !config.fileTypes.some(t => value.endsWith(t)))
+        return `${config.fileTypes.join(", ")} 形式のみ対応しています`;
+      break;
+  }
+  return null;
+}</code></pre>
+
+            <p><strong>バックエンドバリデーション（安全保証）：</strong></p>
+
+<pre><code>func ValidateResponse(spec *ent.FormSpec, responses []ResponseInput) error {
+    questionMap := buildQuestionMap(spec)
+
+    for _, resp := range responses {
+        q, ok := questionMap[resp.QuestionID]
+        if !ok {
+            return fmt.Errorf("unknown question ID: %d", resp.QuestionID)
+        }
+        if q.Required && resp.Value == "" {
+            return fmt.Errorf("question %q is required", q.Label)
+        }
+        if err := validateType(q.Type, resp.Value); err != nil {
+            return fmt.Errorf("question %q: %w", q.Label, err)
+        }
+    }
+
+    // すべての必須項目に回答があるかチェック
+    for id, q := range questionMap {
+        if q.Required && !hasResponse(responses, id) {
+            return fmt.Errorf("missing required question: %q", q.Label)
+        }
+    }
+    return nil
+}</code></pre>
+
+            <p>フロントエンドバリデーションはユーザー体験のため（サーバーへのラウンドトリップなしでエラーを確認できる）、バックエンドバリデーションはデータ整合性のため（フロントエンドバリデーションはバイパスできる）。どちらも省略できない。</p>
+
+            <h3>実際に遭遇する問題</h3>
+
+            <ul>
+                <li><strong>Schema のバージョン管理</strong>：フォーム公開後に Schema を変更した場合（例えば質問の削除）、既に送信された Response はどうなるか？一般的なアプローチは元バージョンを修正するのではなく新バージョンを作成するか、質問を soft delete して過去の回答は保持する。</li>
+                <li><strong>条件ロジック</strong>：現実のフォームには「A を選んだ場合、質問 X を表示」というロジックが頻繁にある。Schema に <code>visibility_rules</code> フィールドを追加し、レンダラーが現在の回答に基づいて質問を動的に表示/非表示にする必要がある。これが複雑さの主な源。</li>
+                <li><strong>パフォーマンス</strong>：大きなフォーム（100 以上の質問）をレンダリングする際、各 Question コンポーネントの再レンダリングがボトルネックになる。解決策：<code>React.memo</code> + onChange コールバックを <code>useCallback</code> でラップし、値が変化した Question のみが再レンダリングされるようにする。</li>
+                <li><strong>ファイルアップロード</strong>：ファイルタイプの質問には特別な処理が必要——まず OSS にアップロードして URL を取得し、その URL を value として保存する。つまりファイルアップロードとフォーム送信は 2 つの独立したフローである。</li>
+                <li><strong>エクスポートと分析</strong>：フォームデータは最終的に Excel へのエクスポートや統計分析が必要。Value が string 型のため、エクスポート時に Question Type に基づいてフォーマットする必要がある（日付を Date 形式に変換、複数選択をカンマ区切りに変換など）。</li>
+            </ul>
+
+            <h3>市場のソリューションとの比較</h3>
+
+            <table>
+                <tr>
+                    <th>ソリューション</th>
+                    <th>Schema 保存</th>
+                    <th>レンダリング</th>
+                    <th>適用シナリオ</th>
+                </tr>
+                <tr>
+                    <td>Google Forms</td>
+                    <td>プロプライエタリ形式</td>
+                    <td>Google ホスティング</td>
+                    <td>シンプルなアンケート</td>
+                </tr>
+                <tr>
+                    <td>JSON Schema + react-jsonschema-form</td>
+                    <td>標準 JSON Schema</td>
+                    <td>自動生成</td>
+                    <td>開発者ツール、設定フォーム</td>
+                </tr>
+                <tr>
+                    <td>Formily / XRender</td>
+                    <td>カスタム DSL</td>
+                    <td>ビジュアルエディタ + レンダラー</td>
+                    <td>エンタープライズ級の複雑なフォーム</td>
+                </tr>
+                <tr>
+                    <td>自作 FormSpec モデル</td>
+                    <td>データベース + ORM</td>
+                    <td>カスタムレンダラー</td>
+                    <td>深いカスタマイズが必要なプロダクト</td>
+                </tr>
+            </table>
+
+            <p><code>react-jsonschema-form</code> は標準 JSON Schema（Draft 7）を使用しており、エコシステムが良くバリデーションライブラリ（ajv）が既にある。しかし標準 JSON Schema はデータ構造の記述のために設計されたもので、フォーム UI の記述のためではない——「グループ」「プレースホルダー」「条件表示」といった概念がなく、<code>uiSchema</code> で補完する必要がある。</p>
+
+            <p>自作 FormSpec モデルの利点はデータ構造を完全にコントロールでき、ビジネス要件に合わせた深いカスタマイズが可能なこと（承認フローの追加、権限制御の追加、テンプレートマーケットの追加など）。コストはレンダラーとバリデーションロジックを自分で書く必要があること。</p>
+
+            <h3>アーキテクチャ上の考察</h3>
+
+            <ul>
+                <li><strong>Schema が契約</strong>：FormSpec がフロントエンドとバックエンドの唯一の契約。バックエンドはフロントエンドのレンダリング方法を知る必要がなく、フロントエンドはバックエンドの保存方法を知る必要がない。Schema のフォーマットが変わらなければ、両側が独立して進化できる。</li>
+                <li><strong>コード生成 vs 手書き</strong>：Ent + gqlgen のようなコード生成ツールを使えば、Schema 定義から API エンドポイントまでほぼ全自動。手書きの CRUD コードには何の価値もない——マシンに生成させ、ビジネスロジックにエネルギーを注ぐ。</li>
+                <li><strong>Switch 文の美学</strong>：レンダラーの大きな switch は「原始的」に見えるが、正しい抽象レベルである。「レジストリパターン」や「プラグインシステム」に過度に抽象化してはいけない——サードパーティ開発者に質問タイプを拡張させる必要がない限り。ほとんどの場合、9 種類で十分。</li>
+                <li><strong>Value の string 保存について</strong>：これは古典的な「柔軟性 vs クエリ能力」のトレードオフ。回答に対する複雑なクエリが必要な場合（「A オプションを選択したすべてのユーザーを見つける」）、PostgreSQL の JSONB 型の使用や、送信時に分析用のワイドテーブルに追加で書き込むことを検討できる。</li>
+            </ul>
+
+            <h3>まとめ</h3>
+
+            <p>Schema 駆動フォームの本質は、古くからのソフトウェアエンジニアリングの思想の具体的な応用：<strong>データと振る舞いの分離</strong>。フォームの構造（データ）は Schema で記述し、フォームのレンダリングとバリデーション（振る舞い）は汎用コードで処理する。これにより非開発者がフォームを作成・変更でき、開発者は 1 セットのコードですべてのフォームシナリオに対応できる。</p>
+
+            <p>このパターンはフォームに限らない。設定ページ、承認フロー、データダッシュボード——「構造は変わるが振る舞いは固定」のあらゆるシナリオに Schema 駆動のアプローチが使える。核心は常に：良い Schema を定義し、良いレンダラーを書くこと。</p>
+
+            <p>しかし現時点では、我々の Schema はフラットなフォームフィールドしか記述できない。条件レンダリング、動的表現、レイアウトのネスト、インタラクションアクションが必要な場合は？次の記事で Schema の能力を UI ツリー全体に拡張する。</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>次回：</strong><a href="schema-driven-ui.html">Schema 駆動フォーム（下）：表現エンジンと汎用 UI レンダリング</a>
+            </p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

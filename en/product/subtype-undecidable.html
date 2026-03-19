@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Why Is Subtype Checking Undecidable with Union + Intersection Types? - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Why Is Subtype Checking Undecidable with Union + Intersection Types?</h2>
+            <time>2026-03-13</time>
+
+            <figure class="post-cover">
+                <img src="../../images/el-greco-jerome-scholar.jpg" alt="Saint Jerome as Scholar, El Greco, c. 1610">
+                <figcaption>El Greco, "Saint Jerome as Scholar", c. 1610 — The scholar's open tomes pile layer upon layer, each page potentially leading to new annotations and cross-references, never-ending. This mirrors subtype checking's predicament with union + intersection + recursive types: each type expansion can produce new branches, new choices, new expansions — without end</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: If you've used TypeScript, you may have encountered the type checker getting stuck, producing inexplicable errors, or the IDE just spinning. This isn't a bug — it's a fundamental limitation of the type system. When a type system simultaneously supports union (<code>|</code>), intersection (<code>&</code>), function types, and recursive types, subtype checking is theoretically undecidable. This article derives this conclusion in a way engineers can understand: starting from the simplest subtype system, progressively adding union, intersection, function contravariance, and recursive types, showing how each step makes the problem harder, ultimately exceeding what algorithms can handle. Understanding this "why" can help you understand why TypeScript makes certain design compromises, and how to avoid writing types that make the compiler explode.
+            </blockquote>
+
+            <h3>Problem Definition: Subtype Checking Is a Decision Problem</h3>
+
+            <p>Let's be clear about the problem. <strong>Subtype checking</strong> means answering a yes/no question: given types A and B, does <code>A &lt;: B</code> hold?</p>
+
+            <p>You do this every day. When you write TypeScript:</p>
+
+<pre><code>function greet(name: string) { ... }
+greet(42)  // Compile error: number is not a subtype of string</code></pre>
+
+            <p>What the compiler does behind the scenes is subtype checking: <code>number &lt;: string</code>? Doesn't hold, error.</p>
+
+            <p><strong>Decidable</strong> means there exists an algorithm that, for any input A and B, can give the correct answer in finite steps. <strong>Undecidable</strong> means no such algorithm exists — for certain inputs, any correct algorithm will either never finish computing or give a wrong answer.</p>
+
+            <p>The core question this article answers: <strong>why does subtype checking become undecidable after adding union and intersection types?</strong></p>
+
+            <h3>Baseline: Simple Subtype Systems Are Decidable</h3>
+
+            <p>First, the simplest case. Types are only base types and function types:</p>
+
+<pre><code>Type ::= number | string | A → B</code></pre>
+
+            <p>Subtype rules are straightforward:</p>
+
+<pre><code>number &lt;: number                                // Reflexivity
+string &lt;: string                                // Reflexivity
+A → B &lt;: C → D   if and only if   C &lt;: A and B &lt;: D   // Function type</code></pre>
+
+            <p>The function type rule is worth pausing on: <strong>parameters are contravariant, return values are covariant</strong>. The intuition is — if you need a function that "eats Cat and produces Animal," then a function that "eats Animal and produces Cat" can substitute, because it can eat more (accepts broader input) and produces something more precise (returns more specific output).</p>
+
+            <p>Subtype checking for this system is obviously decidable: each rule application makes types smaller, there are no loops, no branches, solved in linear time. The key is that this process is <strong>syntax-directed</strong> — the type's structure directly tells you which rule to use, no choices needed.</p>
+
+            <h3>First Complication: Union and Intersection Introduce Search</h3>
+
+            <h4>Union Type: Disjunction / OR</h4>
+
+            <p><code>A | B</code> means "is A or is B." It's everywhere in TypeScript:</p>
+
+<pre><code>type Result = Success | Error
+type ID = string | number</code></pre>
+
+            <p>Subtype rules:</p>
+
+<pre><code>A &lt;: A | B          // Left injection: A is obviously "A or B"
+B &lt;: A | B          // Right injection
+A | B &lt;: C  requires  A &lt;: C and B &lt;: C   // Union elimination: both branches must satisfy</code></pre>
+
+            <p>But the reverse is tricky — when determining <code>C &lt;: A | B</code>, you can't simply check <code>C &lt;: A</code> or <code>C &lt;: B</code>. Look at this example:</p>
+
+<pre><code>(string | number) &lt;: (string | number)   // ✅ holds
+(string | number) &lt;: string              // ❌ doesn't hold
+(string | number) &lt;: number              // ❌ also doesn't hold</code></pre>
+
+            <p>You need to break apart C's "members" and check that each belongs to either A or B. This is no longer a single-step decision — you need search.</p>
+
+            <h4>Intersection Type: Conjunction / AND</h4>
+
+            <p><code>A &amp; B</code> means "is both A and B simultaneously." Common in TypeScript's mixin pattern:</p>
+
+<pre><code>type Serializable = { serialize(): string }
+type Loggable = { log(): void }
+type Entity = Serializable &amp; Loggable  // Satisfies both interfaces</code></pre>
+
+            <p>Subtype rules:</p>
+
+<pre><code>A &amp; B &lt;: A          // Left projection
+A &amp; B &lt;: B          // Right projection
+C &lt;: A &amp; B  requires  C &lt;: A and C &lt;: B   // Intersection introduction</code></pre>
+
+            <p>The reverse direction has the same problem: <code>A &amp; B &lt;: C</code> can't be simply split into <code>A &lt;: C</code> or <code>B &lt;: C</code>.</p>
+
+            <h4>First Key Change: Subtype Checking Becomes a Search Problem</h4>
+
+            <p>In the simple system before, each derivation step's rule was uniquely determined. Now with union and intersection, choices must be made:</p>
+
+            <ul>
+                <li>When determining <code>C &lt;: A | B</code>, you may need to "guess" which part of C goes to A and which to B</li>
+                <li>When determining <code>A &amp; B &lt;: C</code>, you may need to "choose" whether to use A's information or B's</li>
+            </ul>
+
+            <p>Subtype checking goes from "deterministic computation" to "search problem." But mere search isn't enough — NP problems are also search problems but still decidable (just slow). Reaching undecidability requires more.</p>
+
+            <h3>The Critical Step: Function Contravariance Flips Union and Intersection</h3>
+
+            <p>This is the most critical step in the entire derivation chain. Function type parameters are contravariant, and when this property collides with union/intersection, it produces an important set of equivalences (distributive laws):</p>
+
+<pre class="diagram"><code>  Distributive laws (function parameter position = contravariant position):
+
+  (A | B) → C   ≡   (A → C) &amp; (B → C)     ① union through parameter → becomes intersection
+  (A &amp; B) → C   ≡   (A → C) | (B → C)     ② intersection through parameter → becomes union
+
+  Distributive laws (function return position = covariant position):
+
+  A → (B | C)   ≡   (A → B) | (A → C)     ③ union stays union
+  A → (B &amp; C)   ≡   (A → B) &amp; (A → C)     ④ intersection stays intersection</code></pre>
+
+            <p>Equations 1 and 2 are the killer. They mean: <strong>each time you pass through a function type's parameter position, union and intersection flip once</strong>.</p>
+
+            <p>Engineering intuition for equation 1: A function accepting <code>string | number</code> is essentially a function that can handle both string and number — it's equivalent to "being both <code>string → C</code> and <code>number → C</code>." So union in the parameter position becomes intersection overall.</p>
+
+            <p>This causes the search nature of subtype determination to keep flipping:</p>
+
+<pre class="diagram"><code>  Level 0: Need to verify an AND condition (intersection)
+     │
+     ▼  Pass through one layer of function parameter
+  Level 1: Becomes an OR choice (union)
+     │
+     ▼  Pass through another layer of function parameter
+  Level 2: Flips back to AND condition (intersection)
+     │
+     ▼
+    ...alternating</code></pre>
+
+            <p>This is no longer simple SAT-style search (pure OR branches), but an <strong>AND-OR alternating search</strong> — similar to a game tree (I make a move, opponent makes a move, I make another move...). Game tree determination is much harder than SAT.</p>
+
+            <h3>Adding Fuel: Recursive Types Provide Infinite Expansion</h3>
+
+            <p>So far, if all types are finite-sized (no recursion), the search tree is complex but bounded in depth — still decidable (possibly EXPTIME or higher, but will always terminate).</p>
+
+            <p>Recursive types break this limitation. They allow types to reference themselves:</p>
+
+<pre><code>// Recursive types in TypeScript
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
+
+// Formal notation
+type List = μX. Nil | Cons(number, X)    // Fixed point of X = Nil | Cons(number, X)</code></pre>
+
+            <p>Under equi-recursive semantics (the most common interpretation), a recursive type equals its one-step expansion:</p>
+
+<pre><code>μX. F(X)  =  F(μX. F(X))    // Can expand infinitely</code></pre>
+
+            <p>This means <strong>types can grow infinitely</strong>. Combined with the earlier conclusion:</p>
+
+            <ol>
+                <li>Each pass through a function parameter position flips union/intersection once</li>
+                <li>Recursive types can expand infinitely, continuously producing new function layers</li>
+                <li>Each expansion introduces new union/intersection branches</li>
+                <li>The AND/OR nature of branches alternates with expansion depth</li>
+                <li><strong>There is no natural termination condition</strong></li>
+            </ol>
+
+            <p>A concrete example:</p>
+
+<pre><code>type T = μX. (X → X) | number
+
+// Expand once:
+T = (T → T) | number
+
+// Expand T → T's T:
+T = (((T → T) | number) → ((T → T) | number)) | number
+
+// Each expansion produces new unions, passing through → flips to intersection, continues...</code></pre>
+
+            <p>A subtype checking algorithm facing this type can infinitely expand, flip, and branch. Any algorithm attempting to decide <code>A &lt;: B</code> may run forever on such recursive structures.</p>
+
+            <h3>The Ultimate Question: Why Can It Encode a Turing Machine</h3>
+
+            <p>The previous four steps gave us all the parts. Now let's see how they assemble into Turing-complete computation.</p>
+
+            <h4>What a Turing Machine Needs vs. What the Type System Provides</h4>
+
+            <table>
+                <thead>
+                    <tr><th>Turing Machine Component</th><th>Type System Counterpart</th><th>Provided By</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Finite states</td><td>Different type constructions (different branches of union)</td><td>Union types</td></tr>
+                    <tr><td>Infinite tape</td><td>Infinite expansion of recursive types</td><td>Recursive types</td></tr>
+                    <tr><td>State transition function</td><td>Function contravariance + union/intersection distributive laws</td><td>Function types + contravariance</td></tr>
+                    <tr><td>Branch decision</td><td>AND-OR alternating search</td><td>Union + Intersection + contravariance</td></tr>
+                    <tr><td>Computation steps</td><td>One step of subtype derivation</td><td>Subtype rules</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Encoding Intuition</h4>
+
+            <p>The core idea is constructing two recursive types A and B such that <code>A &lt;: B</code> holds if and only if a particular Turing machine halts.</p>
+
+            <ul>
+                <li><strong>Encode current symbol with union branches</strong>: <code>Symbol = Zero | One</code>, different branches represent different values on the tape</li>
+                <li><strong>Encode tape continuation with recursion</strong>: <code>Tape = μX. Symbol &amp; (Unit → X)</code>, recursively representing an infinite tape</li>
+                <li><strong>Encode "simultaneously satisfying multiple conditions" with intersection</strong>: State transitions need to check both current symbol and current state</li>
+                <li><strong>Encode read/write with function contravariance</strong>: Reading is in the contravariant position (input), writing is in the covariant position (output)</li>
+            </ul>
+
+            <p>Each time subtype checking expands one step of a recursive type, it's equivalent to the Turing machine executing one step. If the Turing machine doesn't halt, subtype checking never finishes.</p>
+
+            <h4>Standard Reduction Path</h4>
+
+            <p>Classic proofs typically use a two-step reduction:</p>
+
+<pre class="diagram"><code>  Halting problem (known undecidable)
+     │
+     │  Reduces to
+     ▼
+  Post Correspondence Problem (PCP)
+  Given string pairs (u₁,v₁), ..., (uₙ,vₙ)
+  Does there exist a sequence i₁,...,iₖ such that
+  u_{i₁}...u_{iₖ} = v_{i₁}...v_{iₖ} ?
+     │
+     │  Reduces to
+     ▼
+  Subtype checking problem
+  A &lt;: B ?</code></pre>
+
+            <p>PCP to subtype checking encoding:</p>
+
+            <ul>
+                <li>Each PCP string pair → a pair of type constructors</li>
+                <li>String concatenation → type nesting/composition (using recursion)</li>
+                <li>String "equality" → subtype relationship</li>
+                <li>"There exists a sequence" → union type choice</li>
+            </ul>
+
+            <h3>Validating the Intuition: What Happens If You Remove Any Component?</h3>
+
+            <p>If the analysis above is correct, then removing any key component should make the problem decidable again. Indeed it does:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Configuration</th><th>Decidable?</th><th>Reason</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Only Union, no Intersection</td><td>Decidable</td><td>Without intersection, function parameter position doesn't flip union into intersection, AND-OR alternation doesn't occur</td></tr>
+                    <tr><td>Only Intersection, no Union</td><td>Generally decidable</td><td>Easier to control, though some combinations (like bounded quantification) may still cause problems</td></tr>
+                    <tr><td>Union + Intersection, no recursion</td><td>Decidable</td><td>All types are finite, search tree has bounded depth. May be EXPTIME, but always terminates</td></tr>
+                    <tr><td>Union + Intersection + recursion, no function types</td><td>Decidable</td><td>No contravariant positions, union and intersection don't flip each other, degenerates to set containment checking</td></tr>
+                </tbody>
+            </table>
+
+            <p><strong>Conclusion: Undecidability requires all four components working together — remove any one and it breaks.</strong></p>
+
+<pre class="diagram"><code>  Union (provides OR branches)
+    + Intersection (provides AND branches)
+    + Function type contravariance (makes OR ↔ AND flip)
+    + Recursive types (makes this process infinite)
+    ────────────────────────────────
+    = Can encode Turing machines → Undecidable</code></pre>
+
+            <h3>Complete Causal Chain</h3>
+
+<pre class="diagram"><code>  WHY-0: The halting problem is undecidable
+            ↓
+  WHY-1: Any decision problem in a formal system that can encode Turing machines is undecidable
+            ↓
+  WHY-2: Union + Intersection + Function types + Recursive types can encode Turing machines
+            ↓ because
+  WHY-3: Union encodes OR choice, Intersection encodes AND conjunction
+            ↓ plus
+  WHY-4: Function parameter contravariance makes union ↔ intersection flip
+            ↓ causing
+  WHY-5: Subtype checking becomes AND-OR alternating search
+            ↓ plus
+  WHY-6: Recursive types make the expansion process have no termination point
+            ↓ ultimately
+  WHY-7: Subtype checking can encode arbitrary Turing machines → Undecidable</code></pre>
+
+            <h3>How Do Real Type Systems Cope?</h3>
+
+            <p>Theoretically undecidable, but TypeScript, Flow, and Scala all work just fine in daily use. How do they manage? Essentially by giving up "completeness" or "full recursion" in exchange for decidability.</p>
+
+            <h4>Strategy 1: Incomplete but Sound (TypeScript's Approach)</h4>
+
+            <p>TypeScript's subtype checking algorithm is <strong>sound but incomplete</strong> — it won't accept incorrect subtype relationships (sound), but may reject some subtype relationships that actually hold (incomplete).</p>
+
+<pre><code>// TypeScript's subtype checking can handle some cases
+type A = { x: string } &amp; { y: number }
+type B = { x: string, y: number }
+// A &lt;: B and B &lt;: A, TypeScript handles this
+
+// But for deeply nested recursive + union + intersection combinations
+// the compiler may just error out or time out</code></pre>
+
+            <p>In practice: if you've done complex TypeScript type gymnastics (conditional types + infer + recursion), you may have seen <code>Type instantiation is excessively deep and possibly infinite</code>. This is TypeScript's depth limit in action — when recursive expansion exceeds a certain depth (typically 50 levels), it simply stops.</p>
+
+            <h4>Strategy 2: Semantic Subtyping (CDuce, Ballerina's Approach)</h4>
+
+            <p>Interpret types as sets of values, with subtyping being set containment. Decidability is recovered by restricting the form of recursive types:</p>
+
+            <ul>
+                <li><strong>Contractive condition</strong>: The recursive body can't be just the variable itself (<code>μX. X</code> is illegal), it must pass through at least one type constructor</li>
+                <li>This restriction blocks "meaningless infinite expansion" while preserving useful recursive types (lists, trees, etc.)</li>
+            </ul>
+
+            <h4>Strategy 3: Restrict Where Union/Intersection Can Appear</h4>
+
+            <p>Some type systems only allow union/intersection in specific positions — for example, only at the top level, not nested inside function parameters. This directly blocks the contravariance flipping chain.</p>
+
+            <h4>Strategy 4: Iso-recursive Instead of Equi-recursive</h4>
+
+            <p>Iso-recursive types require explicit <code>fold</code>/<code>unfold</code> operations to expand recursion. Each expansion is actively triggered by the programmer, rather than the type checker automatically expanding infinitely. This limits expansion depth.</p>
+
+            <h4>Strategy 5: MLsub's Clever Restriction</h4>
+
+            <p>Dolan and Mycroft's 2017 MLsub system demonstrated a clever approach: by restricting union and intersection to only appear in specific "polarity" positions — union only in covariant positions, intersection only in contravariant positions — completely eliminates the possibility of AND-OR alternation, yielding a decidable and efficient system.</p>
+
+            <h3>Implications for Engineering Practice</h3>
+
+            <p>Understanding the root cause of undecidability can guide us to write more "friendly" types:</p>
+
+            <ul>
+                <li><strong>Avoid nesting union + intersection + recursion in function parameter positions</strong>. This is the precise condition that triggers AND-OR alternating search. Extract complex types into named type aliases to reduce nesting depth</li>
+                <li><strong>Keep recursive types simple</strong>. <code>type Tree = Leaf | Node(Tree, Tree)</code> is safe. <code>type T = (T → T) | number</code> is dangerous — because T in the function parameter position triggers contravariance flipping</li>
+                <li><strong>When you see "excessively deep" errors, don't just add <code>// @ts-ignore</code></strong>. Re-examine your type definitions, looking for whether union/intersection is constantly flipping through function parameter positions within recursion</li>
+                <li><strong>Type gymnastics in moderation</strong>. TypeScript's conditional type + infer is essentially performing recursive search over union/intersection. Each additional nesting level can exponentially expand the search space</li>
+            </ul>
+
+            <h3>References</h3>
+
+            <ul>
+                <li>Pierce, B.C. (1994): "Bounded quantification is undecidable" — The classic paper proving subtype undecidability in F&lt;:</li>
+                <li>Barbanera, Dezani-Ciancaglini, de'Liguoro (1995): Undecidability of intersection types + bounded quantification</li>
+                <li>Frisch, Castagna, Hosoya (2002/2008): Semantic Subtyping — Demonstrating how to recover decidability through restrictions</li>
+                <li>Dolan, Mycroft (2017): "Polymorphism, Subtyping, and Type Inference in MLsub" — Decidable union + intersection subtype system</li>
+                <li>Castagna (2022): "Programming with Union, Intersection, and Negation Types" — Latest comprehensive reference</li>
+            </ul>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

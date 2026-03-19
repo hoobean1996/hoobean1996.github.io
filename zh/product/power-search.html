@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PowerSearch：构建可组合的前端高级搜索栏 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PowerSearch：构建可组合的前端高级搜索栏</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/emmoser-celestial-globe.jpg" alt="Celestial Globe by Gerhard Emmoser">
+                <figcaption>Gerhard Emmoser，天球仪，1579 — 在一个精密的结构里，每颗星星都有自己的坐标和分类。高级搜索也是如此：用结构化的条件精确定位你要找的东西</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：几乎每个 B 端产品都需要高级搜索，但大多数实现要么是堆砌输入框的简陋方案，要么是无法组合嵌套的半成品。这里分享一个基于递归条件树的数据模型，让搜索栏天然支持 AND/OR 组合和无限嵌套——数据结构对了，UI 交互和后端映射都会变得简单。
+            </blockquote>
+
+            <h3>问题</h3>
+
+            <p>B 端产品的列表页几乎都需要搜索和筛选。最简单的做法是放几个输入框和下拉框，但这在字段多了之后会变得很丑，而且无法表达复杂的逻辑——比如"状态是已完成 <strong>且</strong>（创建者是张三 <strong>或</strong> 创建者是李四）"。</p>
+
+            <p>像 Jira、Linear、Notion 这类产品的搜索栏，支持用户动态添加筛选条件，选择字段、运算符和值，还能用 AND/OR 组合条件、嵌套分组。这种交互叫 <strong>PowerSearch</strong>（或 Advanced Filter、Structured Search）。</p>
+
+            <p>它看起来复杂，但数据结构其实很清晰——本质上就是一棵条件表达式树。</p>
+
+            <h3>数据模型</h3>
+
+            <p>整个系统的类型定义只有几个：</p>
+
+<pre><code>// 字段配置——定义可以搜索哪些字段
+type FieldConfig = {
+  id: string;          // "status"
+  label: string;       // "状态"
+  type: "text" | "number" | "date" | "select" | "boolean";
+  operators: OperatorOption[];     // 该字段支持的运算符
+  options?: { value: string; label: string }[];  // select 类型的选项
+};
+
+// 运算符
+type OperatorOption = {
+  id: string;      // "eq"
+  label: string;   // "等于"
+  symbol: string;  // "="
+};
+
+// 单个筛选条件
+type FilterCondition = {
+  id: string;
+  type: "condition";
+  fieldId: string;     // 哪个字段
+  operatorId: string;  // 什么运算符
+  value: string;       // 比较的值
+};
+
+// 条件组（递归结构，支持嵌套）
+type ConditionGroup = {
+  id: string;
+  type: "group";
+  operator: "AND" | "OR";
+  conditions: (FilterCondition | ConditionGroup)[];  // 可以嵌套
+};</code></pre>
+
+            <p>关键在最后一个类型：<code>ConditionGroup</code> 的 <code>conditions</code> 数组可以包含 <code>FilterCondition</code>（叶子节点），也可以包含 <code>ConditionGroup</code>（子树）。这就是一棵递归的表达式树。</p>
+
+            <p>一个实际的查询长这样：</p>
+
+<pre><code>// "状态 = 已完成 AND (创建者 = 张三 OR 创建者 = 李四)"
+{
+  id: "root",
+  type: "group",
+  operator: "AND",
+  conditions: [
+    {
+      id: "c1", type: "condition",
+      fieldId: "status", operatorId: "eq", value: "done"
+    },
+    {
+      id: "g1", type: "group",
+      operator: "OR",
+      conditions: [
+        {
+          id: "c2", type: "condition",
+          fieldId: "creator", operatorId: "eq", value: "zhangsan"
+        },
+        {
+          id: "c3", type: "condition",
+          fieldId: "creator", operatorId: "eq", value: "lisi"
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+            <h3>组件 API 设计</h3>
+
+            <p>使用方只需要提供两样东西：字段配置和搜索回调。</p>
+
+<pre><code>const fields: FieldConfig[] = [
+  {
+    id: "name",
+    label: "名称",
+    type: "text",
+    operators: [
+      { id: "contains", label: "包含", symbol: "⊃" },
+      { id: "eq", label: "等于", symbol: "=" },
+      { id: "starts_with", label: "开头是", symbol: "^" },
+    ],
+  },
+  {
+    id: "status",
+    label: "状态",
+    type: "select",
+    operators: [
+      { id: "eq", label: "等于", symbol: "=" },
+      { id: "neq", label: "不等于", symbol: "≠" },
+    ],
+    options: [
+      { value: "active", label: "进行中" },
+      { value: "done", label: "已完成" },
+      { value: "archived", label: "已归档" },
+    ],
+  },
+  {
+    id: "created_at",
+    label: "创建日期",
+    type: "date",
+    operators: [
+      { id: "after", label: "晚于", symbol: ">" },
+      { id: "before", label: "早于", symbol: "&lt;" },
+    ],
+  },
+  {
+    id: "priority",
+    label: "优先级",
+    type: "number",
+    operators: [
+      { id: "eq", label: "等于", symbol: "=" },
+      { id: "gt", label: "大于", symbol: ">" },
+      { id: "lt", label: "小于", symbol: "&lt;" },
+    ],
+  },
+  {
+    id: "enabled",
+    label: "是否启用",
+    type: "boolean",
+    operators: [
+      { id: "eq", label: "等于", symbol: "=" },
+    ],
+  },
+];
+
+function handleSearch(query: ConditionGroup) {
+  // 把条件树转成 API 请求
+  console.log(JSON.stringify(query, null, 2));
+}
+
+&lt;PowerSearchBar
+  fields={fields}
+  onSearch={handleSearch}
+  placeholder="点击添加筛选条件..."
+  defaultOperator="AND"
+/&gt;</code></pre>
+
+            <p>组件内部维护一棵 <code>ConditionGroup</code> 树作为状态。每次用户添加/修改/删除条件，树更新后通过 <code>onSearch</code> 回调出去。调用方拿到这棵树，转成 GraphQL 的 where 子句或 REST API 的 query string，发给后端。</p>
+
+            <h3>交互流程</h3>
+
+            <p>添加一个筛选条件是一个三步引导流程：</p>
+
+<pre><code>1. 选字段 → 弹出字段列表（Field Dropdown）
+                ┌─────────────────┐
+                │ Select Field    │
+                ├─────────────────┤
+                │ 名称      text  │
+                │ 状态    select  │
+                │ 创建日期  date  │
+                │ 优先级  number  │
+                └─────────────────┘
+
+2. 选运算符 → 根据字段类型显示对应的运算符
+                ┌─────────────────┐
+                │ Select Operator │
+                ├─────────────────┤
+                │ 等于          = │
+                │ 不等于        ≠ │
+                └─────────────────┘
+
+3. 输入值 → 根据字段类型显示不同的输入方式
+   text   → 文本输入框
+   number → 数字输入框
+   date   → 日期选择器
+   select → 选项列表
+   boolean → true/false 选择</code></pre>
+
+            <p>每一步完成后自动进入下一步，三步走完自动提交条件。这个渐进式引导比直接显示三个并排的下拉框体验好得多——用户每次只需要做一个决策。</p>
+
+            <h3>状态管理</h3>
+
+            <p>组件内部有两个核心状态：</p>
+
+<pre><code>// 1. 条件树（完整的查询结构）
+const [rootGroup, setRootGroup] = useState&lt;ConditionGroup&gt;({
+  id: "root",
+  type: "group",
+  operator: defaultOperator,
+  conditions: [],
+});
+
+// 2. 当前正在编辑的条件（三步引导的中间状态）
+const [editingCondition, setEditingCondition] = useState&lt;{
+  condition: Partial&lt;FilterCondition&gt;;  // 可能只填了字段，还没选运算符
+  groupId: string;   // 属于哪个组
+  index?: number;    // 编辑已有条件时的索引
+} | null&gt;(null);</code></pre>
+
+            <p>条件树的修改都通过深拷贝实现（immutable update），确保 React 能正确检测到变化：</p>
+
+<pre><code>// 深拷贝条件树
+const deepCloneGroup = (group: ConditionGroup): ConditionGroup =&gt; ({
+  ...group,
+  conditions: group.conditions.map((c) =&gt;
+    c.type === "group" ? deepCloneGroup(c) : { ...c }
+  ),
+});
+
+// 在嵌套的树中找到目标组
+const findGroupById = (
+  group: ConditionGroup, id: string
+): ConditionGroup | null =&gt; {
+  if (group.id === id) return group;
+  for (const c of group.conditions) {
+    if (c.type === "group") {
+      const found = findGroupById(c, id);
+      if (found) return found;
+    }
+  }
+  return null;
+};</code></pre>
+
+            <p>每次修改条件时：深拷贝树 → 找到目标组 → 修改 → 设置新状态 → 触发 <code>onSearch</code> 回调。</p>
+
+            <h3>值输入的类型适配</h3>
+
+            <p>第三步"输入值"根据字段类型渲染不同的输入组件，这是一个 switch 分发：</p>
+
+<pre><code>const renderValueInput = () =&gt; {
+  const field = getField(editingCondition.condition.fieldId);
+
+  switch (field.type) {
+    case "select":
+      // 渲染选项列表，点击直接提交
+      return &lt;OptionsList options={field.options} onSelect={handleSubmit} /&gt;;
+
+    case "boolean":
+      // 只有 true/false 两个选项
+      return &lt;BooleanPicker onSelect={handleSubmit} /&gt;;
+
+    case "date":
+      // 日期选择器
+      return &lt;input type="date" onChange={handleValueChange} /&gt;;
+
+    case "number":
+      // 数字输入框
+      return &lt;input type="number" onChange={handleValueChange} /&gt;;
+
+    default:  // text
+      // 文本输入框，Enter 提交
+      return &lt;input type="text" onChange={handleValueChange}
+                     onKeyDown={e =&gt; e.key === "Enter" && handleSubmit()} /&gt;;
+  }
+};</code></pre>
+
+            <p>注意 <code>select</code> 和 <code>boolean</code> 类型的特殊处理：用户点击选项后直接提交条件，不需要额外点"确认"按钮。这减少了一次点击，交互更流畅。</p>
+
+            <h3>AND/OR 切换与条件分组</h3>
+
+            <p>条件之间的逻辑关系通过 <code>ConditionGroup.operator</code> 控制。UI 上是一个可点击的小标签，每次点击在 AND 和 OR 之间切换：</p>
+
+<pre><code>const handleToggleOperator = (groupId: string) =&gt; {
+  setRootGroup((prev) =&gt; {
+    const updated = deepCloneGroup(prev);
+    const group = findGroupById(updated, groupId);
+    if (group) {
+      group.operator = group.operator === "AND" ? "OR" : "AND";
+    }
+    onSearch(updated);
+    return updated;
+  });
+};</code></pre>
+
+            <p>嵌套分组让用户可以表达更复杂的逻辑。比如"(A AND B) OR (C AND D)"——顶层是 OR，两个子组各自是 AND。实现上限制了最大嵌套深度为 3 层，防止条件树过于复杂：</p>
+
+<pre><code>// 只在深度 &lt; 3 时显示"添加分组"按钮
+{depth &lt; 3 && (
+  &lt;button onClick={() =&gt; handleAddGroup(group.id)}&gt;
+    Add Group
+  &lt;/button&gt;
+)}</code></pre>
+
+            <h3>条件的渲染</h3>
+
+            <p>条件树的渲染也是递归的。每个 <code>ConditionGroup</code> 渲染自己的 operator 标签和 conditions 列表，遇到子组就递归调用自己：</p>
+
+<pre><code>const renderGroup = (group: ConditionGroup, depth = 0) =&gt; (
+  &lt;div className={depth &gt; 0 ? "nested-group" : ""}&gt;
+    {/* AND/OR 切换按钮 */}
+    {group.conditions.length &gt; 0 && (
+      &lt;button onClick={() =&gt; handleToggleOperator(group.id)}&gt;
+        {group.operator}
+      &lt;/button&gt;
+    )}
+
+    {/* 逐个渲染条件 */}
+    {group.conditions.map((condition, index) =&gt; {
+      if (condition.type === "group") {
+        // 递归渲染子组
+        return renderGroup(condition, depth + 1);
+      } else {
+        // 渲染单个条件 pill
+        const field = getField(condition.fieldId);
+        const operator = getOperator(condition.fieldId, condition.operatorId);
+        return (
+          &lt;div className="condition-pill"&gt;
+            &lt;span className="field"&gt;{field?.label}&lt;/span&gt;
+            &lt;span className="operator"&gt;{operator?.symbol}&lt;/span&gt;
+            &lt;span className="value"&gt;{condition.value}&lt;/span&gt;
+            &lt;button onClick={() =&gt; handleRemove(group.id, index)}&gt;×&lt;/button&gt;
+          &lt;/div&gt;
+        );
+      }
+    })}
+
+    {/* 添加条件/分组按钮 */}
+    &lt;button onClick={() =&gt; handleAddCondition(group.id)}&gt;+ Add Filter&lt;/button&gt;
+    {depth &lt; 3 && &lt;button onClick={() =&gt; handleAddGroup(group.id)}&gt;() Add Group&lt;/button&gt;}
+  &lt;/div&gt;
+);</code></pre>
+
+            <p>嵌套的子组用左边框缩进（<code>border-left + padding-left</code>），视觉上清晰地表达层级关系。</p>
+
+            <h3>和后端对接</h3>
+
+            <p><code>onSearch</code> 回调返回的是一棵 <code>ConditionGroup</code> 树。后端通常需要把它转成数据库查询。这个转换是递归的：</p>
+
+<pre><code>// 转成 SQL WHERE 子句（伪代码）
+function toSQL(group: ConditionGroup): string {
+  const parts = group.conditions.map((c) =&gt; {
+    if (c.type === "group") {
+      return `(${toSQL(c)})`;
+    }
+    const op = operatorToSQL(c.operatorId);  // "eq" → "=", "contains" → "LIKE"
+    const val = escapeSQL(c.value);
+    return `${c.fieldId} ${op} ${val}`;
+  });
+  return parts.join(` ${group.operator} `);
+}
+
+// 输出: status = 'done' AND (creator = 'zhangsan' OR creator = 'lisi')</code></pre>
+
+            <p>如果用 GraphQL，可以直接把树结构映射成嵌套的 <code>where</code> input：</p>
+
+<pre><code>// GraphQL where input
+{
+  and: [
+    { status: { eq: "done" } },
+    {
+      or: [
+        { creator: { eq: "zhangsan" } },
+        { creator: { eq: "lisi" } }
+      ]
+    }
+  ]
+}</code></pre>
+
+            <p>数据结构是同构的——前端的 <code>ConditionGroup</code> 和 GraphQL 的 <code>where</code> input 只是同一棵树的不同表示。转换几乎是一对一的映射。</p>
+
+            <h3>设计思考</h3>
+
+            <ul>
+                <li><strong>为什么用树而不是扁平数组</strong>：扁平的 <code>{ field, op, value }[]</code> 数组只能表达全 AND 或全 OR 的关系。一旦需要混合逻辑（"A AND (B OR C)"），就必须用树。树是最通用的结构，扁平数组只是树的退化特例。</li>
+                <li><strong>为什么 FieldConfig 包含 operators</strong>：不同类型的字段支持不同的运算符——文本字段支持"包含"，数字字段支持"大于/小于"，布尔字段只支持"等于"。把 operators 绑在 field 上而不是全局定义，避免了"日期字段选了包含"这种无意义的组合。</li>
+                <li><strong>为什么三步分开而不是一行三个下拉框</strong>：渐进式引导减少了认知负荷。用户每次只需要关注一个选择，而不是同时面对三个下拉框不知道从哪个开始。</li>
+                <li><strong>限制嵌套深度</strong>：理论上递归结构可以无限嵌套，但实际中超过 3 层嵌套的搜索条件几乎不可维护。限制深度是对用户的保护。</li>
+                <li><strong>条件即数据</strong>：整个搜索状态就是一个可序列化的 JSON 树。这意味着它可以保存到 URL query string（分享搜索结果）、持久化到用户配置（保存常用筛选）、或者作为"视图"保存（类似 Notion 的 database views）。</li>
+            </ul>
+
+            <h3>扩展方向</h3>
+
+            <ul>
+                <li><strong>保存为视图</strong>：把 <code>ConditionGroup</code> JSON 保存到数据库，用户下次进入直接加载。就像 Notion 里的 filter view。</li>
+                <li><strong>URL 序列化</strong>：把条件树编码进 URL（base64 或自定义语法），这样搜索结果页可以分享给别人。</li>
+                <li><strong>字段间依赖</strong>：选了"国家 = 中国"后，"城市"字段的选项自动过滤为中国的城市。需要在 FieldConfig 里加 <code>dependsOn</code> 和动态加载 options。</li>
+                <li><strong>自定义运算符</strong>：比如"在列表中"（IN）、"为空"（IS NULL）、"在范围内"（BETWEEN）。只需要在 FieldConfig.operators 里加新的 OperatorOption，渲染器自动适配。</li>
+                <li><strong>键盘导航</strong>：支持方向键在条件间移动、Tab 切换步骤、Delete 删除条件。对高频使用的用户，键盘操作比鼠标快得多。</li>
+            </ul>
+
+            <h3>总结</h3>
+
+            <p>PowerSearch 的核心就是两件事：一个递归的条件树数据结构，和一个三步渐进式的条件编辑交互。数据结构决定了它能表达多复杂的查询（任意 AND/OR 嵌套），交互设计决定了复杂的查询是否容易构建（字段 → 运算符 → 值的引导流程）。</p>
+
+            <p>从工程角度看，这个组件的核心代码量不大——类型定义 30 行，状态管理 50 行，递归渲染 50 行。大部分代码在 UI 细节上（下拉框样式、hover 效果、键盘事件）。这是前端组件的常态：核心逻辑简单，但要做好交互体验需要大量的细节打磨。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

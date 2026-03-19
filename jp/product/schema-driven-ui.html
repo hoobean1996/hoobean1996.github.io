@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema 駆動フォーム（後編）：式エンジンと汎用 UI レンダリング - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Schema 駆動フォーム（後編）：式エンジンと汎用 UI レンダリング</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/patchwork-quilt.jpg" alt="Patchwork Quilt, 1870-1900, Metropolitan Museum of Art">
+                <figcaption>パッチワークキルト（Patchwork Quilt）、1870–1900 — それぞれ独立した布片がルールに従って接ぎ合わされ、完全な模様を形成する。Schema 駆動 UI も同じで、独立したコンポーネントが構造化された記述によって組み合わされ、完全なインターフェースとなる</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：前編では「JSON でフォームを記述する」問題を解決したが、フォームは UI の一部に過ぎない。この記事では Schema の能力をインターフェース全体の記述に拡張する——レイアウト、条件付きレンダリング、式エンジン、アクションシステム。最終的に汎用的な SchemaRenderer を実装する：JSON を渡すだけで、条件ロジックとインタラクション動作を含む完全なページをレンダリングできる。この仕組みは「ローコードでページを構成する」シーンに適している。
+            </blockquote>
+
+            <h3>フォームからインターフェースへ</h3>
+
+            <p><a href="form-builder.html">前編</a>では JSON Schema によるフォームレンダリング——データモデル、レンダラー、バリデーション戦略について議論した。しかしよく考えると、フォームは UI の一部に過ぎない。フォームには入力欄だけでなく、レイアウト（カラム分割、カード、タブ切替）、表示コンポーネント（テキスト、画像、Badge）、インタラクションロジック（ボタンクリックでアクション発火、選択肢に応じたフィールドの表示/非表示）もある。</p>
+
+            <p>Schema の能力を「フォームフィールドの記述」から「UI ツリー全体の記述」に拡張すれば、より強力なシステムが得られる：<strong>Schema 駆動 UI</strong>。一つの JSON がデータ入力だけでなく、レイアウト、条件付きレンダリング、バリデーションルール、インタラクションアクションも定義し、フロントエンドは汎用的な <code>SchemaRenderer</code> 一つで完全なページをレンダリングできる。</p>
+
+            <h3>コア型設計</h3>
+
+            <p>システム全体の型定義：</p>
+
+<pre><code>// コンポーネントの完全な記述
+interface ComponentSchema {
+  type: string;              // コンポーネントタイプ："Input" | "Card" | "Row" | ...
+  name?: string;             // フィールド名（フォームコンポーネントのみ）
+  props?: Record&lt;string, unknown&gt;;  // コンポーネントに渡す props
+  validation?: ValidationSchema;     // バリデーションルール
+  conditional?: ConditionalSchema;   // 条件付きレンダリング
+  actions?: Record&lt;string, ActionSchema&gt;;  // イベントハンドリング
+  children?: ComponentSchema[];      // 子コンポーネント（レイアウトコンテナ用）
+}
+
+// トップレベル Schema
+interface FormSchema {
+  id: string;
+  title?: string;
+  description?: string;
+  form?: {
+    initialValues?: Record&lt;string, unknown&gt;;  // デフォルト値
+    values?: Record&lt;string, unknown&gt;;         // プリセット値（最優先）
+    validateOn?: "change" | "blur" | "submit";
+  };
+  components: ComponentSchema[];  // コンポーネントツリー
+}</code></pre>
+
+            <p>重要な設計判断：<strong>ComponentSchema は再帰的である</strong>。<code>Card</code> の <code>children</code> に <code>Row</code> を入れ、<code>Row</code> の中に <code>Input</code> と <code>Button</code> を配置できる。つまり Schema は任意の深さの UI ツリーを記述でき、フラットなフィールドリストに限定されない。</p>
+
+            <h3>実際の Schema 例</h3>
+
+<pre><code>{
+  "id": "employee-onboarding",
+  "title": "新員工入職登記",
+  "form": {
+    "initialValues": { "accountType": "individual" }
+  },
+  "components": [
+    {
+      "type": "Card",
+      "props": { "title": "基本信息" },
+      "children": [
+        {
+          "type": "Row",
+          "props": { "gap": 16 },
+          "children": [
+            {
+              "type": "Input",
+              "name": "name",
+              "props": { "label": "姓名", "placeholder": "请输入姓名" },
+              "validation": {
+                "rule": "LEN(@name) >= 2",
+                "message": "姓名至少 2 个字符"
+              }
+            },
+            {
+              "type": "DatePicker",
+              "name": "startDate",
+              "props": { "label": "入职日期" }
+            }
+          ]
+        },
+        {
+          "type": "Selector",
+          "name": "department",
+          "props": {
+            "label": "部门",
+            "options": [
+              { "value": "eng", "label": "工程" },
+              { "value": "product", "label": "产品" },
+              { "value": "design", "label": "设计" }
+            ]
+          }
+        },
+        {
+          "type": "RadioGroup",
+          "name": "accountType",
+          "props": {
+            "label": "账号类型",
+            "options": [
+              { "value": "individual", "label": "个人" },
+              { "value": "business", "label": "企业" }
+            ]
+          }
+        },
+        {
+          "type": "Input",
+          "name": "companyName",
+          "props": { "label": "公司名称" },
+          "conditional": {
+            "when": "@accountType == 'business'"
+          }
+        }
+      ]
+    },
+    {
+      "type": "Button",
+      "props": { "label": "提交", "type": "submit" },
+      "actions": {
+        "onClick": { "type": "submit" }
+      }
+    }
+  ]
+}</code></pre>
+
+            <p>この JSON が記述しているもの：レイアウト（Card でラップ、Row でカラム分割）、フォームフィールド（Input、DatePicker、Selector、RadioGroup）、バリデーションルール（名前の長さ >= 2）、条件付きレンダリング（「企業」を選択した時のみ会社名を表示）、インタラクションアクション（ボタンで送信）。フロントエンドではコンポーネントコードを一切書く必要がなく、汎用レンダラーだけで済む。</p>
+
+            <h3>式エンジン</h3>
+
+            <p>条件付きレンダリングとバリデーションルールの核心は式エンジンである。Schema 内の文字列式（例：<code>@accountType == 'business'</code>）は実行時に評価される必要がある。</p>
+
+            <p><code>@</code> プレフィックスはフォームフィールドの現在の値を参照し、式は比較、論理演算、組み込み関数をサポートする：</p>
+
+<pre><code>// バリデーションルールの例
+"LEN(@name) >= 2"                              // 文字列長
+"@age >= 18 AND @age <= 120"                   // 範囲チェック
+"LEN(@email) > 5 AND FIND(\"@\", @email) > 0" // メール形式
+
+// 条件付きレンダリングの例
+"@accountType == 'business'"                    // 等値判定
+"@role == 'admin' OR @role == 'super_admin'"   // 複数条件
+"@items > 0"                                    // 数値比較</code></pre>
+
+            <p>式エンジンの実装はそれほど複雑にする必要はない。シンプルな再帰下降パーサーで十分で、式文字列をトークン化し、AST に解析してから再帰的に評価する。重要なのは：<strong>式の評価コンテキストはフォームの状態と同期していなければならない</strong>。フォームの値が変化するたびに、式エンジンが最新の値を取得して再評価できるようにする。</p>
+
+            <p>実装方法は React Context を使ってフォームの値を式エンジンに注入する：</p>
+
+<pre><code>function FormContent({ schema, registry }) {
+  const formContext = useFormSchema();
+  const evalContext = useLibExprEvaluation();
+
+  // フォームの値が変化したら式エンジンに同期
+  useEffect(() => {
+    evalContext.setValues(formContext.values);
+  }, [formContext.values]);
+
+  return (
+    &lt;form&gt;
+      {schema.components.map((comp, i) =&gt; (
+        &lt;SchemaField key={comp.name || i} schema={comp} registry={registry} /&gt;
+      ))}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+            <h3>条件付きレンダリング</h3>
+
+            <p>条件付きレンダリングの Schema 定義：</p>
+
+<pre><code>interface ConditionalSchema {
+  when: string;                     // 式、表示するかどうかを決定
+  then?: Partial&lt;ComponentSchema&gt;;  // 条件が true の時にマージする props
+  else?: Partial&lt;ComponentSchema&gt;;  // 条件が false の時にマージする props
+}</code></pre>
+
+            <p>表示/非表示の制御だけでなく、条件に基づいてコンポーネントの props を変更することもできる。例：</p>
+
+<pre><code>{
+  "type": "Input",
+  "name": "budget",
+  "props": { "label": "予算" },
+  "conditional": {
+    "when": "@role == 'manager'",
+    "then": { "props": { "label": "部門予算（管理者）" } },
+    "else": { "props": { "disabled": true } }
+  }
+}</code></pre>
+
+            <p>レンダラー内の実装は素直である：</p>
+
+<pre><code>function SchemaField({ schema, registry }) {
+  const evalContext = useLibExprEvaluation();
+  const { conditional } = schema;
+
+  const isVisible = useMemo(() =&gt; {
+    if (!conditional?.when) return true;
+    try {
+      return evalContext.validate(conditional.when);
+    } catch {
+      return true;  // 式エラー時はデフォルトで表示
+    }
+  }, [conditional?.when, evalContext]);
+
+  if (!isVisible) return null;
+
+  // ... コンポーネントをレンダリング
+}</code></pre>
+
+            <h3>コンポーネントレジストリ</h3>
+
+            <p>Schema の <code>type: "Input"</code> はどうやって実際の React コンポーネントになるのか？コンポーネントレジストリを通じて実現する：</p>
+
+<pre><code>interface ComponentRegistry {
+  [key: string]: React.ComponentType&lt;any&gt;;
+}
+
+const defaultRegistry: ComponentRegistry = {
+  // フォーム入力
+  Input: XDSInput,
+  TextArea: XDSTextArea,
+  NumberInput: XDSNumberInput,
+  Checkbox: XDSCheckbox,
+  RadioGroup: XDSRadioGroup,
+  Selector: XDSSelector,
+  Switch: XDSSwitch,
+  DatePicker: XDSDatePicker,
+  TimePicker: XDSTimePicker,
+  FileUpload: XDSFileUpload,
+  Slider: XDSSlider,
+  Rating: XDSRating,
+  ColorPicker: XDSColorPicker,
+
+  // レイアウト
+  Card: XDSCard,
+  Row: XDSFlexbox,     // direction: row
+  Column: XDSFlexbox,  // direction: column
+  Tabs: XDSTabs,
+  Accordion: XDSAccordion,
+  Divider: XDSDivider,
+
+  // 表示
+  Text: XDSText,
+  Badge: XDSBadge,
+  Alert: XDSAlert,
+  Image: XDSImage,
+  Table: XDSTable,
+
+  // インタラクション
+  Button: XDSButton,
+  Dropdown: XDSDropdown,
+};</code></pre>
+
+            <p>使用時にカスタムコンポーネントを注入してデフォルトを上書きしたり、新しいタイプを拡張したりできる：</p>
+
+<pre><code>&lt;SchemaRenderer
+  schema={schema}
+  components={{
+    RichTextEditor: MyRichTextEditor,  // 新規追加
+    Input: MyCustomInput,              // デフォルトを上書き
+  }}
+/&gt;</code></pre>
+
+            <p>この設計の利点は：<strong>Schema とコンポーネント実装が完全に分離されている</strong>こと。同じ Schema を異なるコンポーネントライブラリでレンダリングできる——デスクトップでは Ant Design のレジストリ、モバイルでは React Native のレジストリ、さらには Flutter Widget としてレンダリングすることも可能である。</p>
+
+            <h3>Action システム</h3>
+
+            <p>フォームはデータ収集だけでなく、インタラクションもある。Action Schema はユーザーがトリガーする動作を記述する：</p>
+
+<pre><code>type ActionType = "submit" | "setValue" | "navigate" | "toast" | "api" | "custom";
+
+interface ActionSchema {
+  type: ActionType;
+  field?: string;    // setValue: 対象フィールド
+  value?: unknown;   // setValue: 新しい値
+  to?: string;       // navigate: 遷移先パス
+  message?: string;  // toast: 通知メッセージ
+  url?: string;      // api: リクエスト URL
+  method?: string;   // api: HTTP メソッド
+  handler?: string;  // custom: ハンドラー関数名
+}</code></pre>
+
+            <p>Schema での使用例：</p>
+
+<pre><code>// ボタンクリックでフォーム送信
+{
+  "type": "Button",
+  "props": { "label": "提交" },
+  "actions": {
+    "onClick": { "type": "submit" }
+  }
+}
+
+// ボタンクリックで別のフィールドの値を設定
+{
+  "type": "Button",
+  "props": { "label": "填入默认地址" },
+  "actions": {
+    "onClick": {
+      "type": "setValue",
+      "field": "address",
+      "value": "上海市浦东新区"
+    }
+  }
+}
+
+// カスタムハンドラー関数を呼び出す
+{
+  "type": "Button",
+  "props": { "label": "导出 PDF" },
+  "actions": {
+    "onClick": {
+      "type": "custom",
+      "handler": "exportPDF"
+    }
+  }
+}</code></pre>
+
+            <p>レンダラーは Action タイプに応じて対応する処理ロジックにディスパッチする：</p>
+
+<pre><code>const buildActionHandler = (action: ActionSchema) =&gt; () =&gt; {
+  switch (action.type) {
+    case "setValue":
+      formContext.setValue(action.field, action.value);
+      break;
+    case "submit":
+      formContext.submit();
+      break;
+    case "custom":
+      actionHandlers?.[action.handler]?.(action);
+      break;
+  }
+};</code></pre>
+
+            <h3>状態管理と永続化</h3>
+
+            <p>フォームの状態管理は React Context で実装し、一連の hooks を提供する：</p>
+
+<pre><code>// 完全なフォームコンテキスト
+const { values, setValue, reset, isDirty, submit, getSchema } = useFormSchema();
+
+// 単一フィールドのバインディング
+const [email, setEmail, { touched, setTouched }] = useFormField&lt;string&gt;("email");
+
+// 読み取り専用の値
+const values = useFormValues();
+
+// 特定フィールドの変化を監視
+const { name, age } = useWatchFields(["name", "age"]);</code></pre>
+
+            <p>状態の永続化は巧みな設計で、<code>getSchema()</code> メソッドは現在の Schema を返しつつ、ユーザーが入力した値を <code>form.values</code> に埋め込む。この JSON を保存すれば、次回読み込み時にフォームが自動的に以前の状態に復元される：</p>
+
+<pre><code>// 現在の進捗を保存
+const schemaWithValues = getSchema();
+localStorage.setItem("draft", JSON.stringify(schemaWithValues));
+
+// 進捗を復元——保存した Schema をそのままレンダリングすれば、フォームが自動的にプリセットされる
+const saved = JSON.parse(localStorage.getItem("draft"));
+&lt;SchemaRenderer schema={saved} /&gt;</code></pre>
+
+            <p>値の優先順位設計も重要で、<code>form.values</code>（プリセット/復元）> <code>props.initialValues</code>（外部から渡される）> <code>form.initialValues</code>（Schema のデフォルト値）。これにより永続化からの復元が常にデフォルト値を上書きすることが保証される。</p>
+
+            <h3>Props 内の動的式</h3>
+
+            <p>Schema の props は静的な値だけでなく、式の補間も含むことができる：</p>
+
+<pre><code>{
+  "type": "Text",
+  "props": {
+    "content": "${@name ? '你好，' + @name + '！' : '请输入姓名'}"
+  }
+}</code></pre>
+
+            <p>レンダラーは props を再帰的に走査し、<code>${...}</code> に遭遇したら式エンジンで評価する：</p>
+
+<pre><code>function evaluateProps(props, evaluate) {
+  const result = {};
+  for (const [key, value] of Object.entries(props)) {
+    if (typeof value === "string" && value.includes("${")) {
+      result[key] = safeEvaluate(value, evaluate);
+    } else if (typeof value === "object" && value !== null) {
+      result[key] = evaluateProps(value, evaluate);  // 再帰
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}</code></pre>
+
+            <p>これにより Schema に「データバインディング」能力が付与される——表示コンポーネントの内容がフォーム入力に応じてリアルタイムに変化し、JavaScript を一切書く必要がない。</p>
+
+            <h3>レンダラーの Switch 戦略</h3>
+
+            <p>異なるタイプのコンポーネントには異なる props バインディング方法が必要である。これはレンダラーの中で最も「泥臭い」が最も重要な部分である：</p>
+
+<pre><code>// Input は onValueChange を使用
+case "Input":
+  componentProps.onValueChange = handleChange;
+  break;
+
+// TextArea は event ベースの onChange を使用
+case "TextArea":
+  componentProps.onChange = (e) =&gt; handleChange(e.target.value);
+  break;
+
+// Checkbox/Switch は checked + event を使用
+case "Checkbox":
+case "Switch":
+  componentProps.checked = Boolean(value);
+  componentProps.onChange = (e) =&gt; handleChange(e.target.checked);
+  break;
+
+// DatePicker は string と Date の変換が必要
+case "DatePicker":
+  componentProps.value = toDate(value);
+  componentProps.onChange = handleChange;
+  break;
+
+// レイアウトコンポーネントは value/name 不要
+case "Card":
+case "Row":
+case "Divider":
+  delete componentProps.value;
+  delete componentProps.name;
+  break;</code></pre>
+
+            <p>この switch は避けられない「アダプター層」である。各 UI コンポーネントライブラリは onChange の規約がそれぞれ異なり、value を渡すもの、event を渡すもの、Date オブジェクトを渡すものがある。Schema レンダラーの役割はこれらの差異を吸収し、Schema 作成者が基礎コンポーネントの API 詳細を気にしなくて済むようにすることである。</p>
+
+            <h3>選択モード：ビジュアルエディタへの布石</h3>
+
+            <p>ドラッグ＆ドロップ式のフォームビルダーを作るなら、ユーザーがページ上のコンポーネントをクリックして選択し、そのプロパティを編集できるようにする必要がある。これには「選択モード」が必要である：</p>
+
+<pre><code>&lt;SchemaRenderer
+  schema={schema}
+  selectionMode={true}
+  onComponentSelect={(info) =&gt; {
+    console.log(info.path);  // "components[0].children[2]"
+    console.log(info.type);  // "Input"
+    console.log(info.name);  // "email"
+  }}
+/&gt;</code></pre>
+
+            <p>選択モードでは、各コンポーネントの外側にホバーオーバーレイが被さり、クリック時に Schema ツリー内のパスが返される。エディタはこのパスを使って Schema JSON を特定し、props を変更して再レンダリングできる。</p>
+
+            <p>これで完全なクローズドループが形成される：</p>
+
+<pre><code>ビジュアルエディタ
+    ↓ ドラッグ / 設定
+FormSchema (JSON)
+    ↓ SchemaRenderer
+レンダリングされた UI
+    ↓ ユーザーインタラクション
+FormResponse (JSON)
+    ↓ getSchema()
+状態を含む FormSchema（永続化可能）</code></pre>
+
+            <h3>このアプローチの境界</h3>
+
+            <ul>
+                <li><strong>適している</strong>：設定駆動のフォーム、アンケートシステム、ローコードプラットフォーム、承認フローのフォーム、CMS コンテンツエディタ——これらのシーンでは UI 構造が「実行時に決定される」もので、コンパイル時にハードコードされるものではない。</li>
+                <li><strong>適していない</strong>：高度にカスタマイズされたインタラクション（ドラッグソート、キャンバス編集、複雑なアニメーション）、パフォーマンスに敏感なシーン（100 以上のコンポーネントのリアルタイム更新）、大量のカスタムロジックが必要なページ。これらのシーンでは Schema の抽象が制約となり、Schema に escape hatch を追加し続けた結果、直接コードを書くより複雑になってしまう。</li>
+                <li><strong>複雑度の天井</strong>：条件付きレンダリングルールが 10 個を超え、式のネストが 3 層を超えると、JSON Schema の可読性が急激に低下する。その時点では手書きの JSON ではなく、良質なビジュアルエディタによる補助が必要になる。</li>
+            </ul>
+
+            <h3>他のアプローチとの関係</h3>
+
+            <table>
+                <tr>
+                    <th>アプローチ</th>
+                    <th>Schema の範囲</th>
+                    <th>式の能力</th>
+                    <th>レイアウト能力</th>
+                </tr>
+                <tr>
+                    <td>react-jsonschema-form</td>
+                    <td>データ構造</td>
+                    <td>なし</td>
+                    <td>uiSchema で補完が必要</td>
+                </tr>
+                <tr>
+                    <td>Formily</td>
+                    <td>フォームフィールド + レイアウト</td>
+                    <td>JSON Schema + reactions</td>
+                    <td>FormLayout / FormGrid</td>
+                </tr>
+                <tr>
+                    <td>Retool / Appsmith</td>
+                    <td>アプリ全体</td>
+                    <td>JavaScript</td>
+                    <td>ドラッグキャンバス</td>
+                </tr>
+                <tr>
+                    <td>本記事のアプローチ</td>
+                    <td>UI コンポーネントツリー</td>
+                    <td>カスタム式言語</td>
+                    <td>コンポーネントのネスト（Card/Row/Tabs）</td>
+                </tr>
+            </table>
+
+            <p>本記事のアプローチは「フォーム Schema」と「ローコードプラットフォーム」の中間に位置する。react-jsonschema-form より強力（レイアウト、条件付きレンダリング、Action をサポート）だが、Retool より軽量（データソース接続、API オーケストレーション、ステートマシンには関与しない）。この位置づけは「非開発者が UI を構成する必要があるが、完全なローコードプラットフォームは不要」なシーンに適している。</p>
+
+            <h3>まとめ</h3>
+
+            <p>Schema 駆動 UI のコア公式：</p>
+
+<pre><code>ComponentSchema（再帰的なコンポーネントツリー記述）
+  + ComponentRegistry（タイプ → コンポーネントのマッピング）
+  + Expression Engine（動的評価）
+  + FormContext（状態管理 + 永続化）
+  = SchemaRenderer（汎用レンダラー）</code></pre>
+
+            <p>4 つの部分がそれぞれ独立しており、組み合わせることで任意の複雑さの UI をレンダリングできる。Schema は「何であるか」を担当し、Registry は「どう見えるか」を担当し、Expression Engine は「いつ」を担当し、FormContext は「現在の状態は何か」を担当する。</p>
+
+            <p>これは新しいアイデアではない——WinForms の XML 記述から SwiftUI の宣言的構文まで、「データで UI を記述する」は繰り返し現れるテーマである。JSON Schema 駆動 UI はこの思想の Web フロントエンド、特に B 向けプロダクトにおける一つの具体例に過ぎない。その価値は技術的にどれほど先進的かではなく、<strong>UI の作成権を開発者からビジネス担当者に移転する</strong>ことにある。</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>前編：</strong><a href="form-builder.html">Schema 駆動フォーム（前編）：データモデルとレンダラー</a>
+            </p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

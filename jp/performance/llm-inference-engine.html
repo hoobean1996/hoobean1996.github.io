@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ゼロから生成まで：純粋な C++ で LLM 推論エンジンを一から構築した全記録 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>ゼロから生成まで：純粋な C++ で LLM 推論エンジンを一から構築した全記録</h2>
+            <time>2026-02-19</time>
+
+            <figure class="post-cover">
+                <img src="../../images/davinci-flying-machine.jpg" alt="Flying Machine by Leonardo da Vinci">
+                <figcaption>Leonardo da Vinci,《飛行機械の設計手稿》, c. 1487</figcaption>
+            </figure>
+
+            <h3>はじめに</h3>
+
+            <p>毎日 LLM を使っているが、実際にはどうやって一連の token を人間の言葉に変換しているのだろうか？PyTorch、vLLM、llama.cpp といったフレームワークはすべての詳細を隠している——<code>model.generate()</code> を呼べば、テキストが出てくる。しかし、その間に何が起こっているのかを知りたかった。</p>
+
+            <p>そこで純粋な C++20 で、ML フレームワークに一切依存せず、ゼロから LLM 推論エンジンを書いた：<strong>vvllm</strong>。Qwen2.5-0.5B を動かすことができ、プロンプトを入力すると一貫性のあるテキストを出力する。プロセス全体——mmap による重み読み込みから、BPE エンコード、Transformer の順伝播、nucleus sampling まで——すべて手書きである。</p>
+
+            <p>この記事では、コードの実際のフローに沿って、このエンジンの構築と最適化の過程を一歩ずつ記録する。</p>
+
+            <h3>問題定義</h3>
+
+            <p>目標：テキスト（プロンプト）を与え、モデルに一貫性のある内容を続けて生成させる。</p>
+
+            <p>モデル：Qwen2.5-0.5B（通義千問 0.5B パラメータ版）</p>
+            <ul>
+                <li>hidden_size: 896</li>
+                <li>num_hidden_layers: 24</li>
+                <li>num_attention_heads: 14</li>
+                <li>num_key_value_heads: 2（GQA, Grouped Query Attention）</li>
+                <li>intermediate_size: 4864</li>
+                <li>vocab_size: 151936</li>
+                <li>重みフォーマット：SafeTensors、BF16 保存、約 1GB ファイル / 1.9GB float32</li>
+            </ul>
+
+            <p>制約：純粋な C++20、PyTorch / TensorFlow / ONNX Runtime は使わない。唯一許可される外部ライブラリは OpenBLAS（オプションの行列乗算加速）と nlohmann/json（設定ファイル解析）。</p>
+
+            <p>ビルドシステム：Bazel 7.4.1、aarch64 / x86_64 クロスプラットフォーム対応。</p>
+
+            <h3>全体像</h3>
+
+            <p>推論エンジン全体の構築と最適化は 7 ステップに分かれ、実際の開発順序に従う：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>ステップ</th>
+                        <th>内容</th>
+                        <th>主要指標</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Step 0</td>
+                        <td>基盤：Backend + Tensor + SafeTensors</td>
+                        <td>290 個の tensor を読み込み可能、BF16&rarr;F32</td>
+                    </tr>
+                    <tr>
+                        <td>Step 1</td>
+                        <td>BPE Tokenizer</td>
+                        <td>テキスト &harr; token ID 相互変換</td>
+                    </tr>
+                    <tr>
+                        <td>Step 2</td>
+                        <td>Transformer 順伝播</td>
+                        <td>24 層の完全な forward pass</td>
+                    </tr>
+                    <tr>
+                        <td>Step 3</td>
+                        <td>RoPE 回転位置エンコーディングの修正</td>
+                        <td>出力の文字化けから正しい生成へ</td>
+                    </tr>
+                    <tr>
+                        <td>Step 4</td>
+                        <td>KV Cache</td>
+                        <td>decode フェーズ <strong>56&times; 高速化</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Step 5</td>
+                        <td>OpenBLAS による線形投影の加速</td>
+                        <td>線形層 <strong>8.6&times; 高速化</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Step 6</td>
+                        <td>Sampler &amp; 自己回帰生成</td>
+                        <td>Temperature + Top-p サンプリング</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Step 0: 基盤 &mdash; Backend + Tensor + SafeTensors</h3>
+
+            <p>推論ロジックを書く前に、まず 3 つの基本的な問題を解決する必要がある：メモリ管理、計算の抽象化、モデル重みの読み込み。</p>
+
+            <p><strong>Backend 抽象</strong></p>
+
+            <p>抽象的な計算バックエンドインターフェースを定義する。すべての演算子（matmul、add、softmax、RoPE など）は仮想関数であり、具体的な実装はサブクラスが提供する。これにより、後で naive CPU と OpenBLAS バックエンドをシームレスに切り替えることができる：</p>
+
+<pre><code>class Backend {
+public:
+    virtual void matmul(float* out, const float* A, const float* B,
+                        std::size_t M, std::size_t N, std::size_t K) = 0;
+    virtual void rms_norm(float* out, const float* x, const float* weight,
+                          std::size_t n, float eps) = 0;
+    virtual void softmax(float* out, const float* x, std::size_t n) = 0;
+    virtual void rope(float* q, float* k, std::size_t seq_len,
+                      std::size_t num_heads, std::size_t num_kv_heads,
+                      std::size_t head_dim, std::size_t pos, float theta) = 0;
+    virtual void linear(float* out, const float* inp, const float* weight,
+                        const float* bias, std::size_t M, std::size_t N,
+                        std::size_t K) = 0;
+    // ... add, mul, silu, embedding
+};</code></pre>
+
+            <p>最初の実装は naive CPU バックエンド——すべての操作は最も素朴な for ループで行う。例えば linear projection（推論で最もコアな計算）：</p>
+
+<pre><code>void BackendCPU::linear(float* out, const float* inp, const float* weight,
+                        const float* bias, std::size_t M, std::size_t N,
+                        std::size_t K) {
+    // out[M, N] = inp[M, K] @ weight^T[K, N] + bias[N]
+    for (std::size_t i = 0; i &lt; M; i++) {
+        for (std::size_t j = 0; j &lt; N; j++) {
+            float sum = bias ? bias[j] : 0.0f;
+            for (std::size_t k = 0; k &lt; K; k++) {
+                sum += inp[i * K + k] * weight[j * K + k];
+            }
+            out[i * N + j] = sum;
+        }
+    }
+}</code></pre>
+
+            <p>三重ループ、O(M&times;N&times;K) のスカラー乗算。遅いが正しい。まず動かしてから最適化する。</p>
+
+            <p><strong>SafeTensors ローダー</strong></p>
+
+            <p>HuggingFace のモデル重みは SafeTensors 形式で保存される。形式は非常にシンプル：</p>
+
+<pre class="diagram"><code>+------------------+
+| 8 bytes          |  header_size (uint64)
++------------------+
+| JSON header      |  tensor names, shapes, dtypes, offsets
++------------------+
+| raw tensor data  |  バイナリ浮動小数点データ（BF16 または F32）
++------------------+</code></pre>
+
+            <p>重要な設計上の決定は、ファイルの読み込みに <code>read</code> ではなく <code>mmap</code> を使用すること。<code>mmap</code> はファイルを仮想アドレス空間にマッピングし、OS が必要に応じてディスクからデータページを読み込む——ファイル全体を一度にメモリに読み込むのではない。1GB 以上の重みファイルに対して、起動時間とメモリピークを削減できる。</p>
+
+<pre><code>mapped_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);</code></pre>
+
+            <p>Qwen2.5-0.5B の重みは BF16（Brain Float 16）形式で保存されている。BF16 と float32 は同じ 8 ビットの指数部を持ち、仮数部が 23 ビットから 7 ビットに切り詰められているだけ。変換は簡単——16 ビット左シフトするだけ：</p>
+
+<pre><code>float bf16_to_f32(uint16_t bf16) {
+    uint32_t bits = static_cast&lt;uint32_t&gt;(bf16) &lt;&lt; 16;
+    float result;
+    std::memcpy(&amp;result, &amp;bits, sizeof(float));
+    return result;
+}</code></pre>
+
+            <p>モデルには 290 個の tensor がある（各層に attention の Q/K/V/O 重み、MLP の gate/up/down 重み、2 つの layernorm 重み、さらに embedding と final norm）。読み込み後は約 1.9GB のメモリを占有する。</p>
+
+            <h3>Step 1: BPE Tokenizer &mdash; テキストを数値に変換する</h3>
+
+            <p>LLM の入力は生のテキストではなく、token ID の列である。Tokenizer はテキストと token ID 間の変換を担当する。Qwen2.5 は BPE（Byte Pair Encoding）分割を使用する。</p>
+
+            <p>エンコードは 3 ステップ：</p>
+
+<pre class="diagram"><code>"Hello world"
+
+Step 1: Pre-tokenize（空白で分割、空白を Ġ プレフィックスに変換）
+  &rarr; ["Hello", "Ġworld"]
+
+Step 2: BPE merge（最も優先度の高い隣接ペアを繰り返しマージ）
+  "Ġworld" &rarr; ['Ġ', 'w', 'o', 'r', 'l', 'd']
+          &rarr; ['Ġ', 'wo', 'r', 'l', 'd']     // merge('w','o'), rank=300
+          &rarr; ['Ġ', 'wor', 'l', 'd']          // merge('wo','r')
+          &rarr; ['Ġ', 'world']                   // ...
+          &rarr; ['Ġworld']                        // final merge
+
+Step 3: Lookup（語彙表を検索、token &rarr; ID）
+  ['Hello', 'Ġworld'] &rarr; [9707, 1879]</code></pre>
+
+            <p>BPE のコアループ：各ラウンドで隣接するすべての token ペアをスキャンし、merge rank が最も低い（優先度が最も高い）ものを見つけて、新しい token にマージする。マージ可能なペアがなくなるまで繰り返す。</p>
+
+<pre><code>// Step 3: Apply BPE merges
+while (tokens.size() &gt; 1) {
+    int best_rank = -1;
+    size_t best_idx = 0;
+    for (size_t j = 0; j &lt; tokens.size() - 1; j++) {
+        std::string key = tokens[j] + " " + tokens[j + 1];
+        auto it = merge_ranks_.find(key);
+        if (it != merge_ranks_.end()) {
+            if (best_rank &lt; 0 || it-&gt;second &lt; best_rank) {
+                best_rank = it-&gt;second;
+                best_idx = j;
+            }
+        }
+    }
+    if (best_rank &lt; 0) break;
+    tokens[best_idx] = tokens[best_idx] + tokens[best_idx + 1];
+    tokens.erase(tokens.begin() + best_idx + 1);
+}</code></pre>
+
+            <p>デコードは逆の操作：token ID から語彙表を検索して token 文字列を取得し、結合後に <code>Ġ</code>（UTF-8: <code>0xC4 0xA0</code>）を空白に置き換える。</p>
+
+            <p>Qwen2.5 の語彙数は 151,936 個——つまり最終的な logits 出力も 151,936 次元のベクトルである。</p>
+
+            <h3>Step 2: Transformer 順伝播 &mdash; 推論エンジンの核心</h3>
+
+            <p>これがエンジン全体で最も重要な部分である。完全な forward pass は何をするのか？</p>
+
+<pre class="diagram"><code>token_ids: [t0, t1, t2, ..., tn]
+                |
+        Embedding Lookup
+                |
+          x: [seq_len, 896]
+                |
+     +----------+----------+
+     |     Transformer      |
+     |      Layer &times; 24       |
+     |                      |
+     |  RMS Norm            |
+     |  Q, K, V Projection  |
+     |  RoPE                |
+     |  Causal Attention    |
+     |  Output Projection   |
+     |  + Residual          |
+     |  RMS Norm            |
+     |  MLP (SwiGLU)        |
+     |  + Residual          |
+     +----------+-----------+
+                |
+          Final RMS Norm
+                |
+        Logits Projection
+                |
+        logits: [151936]</code></pre>
+
+            <p><strong>1. Embedding Lookup</strong></p>
+
+            <p>最もシンプルなステップ：token ID を 896 次元のベクトルにマッピングする。embedding table は [151936, 896] の行列で、検索は 1 行の <code>memcpy</code> で済む：</p>
+
+<pre><code>void embedding(float* out, const float* table,
+               std::size_t token_id, std::size_t hidden_size) {
+    std::memcpy(out, table + token_id * hidden_size,
+                hidden_size * sizeof(float));
+}</code></pre>
+
+            <p><strong>2. RMS Norm</strong></p>
+
+            <p>各層の入力はまず RMS 正規化を行う——LayerNorm に似ているが、平均を引かず、RMS（Root Mean Square）で割るだけ：</p>
+
+<pre><code>void rms_norm(float* out, const float* x, const float* weight,
+              std::size_t n, float eps) {
+    float sum = std::accumulate(x, x + n, 0.0f,
+        [](float acc, float x) { return acc + x * x; });
+    float rms = sqrt(sum / n + eps);
+    for (size_t i = 0; i &lt; n; i++) {
+        out[i] = x[i] / rms * weight[i];
+    }
+}</code></pre>
+
+            <p>数式：<code>out[i] = (x[i] / &radic;(mean(x&sup2;) + &epsilon;)) &times; weight[i]</code>。RMS Norm は Layer Norm より平均値の計算と減算が 1 回ずつ少なく、推論時により高速で、実験的に同等の効果を示す。</p>
+
+            <p><strong>3. Q, K, V 線形投影</strong></p>
+
+            <p>注意機構の最初のステップ：896 次元の隠れ状態を Q, K, V 空間に投影する。これは行列乗算であり——LLM 推論で最も時間のかかる計算である。</p>
+
+<pre><code>// 各 token に対して Q, K, V を計算
+for (std::size_t s = 0; s &lt; seq_len; s++) {
+    const float* inp = norm_out.data() + s * hidden;
+    linear(q.data() + s * num_heads * head_dim,
+           inp, attn.q_proj_weight, q_bias(attn),
+           num_heads * head_dim, hidden, backend);   // Q: [14&times;64, 896]
+    linear(k_new.data() + s * kv_dim,
+           inp, attn.k_proj_weight, k_bias(attn),
+           kv_dim, hidden, backend);                  // K: [2&times;64, 896]
+    linear(v_new.data() + s * kv_dim,
+           inp, attn.v_proj_weight, v_bias(attn),
+           kv_dim, hidden, backend);                  // V: [2&times;64, 896]
+}</code></pre>
+
+            <p>重要な詳細に注意：Qwen2 は <strong>Grouped Query Attention (GQA)</strong> を使用している——14 個の query head が 2 個の KV head を共有する。つまり K と V の次元は 2&times;64=128 であり、Q の 14&times;64=896 よりはるかに小さい。これにより KV cache のメモリ使用量が大幅に削減される一方、モデル品質への影響は非常に小さい。</p>
+
+            <p><strong>4. RoPE（回転位置エンコーディング）</strong></p>
+
+            <p>Transformer 自体は位置不変である——入力の順序を入れ替えても出力は変わらない。RoPE は Q と K に位置依存の回転を適用することで、モデルが各 token のシーケンス内での位置を知ることができるようにする。</p>
+
+            <p>核心的アイデア：head_dim 次元ベクトルの各要素ペア (x<sub>i</sub>, x<sub>i+half</sub>) に対して、位置 pos と周波数 &theta; に基づいて 2 次元回転を行う：</p>
+
+<pre><code>for (std::size_t i = 0; i &lt; half; i++) {
+    float freq = 1.0f / std::pow(theta, (float)(2 * i) / head_dim);
+    float angle = position * freq;
+    float x0 = head[i];
+    float x1 = head[i + half];
+    head[i]        = x0 * cos(angle) - x1 * sin(angle);
+    head[i + half] = x0 * sin(angle) + x1 * cos(angle);
+}</code></pre>
+
+            <p>周波数は低から高へ、低次元は高周波（局所的な位置関係）を、高次元は低周波（長距離依存）をエンコードする。これはフーリエ変換の考え方に似ている。</p>
+
+            <p><strong>5. Causal Attention（因果注意機構）</strong></p>
+
+            <p>これが Transformer の核心である。各 query 位置について、それ以前のすべての token との注意スコアを計算し、value の加重和を求める：</p>
+
+<pre><code>void causal_attention(float* out, const float* q, std::size_t q_idx,
+                      const float* k, const float* v,
+                      std::size_t attend_len, std::size_t num_heads,
+                      std::size_t num_kv_heads, std::size_t head_dim,
+                      float scale, Backend&amp; backend) {
+    std::size_t groups = num_heads / num_kv_heads;  // 14/2 = 7
+
+    for (std::size_t h = 0; h &lt; num_heads; h++) {
+        std::size_t kv_h = h / groups;  // GQA: 7 つの Q head が 1 つの KV head を共有
+
+        // 1. scores = Q &middot; K^T / sqrt(head_dim)
+        for (std::size_t t = 0; t &lt; attend_len; t++) {
+            float dot = 0.0f;
+            for (std::size_t d = 0; d &lt; head_dim; d++) {
+                dot += q_head[d] * k_head[d];
+            }
+            scores[t] = dot * scale;  // scale = 1/&radic;64 = 0.125
+        }
+
+        // 2. attention weights = softmax(scores)
+        backend.softmax(scores.data(), scores.data(), attend_len);
+
+        // 3. output = weighted sum of V
+        for (std::size_t t = 0; t &lt; attend_len; t++) {
+            for (std::size_t d = 0; d &lt; head_dim; d++) {
+                head_out[d] += scores[t] * v_head[d];
+            }
+        }
+    }
+}</code></pre>
+
+            <p>「Causal」の意味は：各 token は自分自身とそれ以前の token のみを参照でき、未来は見えないということ。これは <code>attend_len = pos + s + 1</code> によって実現される——s 番目の token は s+1 個の位置のみを attend する。</p>
+
+            <p><strong>6. MLP（SwiGLU）</strong></p>
+
+            <p>注意機構の後は 2 層 MLP で、Qwen2 は SwiGLU 活性化関数を使用する：</p>
+
+<pre><code>// gate = linear(x, gate_proj)    // [896] &rarr; [4864]
+// up   = linear(x, up_proj)      // [896] &rarr; [4864]
+// gate = silu(gate) * up          // element-wise
+// out  = linear(gate, down_proj)  // [4864] &rarr; [896]
+
+backend.silu(gate.data(), gate.data(), seq_len * intermediate);
+backend.mul(gate.data(), gate.data(), up.data(), seq_len * intermediate);</code></pre>
+
+            <p>SiLU（Swish とも呼ばれる）：<code>silu(x) = x &times; &sigma;(x) = x / (1 + e<sup>-x</sup>)</code>。SwiGLU の「ゲーティング」機構により、ネットワークは情報を選択的に保持またはフィルタリングできる——gate パスがスイッチを制御し、up パスがコンテンツを提供する。</p>
+
+            <p><strong>7. 残差接続</strong></p>
+
+            <p>各 attention ブロックと MLP ブロックの後に残差接続がある：<code>x = x + block_output</code>。これは深層ネットワークの勾配消失問題を解決する——勾配は skip connection に沿って直接逆伝播でき、24 層で徐々にゼロに減衰することがない。</p>
+
+            <p><strong>8. 最終予測</strong></p>
+
+            <p>24 層の Transformer 処理が完了したら、最後の token の隠れ状態を取り、RMS Norm を行い、vocab 次元に投影して logits を得る：</p>
+
+<pre><code>// Final norm (only last token)
+backend.rms_norm(final_out.data(),
+                 x.data() + (seq_len - 1) * hidden,
+                 final_norm_weight, hidden, eps);
+
+// Logits = final_out @ embed_tokens^T  (tied weights)
+linear(logits.data(), final_out.data(), embed_tokens, nullptr,
+       config.vocab_size, hidden, backend);</code></pre>
+
+            <p><strong>tied weights</strong> に注意：logits 投影行列と embedding table は同じ行列である。これは一般的なパラメータ共有テクニックで——入力（token&rarr;ベクトル）と出力（ベクトル&rarr;token 確率）が同じパラメータを使用し、151936&times;896 &asymp; 1.36 億個のパラメータを削減する。</p>
+
+            <h3>Step 3: バグ修正 &mdash; RoPE 回転位置エンコーディングのペアリング規則</h3>
+
+            <p>forward pass を書き終えてモデルを実行したが——出力はすべて文字化けだった。長時間のデバッグの末、問題は RoPE の<strong>ペアリング規則</strong>にあることが判明した。</p>
+
+            <p>RoPE は head_dim 次元のベクトルを 2 つずつペアにして回転させる必要がある。しかしペアリング方法には 2 種類ある：</p>
+
+<pre class="diagram"><code>head_dim = 8 のベクトル: [x0, x1, x2, x3, x4, x5, x6, x7]
+
+Interleaved (GPT-NeoX 規則):
+  ペア (x0,x1), (x2,x3), (x4,x5), (x6,x7)
+  隣接要素をペアリング
+
+Split-half (Qwen2 / Llama 規則):
+  ペア (x0,x4), (x1,x5), (x2,x6), (x3,x7)
+  前半と後半をペアリング</code></pre>
+
+            <p>最初は interleaved 規則を使った（多くの初期 GPT 実装がそうだったため）が、Qwen2 は split-half を使っている。2 つの規則の数学的本質は全く同じ——どちらも 2 次元回転——だが、異なる要素ペアに適用すると、結果は天と地ほど違う。</p>
+
+            <p>デバッグプロセス：</p>
+            <ol>
+                <li>まず Python で同じ入力を実行し、HuggingFace の logits 出力を比較</li>
+                <li>層ごとに比較し、第 1 層の Q projection の結果は正しいが、RoPE の後に不正確になることを発見</li>
+                <li>numpy スクリプトを書いて 2 つの規則でそれぞれ RoPE を計算し、HuggingFace と比較</li>
+                <li>split-half が HuggingFace の結果と一致することを確認し、C++ 実装を修正</li>
+            </ol>
+
+            <p>教訓：<strong>LLM 推論で最もデバッグが難しいのはアルゴリズムのエラーではなく、規則の違いである</strong>。RoPE のペアリング方法、attention mask の実装、weight のレイアウト（[N,K] か [K,N] か）——これらの詳細は論文には書かれておらず、ソースコードを見るしかない。</p>
+
+            <h3>Step 4: KV Cache &mdash; 56 倍の Decode 高速化</h3>
+
+            <p>RoPE を修正し、モデルは正しくテキストを生成できるようになった。しかし速度は悲惨——各 token の生成に完全な forward pass を再実行する必要がある。</p>
+
+            <p>問題は自己回帰生成の本質にある：N 番目の token を生成する際、前の N-1 個の token すべての attention context が必要。naive なアプローチはすべての token を毎回モデルに再入力すること——しかし前の N-1 個の token の K, V は以前のステップで既に計算済み！</p>
+
+<pre class="diagram"><code>Naive (キャッシュなし):
+  Step 1: forward([t0, t1, t2, t3, t4])        &larr; 5 token、5 組の K,V を計算
+  Step 2: forward([t0, t1, t2, t3, t4, t5])     &larr; 6 token、6 組の K,V を再計算
+  Step 3: forward([t0, t1, t2, t3, t4, t5, t6]) &larr; 7 token、7 組の K,V を再計算
+  &rarr; 計算量 O(n&sup2;)：各ステップですべての履歴を再計算
+
+KV Cache:
+  Prefill:  forward([t0, t1, t2, t3, t4])  &larr; 5 組の K,V をキャッシュ
+  Decode 1: forward([t5], pos=5)             &larr; t5 の Q のみ計算、キャッシュの K,V を使用
+  Decode 2: forward([t6], pos=6)             &larr; t6 の Q のみ計算、キャッシュの K,V を使用
+  &rarr; 計算量 O(n)：各ステップで新しい token のみ計算</code></pre>
+
+            <p>KV Cache の実装は直感的——各層で常に増加する K と V のベクトルを維持する：</p>
+
+<pre><code>struct KVCache {
+    std::vector&lt;std::vector&lt;float&gt;&gt; k_cache;  // [num_layers][seq_len * kv_dim]
+    std::vector&lt;std::vector&lt;float&gt;&gt; v_cache;
+    std::size_t seq_len = 0;
+
+    void append(std::size_t layer_idx, const float* new_k,
+                const float* new_v, std::size_t num_new_tokens,
+                std::size_t kv_dim) {
+        std::size_t count = num_new_tokens * kv_dim;
+        auto&amp; kc = k_cache[layer_idx];
+        kc.insert(kc.end(), new_k, new_k + count);
+        auto&amp; vc = v_cache[layer_idx];
+        vc.insert(vc.end(), new_v, new_v + count);
+    }
+};</code></pre>
+
+            <p>forward pass では、新しい token の K, V がキャッシュに追加され、attention は完全なキャッシュ（現在の token だけでなく）を使用する：</p>
+
+<pre><code>// Append new K/V to cache
+kv_cache.append(layer_idx, k_new.data(), v_new.data(), seq_len, kv_dim);
+
+// Attention はキャッシュ内のすべての K/V を使用
+causal_attention(attn_out, q.data(), s,
+                 kv_cache.k_data(layer_idx),   // すべての履歴 K
+                 kv_cache.v_data(layer_idx),   // すべての履歴 V
+                 pos + s + 1,                   // attend 長
+                 num_heads, num_kv_heads, head_dim, scale, backend);</code></pre>
+
+            <p>生成ループは 2 つのフェーズになる：</p>
+
+<pre><code>// Prefill: プロンプト全体を一括処理し、KV Cache を埋める
+auto logits = forward(model, token_ids, 0, kv_cache);
+
+// Decode: 毎回新しい token のみを送る
+for (int step = 0; step &lt; max_tokens; step++) {
+    int next_token = sampler.sample(logits);
+    std::size_t pos = token_ids.size() - 1;
+    logits = forward(model, {next_token}, pos, kv_cache);  // 1 token のみ送信
+}</code></pre>
+
+            <p><strong>ベンチマーク結果</strong>（Google Benchmark, synthetic tiny model）：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>方式</th>
+                        <th>Context=64</th>
+                        <th>比較</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>DecodeNoCache（各ステップで全量再計算）</td>
+                        <td>~20 ms</td>
+                        <td>1&times;</td>
+                    </tr>
+                    <tr>
+                        <td>DecodeWithCache（新しい token のみ計算）</td>
+                        <td>~362 &mu;s</td>
+                        <td><strong>56&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p><strong>56 倍の高速化</strong>。しかもコンテキスト長が増えるほど差は大きくなる——キャッシュなしでは各ステップですべての token の K/V 投影を再計算し、計算量は O(n)；キャッシュありでは 1 token のみ計算し、計算量は O(1)（attention 自体は依然 O(n) だが、投影部分の節約は莫大）。</p>
+
+            <p>GQA もここで効果を発揮する：各層でキャッシュする必要があるのは 2 つの KV head（128 次元）のみで、14 個（896 次元）ではない。24 層モデルでは、KV cache のメモリ使用量が 7 倍削減される。</p>
+
+            <h3>Step 5: OpenBLAS &mdash; 8.6 倍の線形投影高速化</h3>
+
+            <p>プロファイリングの結果、推論時間の大部分が <code>linear()</code> 関数に費やされていることが判明——これは驚くことではない。1 つの Transformer 層には 7 つの線形投影（Q, K, V, O, gate, up, down）があり、それぞれが行列乗算である。Qwen2.5-0.5B の場合、最大の投影は [896, 4864]、すなわち 896&times;4864 &asymp; 436 万回の乗加算演算。24 層で 1 億回になる。</p>
+
+            <p>naive バックエンドの三重ループ matmul は極めて非効率——<a href="matmul-optimization.html">前回の matmul 最適化記事</a>のベースラインと同じで、SIMD なし、タイリングなし、キャッシュ最適化なし。</p>
+
+            <p>最も直接的な解決策：linear 操作を OpenBLAS の <code>cblas_sgemm</code> に置き換える：</p>
+
+<pre><code>void BackendBLAS::linear(float* out, const float* inp, const float* weight,
+                         const float* bias, std::size_t M, std::size_t N,
+                         std::size_t K) {
+    // out[M, N] = inp[M, K] @ weight^T[K, N]
+    // weight is [N, K] row-major, so we use CblasTrans on B.
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                M, N, K, 1.0f, inp, K, weight, K, 0.0f, out, N);
+
+    if (bias) {
+        for (std::size_t i = 0; i &lt; M; i++)
+            for (std::size_t j = 0; j &lt; N; j++)
+                out[i * N + j] += bias[j];
+    }
+}</code></pre>
+
+            <p>weight の保存形式に注意：PyTorch の慣例では weight の shape は [out_features, in_features]、つまり [N, K] の row-major。したがって <code>inp @ weight^T</code> は weight の転置が必要で、<code>CblasTrans</code> パラメータに対応する。</p>
+
+            <p>この 1 行の <code>cblas_sgemm</code> の背後には OpenBLAS の長年の最適化の結晶がある——SIMD ベクトル化、キャッシュフレンドリーなタイルレイアウト、レジスタレベルのマイクロカーネル——まさに前回の記事で 7 ステップかけて達成した最適化そのものである。</p>
+
+            <p><strong>ベンチマーク結果</strong>（aarch64, <code>-c opt</code>）：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Dimension</th>
+                        <th>CPU (naive)</th>
+                        <th>BLAS (OpenBLAS)</th>
+                        <th>高速化</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>64</td>
+                        <td>2,227 ns</td>
+                        <td>884 ns</td>
+                        <td>2.5&times;</td>
+                    </tr>
+                    <tr>
+                        <td>128</td>
+                        <td>12,148 ns</td>
+                        <td>3,804 ns</td>
+                        <td>3.2&times;</td>
+                    </tr>
+                    <tr>
+                        <td>256</td>
+                        <td>58,317 ns</td>
+                        <td>16,672 ns</td>
+                        <td>3.5&times;</td>
+                    </tr>
+                    <tr>
+                        <td>576</td>
+                        <td>366,660 ns</td>
+                        <td>42,761 ns</td>
+                        <td><strong>8.6&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>次元が大きいほど、高速化比は高くなる。小さい行列（dim=64）では、OpenBLAS のスレッドスケジューリングとパッキングのオーバーヘッドが相対的に大きく、効果は限定的。しかし実際のモデルの次元（hidden_size=896, intermediate_size=4864）では、高速化効果は非常に顕著である。</p>
+
+            <p>バックエンドの切り替えは起動時にパラメータを 1 つ追加するだけ：<code>--backend blas</code>。Backend 抽象によりこの切り替えはゼロ侵襲——forward pass のコードは一切変更不要。</p>
+
+            <h3>Step 6: Sampler &mdash; Logits からテキストへ</h3>
+
+            <p>forward pass の出力は 151,936 次元の logits ベクトル——各値が 1 つの token の「可能性スコア」を表す。ここから次の token をどう選ぶか？</p>
+
+            <p><strong>最もシンプルな方法：Greedy（貪欲法）</strong></p>
+
+            <p>logits の最大値に対応する token を直接取る。決定的だが、繰り返しに陥りやすい。</p>
+
+            <p><strong>Temperature Scaling</strong></p>
+
+            <p>logits を temperature パラメータで割り、softmax を通して確率分布に変換する。temperature &lt; 1 は分布をより尖鋭に（より決定的に）、temperature &gt; 1 は分布をより平坦に（よりランダムに）する。</p>
+
+            <p><strong>Top-p（Nucleus Sampling）</strong></p>
+
+            <p>まず token を確率の高い順にソートし、累積確率が top_p 閾値を超えるまで加算し、それらの token のみからサンプリングする。これはランダム性を保ちつつ（greedy のように硬直しない）、低確率の「ノイズ」token を排除する（純粋なランダムのように不合理にならない）。</p>
+
+<pre><code>int Sampler::sample(const std::vector&lt;float&gt;&amp; logits) {
+    if (temperature_ == 0.0f) {
+        return argmax(logits);  // greedy
+    }
+
+    // 1. Temperature scaling + softmax
+    for (std::size_t i = 0; i &lt; n; i++)
+        scaled[i] = logits[i] / temperature_;
+    softmax(scaled);
+
+    // 2. Top-p: sort by probability, keep cumsum &lt;= top_p
+    std::sort(indices.begin(), indices.end(),
+              [&amp;](int a, int b) { return scaled[a] &gt; scaled[b]; });
+
+    float cumsum = 0.0f;
+    for (std::size_t i = 0; i &lt; n; i++) {
+        cumsum += scaled[indices[i]];
+        if (cumsum &gt;= top_p_) { cutoff = i + 1; break; }
+    }
+
+    // 3. Sample from the truncated distribution
+    std::uniform_real_distribution&lt;float&gt; dist(0.0f, kept_sum);
+    float r = dist(rng_);
+    // ... weighted random selection
+}</code></pre>
+
+            <p>デフォルトパラメータは temperature=0.7, top_p=0.9——多様性と一貫性のバランスポイント。</p>
+
+            <h3>すべてを繋ぎ合わせる</h3>
+
+            <p>最終的な推論フロー：</p>
+
+<pre><code>// 1. 設定、重み、tokenizer を読み込む
+auto config = load_config("config.json");
+auto weights = SafeTensorsLoader("model.safetensors").load_all(backend);
+auto model = create_model(config, backend);
+load_weights(model, weights);
+
+// 2. プロンプトをトークナイズ
+auto token_ids = tokenizer.encode("The capital of France is");  // [5 tokens]
+
+// 3. Prefill: プロンプト全体を処理
+KVCache kv_cache(config.num_hidden_layers);
+auto logits = forward(model, token_ids, 0, kv_cache);
+
+// 4. Decode: token ごとに生成
+for (int step = 0; step &lt; max_tokens; step++) {
+    int next_token = sampler.sample(logits);
+    if (next_token == config.eos_token_id) break;
+
+    std::cout &lt;&lt; tokenizer.decode({next_token}) &lt;&lt; std::flush;
+
+    std::size_t pos = token_ids.size() - 1;
+    logits = forward(model, {next_token}, pos, kv_cache);
+    token_ids.push_back(next_token);
+}</code></pre>
+
+            <p>出力：</p>
+
+<pre><code>Model: qwen2 (896d, 24 layers)
+Loading weights...
+Loaded 290 tensors
+Model initialized
+Prompt: "The capital of France is" (5 tokens)
+
+The capital of France is Paris, where the most important cultural
+institutions are located. The city is famous for its museums,
+including the Lou</code></pre>
+
+            <p>動いた。</p>
+
+            <h3>まとめと考察</h3>
+
+            <p>この推論エンジンをゼロから構築して、いくつかの深い気づきがあった：</p>
+
+            <p><strong>1. LLM 推論 = 大量の行列乗算。</strong>1 回の forward pass には 24 層 &times; 7 つの線形投影 = 168 回の matmul がある。これが LLM 推論で GPU がこれほど重要な理由——その核心的な強みは大規模並列 matmul にある。また OpenBLAS の 1 行のコードで 8.6 倍の高速化が得られる理由でもある。</p>
+
+            <p><strong>2. KV Cache は推論最適化の最優先事項。</strong>56 倍の高速化で、実装もシンプル——本質的には append-only の配列。しかし生成の計算量クラスを変える：O(n&sup2;) から O(n) へ。KV Cache なしの LLM 推論は実用上使い物にならない。</p>
+
+            <p><strong>3. 規則の違いはアルゴリズムのバグより発見が難しい。</strong>RoPE の split-half vs interleaved、weight の [N,K] vs [K,N]、BPE の空白プレフィックス——これらは論文では一言で片付けられるが、実装時にはそれぞれが半日のデバッグを要する可能性がある。リファレンス実装（HuggingFace）の中間結果との比較が唯一信頼できるデバッグ手段である。</p>
+
+            <p><strong>4. 抽象層の設計は重要。</strong>Backend インターフェースにより、まず naive ループで正確性を確認し、次に OpenBLAS でパフォーマンスを向上させ、forward pass のコードは一行も変更不要。このシンプルな戦略により、正確性とパフォーマンスの 2 つの問題を同時にデバッグすることを回避できた。</p>
+
+            <p><strong>5. 最大の収穫は理解すること。</strong>これほど多くの LLM フレームワークを使ってきたが、自分で手書きして初めて真に理解できた：なぜ KV Cache が長いコンテキストでこれほど重要なのか、なぜ GQA がメモリを大幅に削減できるのか、なぜ prefill と decode のパフォーマンス特性が全く異なるのか、なぜ tied embedding がメモリを節約しつつ品質を損なわないのか。</p>
+
+            <p>プロジェクト全体は約 1500 行の C++（テストとベンチマークを除く）で、実際の 0.5B モデルを動かしている。</p>
+
+            <h3>Next Plan</h3>
+
+            <p><strong>Update:</strong> 後続の CUDA 最適化が完了した。詳細は <a href="llm-inference-gpu.html">Part 2: CPU から GPU へ &mdash; CUDA 最適化の道</a>を参照。33 tok/s から 504 tok/s を達成した。</p>
+
+            <p>現在のエンジンは動くが、「使いやすい」にはまだ距離がある。次の計画を優先度順に進める：</p>
+
+            <ol>
+                <li><strong>Instruct モデル対応</strong> &mdash; 現在は base model の続き書きのみ対応。Instruct モデルには chat template のフォーマット（<code>&lt;|im_start|&gt;user\n...&lt;|im_end|&gt;</code>）と、複数の stop token の処理が必要。これはモデルを真に「対話可能」にするための前提条件。</li>
+                <li><strong>マルチスレッド並列化</strong> &mdash; 現在は完全にシングルスレッド。最も直接的な最適化は、linear projection の並列化（複数の head の QKV 投影を同時に計算可能）と、attention における複数 head の独立計算。CPU 上でさらに 3-5 倍の向上が見込まれる。</li>
+                <li><strong>CUDA GPU バックエンド</strong> &mdash; CPU 推論のボトルネックは matmul スループット。GPU の Tensor Core は大規模行列乗算に天然に適している。目標は最小限の CUDA バックエンドを書き、cuBLAS で OpenBLAS を置き換え、decode レイテンシをミリ秒レベルからマイクロ秒レベルに下げること。</li>
+                <li><strong>量子化推論 (INT8/INT4)</strong> &mdash; 現在すべての重みは float32 で、0.5B モデルでも 1.9GB を占有する。INT8 量子化でメモリを半減、INT4 でさらに半減でき、同時に SIMD/GPU の整数演算スループットも高い。鍵となる課題は量子化後の精度損失の制御。</li>
+                <li><strong>Continuous Batching</strong> &mdash; 現在は単一シーケンスしか処理できない。本番レベルの推論エンジン（vLLM, TensorRT-LLM）の核心能力は複数のリクエストを同時処理し、KV cache メモリを動的にスケジューリングすること。これには PagedAttention などのより複雑なメモリ管理戦略が関わる。</li>
+            </ol>
+
+            <p><em>"What I cannot create, I do not understand."</em> &mdash; Richard Feynman</p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

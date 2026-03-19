@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shenbi: Building a Programming Language for Kids in the Browser - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Shenbi: Building a Programming Language for Kids in the Browser</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/children-playing-goldfish.jpg" alt="Two Children Playing with Goldfish, Metropolitan Museum of Art">
+                <figcaption>"Two Children Playing with Goldfish" — Children naturally learn through exploration and interaction. Kids' programming should be the same — not teaching syntax, but letting children experience the magic of "what I write can control the world"</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: Scratch is powerful but too complex for young children. Apple Swift Playgrounds is elegant but disconnected from real programming languages. This article shares a different approach — building a bilingual (Chinese/English) Python-like programming language from scratch in the browser, with a complete Lexer → Parser → Compiler → VM pipeline, bidirectional block/code synchronization, and a World abstraction that lets the same language drive different types of games. If you're interested in "how to build a language" or "how to design a kids' programming product," this has the full engineering details.
+            </blockquote>
+
+            <h3>Why Build Our Own</h3>
+
+            <p>Existing kids' programming tools fall roughly into two categories:</p>
+
+            <ul>
+                <li><strong>Scratch-like</strong>: Pure block dragging, extremely powerful (event system, concurrency, message broadcasting), but too many concepts for 5-8 year olds. A "get the character to the goal" task in Scratch requires understanding coordinate systems, event loops, broadcast messages — these aren't the essence of programming, they're Scratch's own complexity</li>
+                <li><strong>Apple Swift Playgrounds-like</strong>: Beautiful 3D interface, guided teaching, great experience. But it teaches Swift syntax, which has nothing to do with Python/JavaScript that kids will eventually use. After finishing Playgrounds, switching to another language means starting from scratch</li>
+            </ul>
+
+            <p>What I wanted was:</p>
+
+            <ol>
+                <li><strong>Simple enough</strong>: 5-year-olds can understand blocks, 8-year-olds can read code</li>
+                <li><strong>Aligned with real languages</strong>: Syntax highly consistent with Python, so learning transfers directly to real Python</li>
+                <li><strong>Bilingual Chinese/English</strong>: <code>if</code> and its Chinese equivalent are the same thing — kids can start in Chinese and gradually switch to English</li>
+                <li><strong>Bidirectional block-code switching</strong>: Not a one-way "blocks generate code" relationship, but blocks and code that can be converted at any time</li>
+            </ol>
+
+            <p>Couldn't find a tool meeting these criteria, so I built one. Called <strong>Shenbi</strong> (Magic Brush) — writing code is like drawing, and what you draw comes alive.</p>
+
+            <h3>Overall Architecture</h3>
+
+<pre><code>┌─────────────────────────────────────────────┐
+│                User Interface                │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │  Block    │  │  Code    │  │  Game    │  │
+│  │  Editor   │  │  Editor  │  │  Canvas  │  │
+│  └─────┬─────┘  └─────┬─────┘  └─────▲─────┘  │
+│        │    ↕ Bidirectional│              │     │
+│        │      sync        │              │     │
+│        └───────┬──────────┘              │     │
+│                ▼                         │     │
+│  ┌──────────────────────┐                │     │
+│  │   MiniPython Language │                │     │
+│  │  Lexer → Parser →     │                │     │
+│  │  Compiler → IR        │                │     │
+│  └──────────┬───────────┘                │     │
+│             ▼                            │     │
+│  ┌──────────────────────┐                │     │
+│  │   Stack-based VM      │───────────────┘     │
+│  │  Step execution /     │                     │
+│  │  Breakpoints /        │                     │
+│  │  Reverse debugging    │                     │
+│  └──────────┬───────────┘                     │
+│             ▼                                 │
+│  ┌──────────────────────┐                     │
+│  │   World (Game World)  │                     │
+│  │  MazeWorld / TurtleWorld / ...             │
+│  └──────────────────────┘                     │
+└─────────────────────────────────────────────┘</code></pre>
+
+            <p>Reading from bottom up: <strong>World</strong> is the game state, <strong>VM</strong> executes code and operates on the World, <strong>Canvas</strong> renders the World's state, <strong>Block/Code editors</strong> are two ways to edit MiniPython code.</p>
+
+            <h3>Part 1: Building a Language</h3>
+
+            <h4>Lexer: Bilingual Implementation Here</h4>
+
+            <p>The core bilingual design is simple: at the Lexer layer, Chinese keywords and English keywords map to the same Token type. The Parser and all subsequent stages have no idea whether the user wrote in Chinese or English.</p>
+
+<pre><code>const KEYWORDS: Record&lt;string, TokenType&gt; = {
+  // Chinese and English map to the same Token
+  '如果': 'IF',      'if': 'IF',
+  '否则如果': 'ELIF', 'elif': 'ELIF',
+  '否则': 'ELSE',    'else': 'ELSE',
+  '重复': 'REPEAT',  'repeat': 'REPEAT',
+  '次': 'TIMES',     'times': 'TIMES',
+  '当': 'WHILE',     'while': 'WHILE',
+  '对于': 'FOR',     'for': 'FOR',
+  '在': 'IN',        'in': 'IN',
+  '定义': 'DEF',     'def': 'DEF',
+  '返回': 'RETURN',  'return': 'RETURN',
+  '真': 'TRUE',      'True': 'TRUE',
+  '假': 'FALSE',     'False': 'FALSE',
+  '和': 'AND',       'and': 'AND',
+  '或': 'OR',        'or': 'OR',
+  '不': 'NOT',       'not': 'NOT',
+  '类': 'CLASS',     'class': 'CLASS',
+};</code></pre>
+
+            <p>Identifiers also support Chinese characters (Unicode CJK range), so variable names can be in Chinese:</p>
+
+<pre><code>// These two code snippets are completely equivalent after lexing
+重复 3 次:
+    前进()
+    左转()
+
+repeat 3 times:
+    forward()
+    turnLeft()</code></pre>
+
+            <p>The Lexer also needs to handle Python-style indentation — using INDENT/DEDENT tokens to represent code block beginnings and endings, rather than curly braces. This is the most complex part of the entire Lexer.</p>
+
+            <h4>Parser → Compiler → IR</h4>
+
+            <p>The Parser is a hand-written recursive descent parser that generates an AST. The Compiler does multi-pass compilation: first collecting function and class definitions, then compiling the main body, and finally compiling function bodies and class methods. Output is a set of linear stack-based instructions:</p>
+
+<pre><code>// IR instruction set (~35 opcodes)
+type OpCode =
+  // Stack operations
+  | 'PUSH' | 'POP' | 'DUP'
+  // Variables
+  | 'LOAD' | 'STORE'
+  // Arithmetic
+  | 'ADD' | 'SUB' | 'MUL' | 'DIV' | 'MOD' | 'NEG'
+  // Comparison
+  | 'EQ' | 'NEQ' | 'LT' | 'GT' | 'LTE' | 'GTE'
+  // Control flow
+  | 'JUMP' | 'JUMP_IF' | 'JUMP_IF_NOT'
+  // Functions
+  | 'CALL' | 'CALL_USER' | 'RETURN'
+  // Data structures
+  | 'ARRAY_CREATE' | 'ARRAY_GET' | 'ARRAY_SET'
+  | 'OBJECT_CREATE' | 'OBJECT_GET' | 'OBJECT_SET'
+  // Classes
+  | 'CLASS_DEF' | 'NEW' | 'METHOD_CALL'
+  | 'HALT' | 'NOP';</code></pre>
+
+            <p>A simple example's compilation result:</p>
+
+<pre><code>// MiniPython source code
+repeat 3 times:
+    forward()
+
+// Compiled IR
+PUSH 0          // Loop counter = 0
+STORE $i        // Save to variable
+PUSH 3          // Loop upper bound
+STORE $limit
+LOAD $i         // ← Loop start
+LOAD $limit
+LT              // i < limit ?
+JUMP_IF_NOT end // Jump out if false
+CALL forward:0  // Call forward(), 0 arguments
+POP             // Discard return value
+LOAD $i
+PUSH 1
+ADD
+STORE $i        // i++
+JUMP loop       // Jump back to loop start
+HALT            // ← end</code></pre>
+
+            <h4>VM: A Pausable Virtual Machine</h4>
+
+            <p>The VM is a stack-based virtual machine: program counter (PC), operand stack, global variable table, call stack. But it doesn't run all instructions at once — it <strong>executes only one step at a time</strong>, then returns control to the caller.</p>
+
+            <p>This is the core requirement for kids' programming: when a child writes <code>forward()</code>, you need to see the character walk one step with animation, then execute the next instruction. If the VM ran everything at once, users would only see the final state.</p>
+
+<pre><code>// VM.step() returns the execution result instead of running to completion
+step(): StepResult {
+  const inst = this.program[this.pc];
+
+  switch (inst.opcode) {
+    case 'CALL': {
+      const { name, argCount } = parseCallArg(inst.arg);
+      const args = this.popN(argCount);
+
+      // Game commands: _forward, _turnLeft, ...
+      if (this.commandHandlers.has(name)) {
+        this.commandHandlers.get(name)!(args);
+        this.stack.push(null);
+        this.pc++;
+        return { action: name, actionArgs: args };
+        //       ↑ Returns to caller: "just executed forward"
+        //         Caller can play animation, then call step() again
+      }
+
+      // Sensors: frontBlocked, atGoal, ...
+      if (this.sensorHandlers.has(name)) {
+        const result = this.sensorHandlers.get(name)!(args);
+        this.stack.push(result);
+        this.pc++;
+        return { sensorQuery: name };
+      }
+
+      // Built-in functions: len, print, random, ...
+      // ...
+    }
+    // ... other opcodes
+  }
+}</code></pre>
+
+            <p>This design also naturally supports <strong>step-by-step debugging</strong> and <strong>breakpoints</strong>: the caller controls when to call <code>step()</code>, and can inspect variables and highlight the current line between each step.</p>
+
+            <p>Furthermore, the VM supports <strong>reverse debugging</strong> — saving a complete VM state snapshot before each step, allowing users to "rewind" program execution. This is particularly helpful for kids understanding code flow.</p>
+
+            <h3>Part 2: Bidirectional Block-Code Synchronization</h3>
+
+            <p>Most block programming platforms are one-directional: blocks generate code, but code can't be converted back to blocks. This means once a child switches to code mode and makes changes, they can never go back to block mode.</p>
+
+            <p>Shenbi implements bidirectional synchronization:</p>
+
+            <h4>Blocks → Code</h4>
+
+            <p>Each block type (command, repeat, while, if, function definition...) has corresponding code generation rules, while maintaining a <code>LineToBlockMap</code> — recording which block ID each generated line of code corresponds to, for highlighting the corresponding block during execution:</p>
+
+<pre><code>function generateBlockCode(block: Block, indent: number,
+                           lineMap: LineToBlockMap) {
+  const spaces = '    '.repeat(indent);
+
+  switch (block.type) {
+    case 'command':
+      lines.push(`${spaces}${commandName}(${args})`);
+      lineMap.set(currentLine, block.id);
+      break;
+
+    case 'repeat':
+      lines.push(`${spaces}repeat ${block.repeatCount} times:`);
+      lineMap.set(currentLine, block.id);
+      // Recursively process child blocks
+      for (const child of block.children) {
+        generateBlockCode(child, indent + 1, lineMap);
+      }
+      break;
+
+    case 'if':
+      lines.push(`${spaces}if ${conditionToCode(block)}:`);
+      // ...
+  }
+}</code></pre>
+
+            <h4>Code → Blocks</h4>
+
+            <p>This is the more interesting direction. Code first goes through the actual Lexer/Parser to compile into an AST, then AST nodes are reverse-converted into blocks:</p>
+
+<pre><code>function parseCodeToBlocks(code: string): Block[] | null {
+  try {
+    const ast = compile(code);  // Use the real compiler to parse
+    return ast.body
+      .map(stmt => statementToBlock(stmt))
+      .filter(b => b !== null);
+  } catch {
+    return null;  // Syntax error, can't convert
+  }
+}</code></pre>
+
+            <p>This reuses MiniPython's compiler — not a separate simplified parser, but actually compiling the code, getting the AST, then converting to blocks. This ensures the code→blocks and blocks→code conversions are perfectly symmetric.</p>
+
+            <p>The difficulty is handling Chinese function names, English function names, and legacy naming mappings. For example, <code>forward</code>, its Chinese equivalent, and <code>move</code> all need to map to the same <code>command</code> type block:</p>
+
+<pre><code>const COMMAND_MAP: Record&lt;string, CommandId&gt; = {
+  move: 'move', turn: 'turn',
+  移动: 'move', 转向: 'turn',
+  forward: 'move', backward: 'move',  // legacy
+  前进: 'move', 后退: 'move',
+  左转: 'turn', 右转: 'turn',
+  setColor: 'setColor', 设置颜色: 'setColor',
+};</code></pre>
+
+            <p>The result: kids assemble logic in block mode, switch to code mode to see corresponding Python code; edit a few lines in code mode, switch back to block mode to see corresponding block changes. The two modes stay synchronized at all times.</p>
+
+            <h3>Part 3: The World Model</h3>
+
+            <p>This is the part I think is best designed. Shenbi doesn't just have maze games — it also has Turtle Graphics, with potential for more game types. The question is: <strong>how do you let the same language and VM drive completely different types of games?</strong></p>
+
+            <p>The answer is the <strong>World abstraction</strong>:</p>
+
+<pre><code>Architecture pattern:
+- World: Data model (state + commands + sensors)
+- VM: Code executor (maps code to World methods)
+- Canvas: Renderer (displays World state)</code></pre>
+
+            <p>Each game type implements its own World, its own VM bindings, and its own Canvas, but shares the same MiniPython language and VM core.</p>
+
+            <h4>MazeWorld</h4>
+
+<pre><code>class MazeWorld {
+  // State
+  grid: Cell[][];
+  x: number; y: number;
+  direction: 'up' | 'down' | 'left' | 'right';
+  collected: number;
+  steps: number;
+
+  // Commands
+  moveForward(): boolean;
+  turnLeft(): void;
+  turnRight(): void;
+  collect(): boolean;
+
+  // Sensors
+  isFrontBlocked(): boolean;
+  isAtGoal(): boolean;
+  hasStarHere(): boolean;
+
+  // Serialization (for VM)
+  toSharedState(): SharedMazeState;
+  syncFromSharedState(state: SharedMazeState): void;
+}</code></pre>
+
+            <h4>TurtleWorld</h4>
+
+<pre><code>class TurtleWorld {
+  // State
+  x: number; y: number;
+  angle: number;
+  penDown: boolean;
+  penColor: string;
+  lines: LineSegment[];
+
+  // Commands
+  forward(distance: number): void;
+  turnLeft(degrees: number): void;
+  penUp(): void;
+  setColor(color: string): void;
+
+  // Serialization
+  toSharedState(): SharedTurtleState;
+  syncFromSharedState(state: SharedTurtleState): void;
+}</code></pre>
+
+            <h4>Key Design: SharedState Bridge</h4>
+
+            <p>World and VM connect through <code>SharedState</code>. When the VM starts, it serializes World state into a plain JavaScript object and injects it into MiniPython's global scope as <code>world</code>:</p>
+
+<pre><code>// MazeVM.loadWithSource()
+loadWithSource(userCode: string): void {
+  const fullCode = MAZE_STDLIB + '\n' + userCode;
+  const program = compileToIR(compile(fullCode));
+  this.sharedState = this.world.toSharedState();
+  this.vm.load(program);
+  this.vm.setGlobal('world', this.sharedState);
+  //                  ↑ MiniPython code can directly read/write world.x, world.y, ...
+}</code></pre>
+
+            <p>Then the MiniPython standard library code directly operates on this <code>world</code> object:</p>
+
+<pre><code># MiniPython standard library (maze)
+def forward():
+    offset = DIRECTION_OFFSETS[world.direction]
+    newX = world.x + offset[0]
+    newY = world.y + offset[1]
+    if getCell(newX, newY) == 'wall':
+        return False
+    _forward()    # ← The only native call, notifies Canvas to play animation
+    return True
+
+def frontBlocked():
+    offset = DIRECTION_OFFSETS[world.direction]
+    newX = world.x + offset[0]
+    newY = world.y + offset[1]
+    return getCell(newX, newY) == 'wall'</code></pre>
+
+            <p>Note: <code>forward()</code>'s collision detection and coordinate calculation are all done by MiniPython itself. Only <code>_forward()</code> is a native command — it tells Canvas "the character moved one step," and Canvas plays the animation. The standard library is <strong>written in its own language</strong>.</p>
+
+            <p>The turtle graphics standard library follows the same pattern:</p>
+
+<pre><code># MiniPython standard library (turtle)
+def forward(distance):
+    radians = world.angle * 3.14159265359 / 180
+    dx = _cos(radians) * distance * world.stepSize
+    dy = _sin(radians) * distance * world.stepSize * -1
+    oldX = world.x
+    oldY = world.y
+    world.x = world.x + dx
+    world.y = world.y + dy
+    if world.penDown:
+        _drawLine(oldX, oldY, world.x, world.y,
+                  world.penColor, world.penWidth)</code></pre>
+
+            <p>Only <code>_cos</code>, <code>_sin</code>, and <code>_drawLine</code> are native — because trigonometric functions and line drawing are things MiniPython can't do. All other coordinate calculations happen in MiniPython.</p>
+
+            <h4>What's Needed to Add a New Game Type</h4>
+
+            <p>The World model makes extending new games very clear:</p>
+
+            <ol>
+                <li>Define a new World class (state + commands + sensors + toSharedState)</li>
+                <li>Write a corresponding VM binding class, registering a few native commands</li>
+                <li>Write the standard library in MiniPython — most game logic goes here</li>
+                <li>Write a Canvas component to render World state</li>
+            </ol>
+
+            <p>The language, compiler, VM core, and block editor — all reused, zero modifications.</p>
+
+            <h3>Level System: Conditions Are Also Expressions</h3>
+
+            <p>Each level is a JSON file with the map defined using ASCII art:</p>
+
+<pre><code>{
+  "id": "maze-01",
+  "name": "First Steps",
+  "grid": [
+    "########",
+    "#>...*G#",    // > = player facing right, * = star, G = goal
+    "########"
+  ],
+  "availableBlocks": ["command"],
+  "winCondition": "collectedCount() >= 1 and atGoal()",
+  "failCondition": "stepCount() > 10",
+  "hints": [
+    "Use the Forward block to move the robot",
+    "Keep going until you reach the flag!"
+  ]
+}</code></pre>
+
+            <p><code>winCondition</code> and <code>failCondition</code> aren't hardcoded enums — they're <strong>MiniPython expressions</strong>, evaluated by the VM. This means level designers (teachers) can combine arbitrary conditions without changing code:</p>
+
+<pre><code>// Various win conditions
+"atGoal()"                                // Reach the goal
+"collectedCount() >= 3 and atGoal()"      // Collect 3 stars + reach goal
+"stepCount() <= 8 and atGoal()"           // Reach goal within 8 steps
+"collectedCount() == getRemainingStars()" // Collect all stars</code></pre>
+
+            <h3>Summary</h3>
+
+            <p>Back to the original goals:</p>
+
+            <ul>
+                <li><strong>Simple enough</strong> → Block mode lets 5-year-olds get started, code mode syntax is consistent with Python</li>
+                <li><strong>Aligned with real languages</strong> → MiniPython's syntax is a subset of Python, learning transfers directly to real Python</li>
+                <li><strong>Bilingual Chinese/English</strong> → Implemented via keyword mapping at the Lexer layer, with the rest of the pipeline completely unaware</li>
+                <li><strong>Bidirectional block-code switching</strong> → Reverse conversion from code→blocks achieved by reusing the compiler's AST</li>
+            </ul>
+
+            <p>The three most satisfying engineering designs:</p>
+
+            <ol>
+                <li><strong>Bilingual handling only at the Lexer layer</strong>: One keyword mapping table solves the problem. Parser/Compiler/VM don't need to care about language. This decision prevented the entire system's complexity from doubling due to "bilingual support"</li>
+                <li><strong>World abstraction</strong>: Game worlds are pure data models, the VM bridges through SharedState, and standard libraries are written in the language itself. Adding new games doesn't require changing the language or VM</li>
+                <li><strong>VM's step() design</strong>: Executing only one step at a time instead of running to completion makes animation playback, step debugging, breakpoints, and reverse debugging all feel natural</li>
+            </ol>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

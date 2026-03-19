@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCaml で URL Router を書く：面白いオーバーエンジニアリング - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>OCaml で URL Router を書く：面白いオーバーエンジニアリング</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/piranesi-carceri.jpg" alt="Le Carceri d'Invenzione by Giovanni Battista Piranesi">
+                <figcaption>Giovanni Battista Piranesi、《想像の牢獄》(Le Carceri d'Invenzione)、c. 1761 — 幾重にも重なるアーチと階段は、オーバーエンジニアリングされたルーティングシステムのようだ</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：これは「オーバーエンジニアリング」の実験である——OCaml の ocamllex + menhir（コンパイラツールチェーン）を使って URL ルーティングマッチングを実装し、js_of_ocaml で JavaScript にコンパイルして Node.js で動かす。実用的な価値は限られるが、コンパイラフロントエンド技術（字句解析、構文解析、AST）が日常的な問題にどう適用できるかに興味があれば、面白いケーススタディである。
+            </blockquote>
+
+            <h3>きっかけ</h3>
+
+            <p>きっかけは単純だった。Next.js 風の SSR フレームワークの実験をしていて、ルーティングマッチャーが必要になった。普通なら正規表現か <code>path-to-regexp</code> のようなライブラリを使って 10 行で済ませるところだ。しかしちょうど OCaml を学んでいたので、「ocamllex + menhir でまともなルーティングパーサーが書けないか？」と思い立った。</p>
+
+            <p>結果が <strong>ssrrouter</strong>——コンパイラフロントエンド技術スタックで URL を解析するルーティングライブラリである。独自の字句解析器、構文解析器、AST、型システム（int と string しかないが）を持ち、最終的に js_of_ocaml で JavaScript にコンパイルされ、Node.js の SSR サーバーで動作する。</p>
+
+            <h3>どう動くのか</h3>
+
+            <p>システム全体の処理フロー：</p>
+
+<pre><code>路由定义字符串
+    ↓ Lexer (ocamllex)
+Token 流
+    ↓ Parser (menhir)
+AST (route_pattern)
+    ↓ Matcher
+匹配结果 + 参数绑定</code></pre>
+
+            <h3>第一歩：AST の定義</h3>
+
+            <p>まずルーティングの型システムを定義する。ルーティングパターンは複数のセグメントで構成され、各セグメントは静的パス、スラッシュ、または型付きパラメータのいずれかである：</p>
+
+<pre><code>(* ast.ml *)
+type param = IntParam of string | StringParam of string
+type value = StringValue of string | IntValue of int
+
+type segment = Static of string | Slash | Param of param
+
+type route_pattern = {
+  path : string;
+  segments : segment list;
+  entrypoint : string;
+}</code></pre>
+
+            <p>同時にルーティングインスタンス（実際の URL）も定義する。こちらのセグメントはパターンではなく具体的な値である：</p>
+
+<pre><code>type segment_instance = IStatic of string | ISlash | IValue of value
+
+type route_instance = {
+  path : string;
+  segments : segment_instance list;
+  query_params : query_param list;
+}</code></pre>
+
+            <p>ここでの重要な設計は、<strong>ルーティング定義とルーティングインスタンスが異なる型を使う</strong>ことである。定義には <code>Param (IntParam "id")</code> があり、インスタンスには <code>IValue (IntValue 42)</code> がある。これにより型システムがマッチングロジックの正確性をチェックしてくれる。</p>
+
+            <h3>第二歩：字句解析</h3>
+
+            <p>ocamllex で文字列をトークンに分割する：</p>
+
+<pre><code>(* lexer.mll *)
+rule token = parse
+    | '/'       { SLASH }
+    | ':'       { COLON }
+    | '('       { LPAREN }
+    | ')'       { RPAREN }
+    | '?'       { QUESTION_MARK }
+    | '='       { EQUALS }
+    | '&'       { AMPERSAND }
+    | "route"   { ROUTE }
+    | "int"     { INT_TYPE }
+    | "string"  { STRING_TYPE }
+    | ['0'-'9']+ as n { NUMBER (int_of_string n) }
+    | ['A'-'Z']['a'-'z''A'-'Z''0'-'9']*"Entrypoint" as e { ENTRYPOINT e }
+    | ['a'-'z']['a'-'z''A'-'Z''0'-'9''-']* as id { ID id }
+    | [' ' '\t' '\n']     { token lexbuf }
+    | eof       { EOF }
+    | _         { raise (LexError ("Unexpected char: " ^ Lexing.lexeme lexbuf)) }</code></pre>
+
+            <p><code>ENTRYPOINT</code> のマッチングルールに注目：大文字で始まり "Entrypoint" で終わる必要がある。これは規約であり、ルーティング定義は次のような形になる：</p>
+
+<pre><code>route /admin/:id(int) AdminDetailEntrypoint</code></pre>
+
+            <h3>第三歩：構文解析</h3>
+
+            <p>menhir（OCaml のパーサージェネレータ）で文法を定義する：</p>
+
+<pre><code>(* parser.mly *)
+route:
+  | ROUTE segments = route_path entrypoint = ENTRYPOINT EOF  {
+    {
+      path = build_path_from_segments segments;
+      segments = segments;
+      entrypoint = entrypoint;
+    }
+  }
+
+route_segments:
+  | p = ID rest = route_segments_tail     { Static p :: rest }
+  | param = param_segment rest = route_segments_tail  { param :: rest }
+  |                                    { [] }
+
+param_segment:
+  | COLON id = ID LPAREN INT_TYPE RPAREN  { Param (IntParam id) }
+  | COLON id = ID LPAREN STRING_TYPE RPAREN { Param (StringParam id) }</code></pre>
+
+            <p>Parser はルーティング定義とルーティングインスタンス（クエリストリング付き）の両方を処理し、二つの生成規則が同じ lexer を共有する。</p>
+
+            <h3>第四歩：マッチング</h3>
+
+            <p>マッチャーのコアロジックは驚くほどシンプルで、セグメントごとに比較し、型が一致する必要がある：</p>
+
+<pre><code>(* matcher.ml *)
+let match_segment (pattern : segment) (instance : segment_instance) =
+  match (pattern, instance) with
+  | Static s1, IStatic s2 -> s1 = s2
+  | Static s1, IValue (StringValue s2) -> s1 = s2
+  | Slash, ISlash -> true
+  | Param (IntParam _), IValue (IntValue _) -> true
+  | Param (StringParam _), IValue (StringValue _) -> true
+  | _ -> false
+
+let match_route (pattern : route_pattern) instance =
+  List.length pattern.segments = List.length instance.segments
+  && List.for_all2 match_segment pattern.segments instance.segments</code></pre>
+
+            <p>マッチング成功後、Router はパラメータバインディングとクエリパラメータを抽出する：</p>
+
+<pre><code>(* router.ml *)
+let extract_bindings pattern_segments instance_segments =
+  List.fold_left2
+    (fun acc pattern_seg instance_seg ->
+      match (pattern_seg, instance_seg) with
+      | Param (StringParam name), IValue value -> { name; value } :: acc
+      | Param (IntParam name), IValue value -> { name; value } :: acc
+      | _, _ -> acc)
+    [] pattern_segments instance_segments</code></pre>
+
+            <h3>第五歩：JavaScript へのコンパイル</h3>
+
+            <p>最後のステップは js_of_ocaml で JS インターフェースを公開すること：</p>
+
+<pre><code>(* jsmain.ml *)
+Js.export "ssrrouter"
+  (object%js
+     method createRouter routes =
+       let routes_list =
+         routes |> Js.to_array |> Array.to_list |> List.map Js.to_string
+       in
+       let r = Router.create routes_list in
+       current_router := Some r
+
+     method lookup path =
+       match !current_router with
+       | None -> Js.null
+       | Some router ->
+           match Router.lookup router (Js.to_string path) with
+           | None -> Js.null
+           | Some result -> (* JS オブジェクトを構築して返す *)
+  end)</code></pre>
+
+            <p>Node.js での使用方法は次の通り：</p>
+
+<pre><code>const ssrrouter = require("./ssrrouter");
+
+ssrrouter.createRouter([
+  "route /      AppEntrypoint",
+  "route /admin AdminEntrypoint",
+  "route /admin/:id(int) AppEntrypoint",
+]);
+
+const result = ssrrouter.lookup("/admin/42?sort=name");
+// { entrypoint: "AppEntrypoint", bindings: [{name:"id", value:42}], queryParams: [{key:"sort", value:"name"}] }</code></pre>
+
+            <h3>良かった点</h3>
+
+            <ul>
+                <li><strong>型安全なパラメータ</strong>：ルーティング定義段階で <code>int</code> と <code>string</code> を区別し、<code>/users/42</code> は <code>:id(int)</code> にマッチし、<code>/users/john</code> は <code>:name(string)</code> にマッチする。実行時の手動変換やバリデーションが不要になる。</li>
+                <li><strong>コンパイラフロントエンドの完全な体験</strong>：Lexer → Parser → AST → 意味処理、小さいながらも一通り揃っている。コンパイラフロントエンドを学びたいなら、URL router を書く方が電卓を書くよりずっと面白い。</li>
+                <li><strong>親切なエラーメッセージ</strong>：完全な lexer/parser があるため、構文エラーを行番号と列番号で正確に特定でき、大雑把な "invalid route" ではなくなる。</li>
+                <li><strong>OCaml の pattern matching はこのシーンに最適</strong>：マッチャーのコアロジックは match 式で非常に明快に書け、ルールのほぼ直訳になる。</li>
+                <li><strong>クロス言語での再利用</strong>：OCaml で一度書き、js_of_ocaml で JS にコンパイルすれば、サーバーサイドとクライアントサイドで同じルーティングロジックを使える。</li>
+            </ul>
+
+            <h3>良くなかった点</h3>
+
+            <ul>
+                <li><strong>オーバーエンジニアリングの典型</strong>：コンパイラ技術スタックで URL を解析するのは、ロケットで出前を届けるようなものだ。<code>path-to-regexp</code> は正規表現で同じことをコード量一桁少なく実現し、実戦で長く使われている。</li>
+                <li><strong>ビルドチェーンの複雑さ</strong>：OCaml ツールチェーン（opam、dune）+ js_of_ocaml が必要で、CI を動かすだけでも苦労する。チームに OCaml を書ける人がいなければ、保守コストは極めて高い。</li>
+                <li><strong>マッチングアルゴリズムが素朴すぎる</strong>：<code>List.find_opt</code> ですべてのルーティングをリニアスキャンしている。本格的なルーター（Go の httprouter など）は radix tree を使い、O(パス長) でマッチングできる。ルーティングが増えると遅くなる。</li>
+                <li><strong>ワイルドカードとネストルーティング未対応</strong>：<code>/api/*</code> や <code>/files/**</code> のような glob マッチングも、ルーティングのネスト（layout routes）もない。フレームワークレベルのルーターとしては機能が限定的すぎる。</li>
+                <li><strong>型システムが単純すぎる</strong>：int と string しかない。実際のプロジェクトでは UUID、日付、列挙型などのパラメータ型も必要である。</li>
+                <li><strong>js_of_ocaml の JS 連携が辛い</strong>：<code>jsmain.ml</code> のコードを見ればわかる——手動で JS オブジェクトを構築し、手動で型変換を行い、型安全性は皆無。この部分のコードは純粋な OCaml 部分よりもはるかに醜い。</li>
+            </ul>
+
+            <h3>共有に値する経験</h3>
+
+            <ul>
+                <li><strong>コンパイラ技術はコンパイラを書くためだけのものではない</strong>：Lexer/Parser の仕組みは構造を持つ任意の入力に適用できる——設定ファイル、DSL、クエリ言語、ルーティングルール。一度マスターすれば、多くの場面で活用できることに気づくだろう。</li>
+                <li><strong>OCaml の代数的データ型 + pattern matching はツリー構造処理の最良のツール</strong>：AST の定義とマッチングコードはほぼ仕様の直訳であり、コンパイラがすべてのケースを処理しているかチェックしてくれる（exhaustiveness check）。</li>
+                <li><strong>「正しい」アプローチが必ずしも「適切な」アプローチではない</strong>：計算機科学の観点からは、formal grammar でルーティング構文を定義するのは「正しい」。しかしエンジニアリングの観点からは、正規表現で十分である。いつ何を使うべきかを知ることは、すべてを使えることより重要だ。</li>
+                <li><strong>js_of_ocaml のポジショニング</strong>：既存の OCaml ライブラリをブラウザにコンパイルして使う場合（例えば OCaml の各種形式検証ツール）には適しているが、JS との大量の相互運用が必要なプロジェクトをゼロから書くには適さない。コードの半分が <code>Js.Unsafe.obj</code> の構築なら、TypeScript で直接書いた方が良い。</li>
+                <li><strong>小さなプロジェクトは最良の学習方法</strong>：このルーターは「実用的でない」が、書き終えた後に lexer generator、parser generator、AST 設計、クロス言語コンパイルについて直感的な理解が得られた。これらの知識は、後に他のコンパイラのコードを読む際に繰り返し役立った。</li>
+            </ul>
+
+            <h3>まとめ</h3>
+
+            <p>ssrrouter は典型的な「学習のためのオーバーエンジニアリング」プロジェクトである。シンプルな問題に対して最もヘビーなアプローチを使ったが、その過程でコンパイラフロントエンドのコア概念をカバーした：字句解析、構文解析、AST 設計、型マッチング、クロス言語コンパイル。</p>
+
+            <p>もしコンパイラや OCaml を学んでいるなら、同様の小さな問題を見つけて練習することをお勧めする。「プログラミング言語を作る」からは始めないこと——大きすぎる。URL router、SQL サブセットパーサー、Markdown レンダラーから始めよう。問題が十分に小さいからこそ、各工程をしっかり理解できる。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

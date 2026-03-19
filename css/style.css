@@ -355,3 +355,35 @@ footer {
         display: none;
     }
 }
+
+/* Language Switcher */
+.lang-switch {
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.lang-switch a {
+    color: #999;
+    text-decoration: none;
+}
+
+.lang-switch a:hover {
+    color: #0066cc;
+}
+
+.lang-switch .lang-current {
+    color: #333;
+    font-weight: 600;
+}
+
+@media (max-width: 600px) {
+    header nav {
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+    .lang-switch {
+        order: -1;
+        width: 100%;
+        text-align: right;
+    }
+}

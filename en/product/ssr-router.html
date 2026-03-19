@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Writing a URL Router in OCaml: A Fun Over-Engineering Exercise - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Writing a URL Router in OCaml: A Fun Over-Engineering Exercise</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/piranesi-carceri.jpg" alt="Le Carceri d'Invenzione by Giovanni Battista Piranesi">
+                <figcaption>Giovanni Battista Piranesi, "Imaginary Prisons" (Le Carceri d'Invenzione), c. 1761 — Layers upon layers of arches and staircases, much like an over-engineered routing system</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: This is an "over-engineering" experiment — using OCaml's ocamllex + menhir (compiler toolchain) to implement URL route matching, then compiling to JavaScript via js_of_ocaml to run in Node.js. Limited practical value, but if you're interested in how compiler frontend techniques (lexical analysis, parsing, AST) can be applied to everyday problems, this is an interesting case study.
+            </blockquote>
+
+            <h3>Origin</h3>
+
+            <p>The origin is simple: I was building a Next.js-like SSR framework experiment and needed a route matcher. A normal person would use regex or a library like <code>path-to-regexp</code>, solving it in ten lines of code. But I happened to be learning OCaml at the time and thought: could I write a "proper" route parser with ocamllex + menhir?</p>
+
+            <p>The result is <strong>ssrrouter</strong> — a routing library that uses compiler frontend technology to parse URLs. It has its own lexical analyzer, parser, AST, type system (though only int and string), and is finally compiled to JavaScript via js_of_ocaml to run in Node.js's SSR server.</p>
+
+            <h3>How It Works</h3>
+
+            <p>The entire system's processing flow:</p>
+
+<pre><code>Route definition string
+    ↓ Lexer (ocamllex)
+Token stream
+    ↓ Parser (menhir)
+AST (route_pattern)
+    ↓ Matcher
+Match result + parameter bindings</code></pre>
+
+            <h3>Step 1: Define the AST</h3>
+
+            <p>First, define the route type system. A route pattern consists of multiple segments, where each segment can be a static path, a slash, or a typed parameter:</p>
+
+<pre><code>(* ast.ml *)
+type param = IntParam of string | StringParam of string
+type value = StringValue of string | IntValue of int
+
+type segment = Static of string | Slash | Param of param
+
+type route_pattern = {
+  path : string;
+  segments : segment list;
+  entrypoint : string;
+}</code></pre>
+
+            <p>Also define route instances (actual URLs), whose segments are concrete values rather than patterns:</p>
+
+<pre><code>type segment_instance = IStatic of string | ISlash | IValue of value
+
+type route_instance = {
+  path : string;
+  segments : segment_instance list;
+  query_params : query_param list;
+}</code></pre>
+
+            <p>The key design here is: <strong>route definitions and route instances use different types</strong>. Definitions have <code>Param (IntParam "id")</code>, instances have <code>IValue (IntValue 42)</code>. This lets the type system help verify matching logic correctness.</p>
+
+            <h3>Step 2: Lexical Analysis</h3>
+
+            <p>Using ocamllex to split strings into tokens:</p>
+
+<pre><code>(* lexer.mll *)
+rule token = parse
+    | '/'       { SLASH }
+    | ':'       { COLON }
+    | '('       { LPAREN }
+    | ')'       { RPAREN }
+    | '?'       { QUESTION_MARK }
+    | '='       { EQUALS }
+    | '&'       { AMPERSAND }
+    | "route"   { ROUTE }
+    | "int"     { INT_TYPE }
+    | "string"  { STRING_TYPE }
+    | ['0'-'9']+ as n { NUMBER (int_of_string n) }
+    | ['A'-'Z']['a'-'z''A'-'Z''0'-'9']*"Entrypoint" as e { ENTRYPOINT e }
+    | ['a'-'z']['a'-'z''A'-'Z''0'-'9''-']* as id { ID id }
+    | [' ' '\t' '\n']     { token lexbuf }
+    | eof       { EOF }
+    | _         { raise (LexError ("Unexpected char: " ^ Lexing.lexeme lexbuf)) }</code></pre>
+
+            <p>Note the <code>ENTRYPOINT</code> matching rule: must start with uppercase and end with "Entrypoint." This is a convention — route definitions look like this:</p>
+
+<pre><code>route /admin/:id(int) AdminDetailEntrypoint</code></pre>
+
+            <h3>Step 3: Parsing</h3>
+
+            <p>Using menhir (OCaml's parser generator) to define the grammar:</p>
+
+<pre><code>(* parser.mly *)
+route:
+  | ROUTE segments = route_path entrypoint = ENTRYPOINT EOF  {
+    {
+      path = build_path_from_segments segments;
+      segments = segments;
+      entrypoint = entrypoint;
+    }
+  }
+
+route_segments:
+  | p = ID rest = route_segments_tail     { Static p :: rest }
+  | param = param_segment rest = route_segments_tail  { param :: rest }
+  |                                    { [] }
+
+param_segment:
+  | COLON id = ID LPAREN INT_TYPE RPAREN  { Param (IntParam id) }
+  | COLON id = ID LPAREN STRING_TYPE RPAREN { Param (StringParam id) }</code></pre>
+
+            <p>The Parser also handles route instances (with query strings), with two sets of productions sharing the same lexer.</p>
+
+            <h3>Step 4: Matching</h3>
+
+            <p>The matcher's core logic is surprisingly simple — compare segments one by one, types must match:</p>
+
+<pre><code>(* matcher.ml *)
+let match_segment (pattern : segment) (instance : segment_instance) =
+  match (pattern, instance) with
+  | Static s1, IStatic s2 -> s1 = s2
+  | Static s1, IValue (StringValue s2) -> s1 = s2
+  | Slash, ISlash -> true
+  | Param (IntParam _), IValue (IntValue _) -> true
+  | Param (StringParam _), IValue (StringValue _) -> true
+  | _ -> false
+
+let match_route (pattern : route_pattern) instance =
+  List.length pattern.segments = List.length instance.segments
+  && List.for_all2 match_segment pattern.segments instance.segments</code></pre>
+
+            <p>After a successful match, the Router extracts parameter bindings and query params:</p>
+
+<pre><code>(* router.ml *)
+let extract_bindings pattern_segments instance_segments =
+  List.fold_left2
+    (fun acc pattern_seg instance_seg ->
+      match (pattern_seg, instance_seg) with
+      | Param (StringParam name), IValue value -> { name; value } :: acc
+      | Param (IntParam name), IValue value -> { name; value } :: acc
+      | _, _ -> acc)
+    [] pattern_segments instance_segments</code></pre>
+
+            <h3>Step 5: Compiling to JavaScript</h3>
+
+            <p>The final step is exposing a JS interface via js_of_ocaml:</p>
+
+<pre><code>(* jsmain.ml *)
+Js.export "ssrrouter"
+  (object%js
+     method createRouter routes =
+       let routes_list =
+         routes |> Js.to_array |> Array.to_list |> List.map Js.to_string
+       in
+       let r = Router.create routes_list in
+       current_router := Some r
+
+     method lookup path =
+       match !current_router with
+       | None -> Js.null
+       | Some router ->
+           match Router.lookup router (Js.to_string path) with
+           | None -> Js.null
+           | Some result -> (* Construct JS object to return *)
+  end)</code></pre>
+
+            <p>Using it in Node.js looks like:</p>
+
+<pre><code>const ssrrouter = require("./ssrrouter");
+
+ssrrouter.createRouter([
+  "route /      AppEntrypoint",
+  "route /admin AdminEntrypoint",
+  "route /admin/:id(int) AppEntrypoint",
+]);
+
+const result = ssrrouter.lookup("/admin/42?sort=name");
+// { entrypoint: "AppEntrypoint", bindings: [{name:"id", value:42}], queryParams: [{key:"sort", value:"name"}] }</code></pre>
+
+            <h3>The Good</h3>
+
+            <ul>
+                <li><strong>Type-safe parameters</strong>: Distinguishing <code>int</code> and <code>string</code> at route definition time. <code>/users/42</code> matches <code>:id(int)</code>, <code>/users/john</code> matches <code>:name(string)</code>. No runtime manual conversion and validation needed.</li>
+                <li><strong>Complete compiler frontend experience</strong>: Lexer → Parser → AST → Semantic processing. Small but complete. If you want to learn compiler frontends, writing a URL router is more interesting than writing a calculator.</li>
+                <li><strong>Friendly error messages</strong>: With a complete lexer/parser, syntax errors can be precisely located to line and column number, rather than a generic "invalid route."</li>
+                <li><strong>OCaml's pattern matching is naturally suited for this scenario</strong>: The matcher's core logic expressed with match expressions is very clear, almost a direct translation of the rules.</li>
+                <li><strong>Cross-language reuse</strong>: Write once in OCaml, compile to JS via js_of_ocaml, and use the same routing logic on both server and client.</li>
+            </ul>
+
+            <h3>The Bad</h3>
+
+            <ul>
+                <li><strong>A textbook example of over-engineering</strong>: Using compiler technology to parse URLs is like using a rocket to deliver food. <code>path-to-regexp</code> does the same thing with regex, an order of magnitude less code, and battle-tested.</li>
+                <li><strong>Complex build chain</strong>: Requires the OCaml toolchain (opam, dune) + js_of_ocaml. Just getting CI to work is painful. If nobody on the team writes OCaml, maintenance cost is extremely high.</li>
+                <li><strong>Naive matching algorithm</strong>: Uses <code>List.find_opt</code> to linearly scan all routes. Real routers (like Go's httprouter) use radix trees, matching in O(path length). This gets slow with many routes.</li>
+                <li><strong>No wildcards or nested routes</strong>: No <code>/api/*</code> or <code>/files/**</code> glob matching, no route nesting (layout routes). As a framework-level router, features are too limited.</li>
+                <li><strong>Type system too simple</strong>: Only int and string. Real projects also need UUID, date, enum, and other parameter types.</li>
+                <li><strong>js_of_ocaml's JS interop is painful</strong>: Look at the code in <code>jsmain.ml</code> — manually constructing JS objects, manual type conversions, zero type safety. This part of the code is much uglier than the pure OCaml parts.</li>
+            </ul>
+
+            <h3>Lessons Worth Sharing</h3>
+
+            <ul>
+                <li><strong>Compiler techniques aren't just for writing compilers</strong>: The Lexer/Parser toolkit applies to any structured input — config files, DSLs, query languages, routing rules. Once you master it, you'll find many places to apply it.</li>
+                <li><strong>OCaml's algebraic data types + pattern matching are the best tools for processing tree structures</strong>: AST definitions and matching code are almost direct translations of specifications, and the compiler checks whether you've handled all cases (exhaustiveness check).</li>
+                <li><strong>The "correct" approach isn't necessarily the "suitable" approach</strong>: From a computer science perspective, defining route syntax with a formal grammar is "correct." But from an engineering perspective, a regex suffices. Knowing when to use what is more important than knowing everything.</li>
+                <li><strong>js_of_ocaml's positioning</strong>: It's suitable for compiling existing OCaml libraries to the browser (like OCaml's various formal verification tools), but not for building new projects with heavy JS interop from scratch. If half your code is constructing <code>Js.Unsafe.obj</code>, you'd be better off just writing TypeScript.</li>
+                <li><strong>Small projects are the best way to learn</strong>: This router is "useless," but after building it, I gained intuitive understanding of lexer generators, parser generators, AST design, and cross-language compilation. This knowledge was repeatedly useful when reading other compiler code later.</li>
+            </ul>
+
+            <h3>Summary</h3>
+
+            <p>ssrrouter is a typical "over-engineering for the sake of learning" project. It used the heaviest approach to solve a simple problem, but in the process covered core compiler frontend concepts: lexical analysis, parsing, AST design, type matching, and cross-language compilation.</p>
+
+            <p>If you're also learning compilers or OCaml, I recommend finding a similar small problem to practice with. Don't start with "writing a programming language" — that's too big. Start with a URL router, a SQL subset parser, or a Markdown renderer. The problem needs to be small enough that you can fully understand every step.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CPU から GPU へ：LLM 推論エンジンの CUDA 最適化の道 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>CPU から GPU へ：LLM 推論エンジンの CUDA 最適化の道</h2>
+            <time>2026-03-18</time>
+
+            <div class="series-nav">
+                <strong>Series:</strong> LLM Inference Engine<br>
+                <a href="llm-inference-engine.html">Part 1: ゼロから生成まで &mdash; 純粋な C++ で推論エンジンを一から構築</a><br>
+                <span class="current">Part 2: CPU から GPU へ &mdash; CUDA 最適化の道 (本稿)</span>
+            </div>
+
+            <figure class="post-cover">
+                <img src="../../images/charlie-chaplin-modern-times.jpg" alt="Charlie Chaplin, Modern Times (1936)">
+                <figcaption>Charlie Chaplin,《モダン・タイムス》, 1936 &mdash; 手作業から機械への加速</figcaption>
+            </figure>
+
+            <h3>はじめに</h3>
+
+            <p><a href="llm-inference-engine.html">前回の記事</a>では、純粋な C++ でゼロから LLM 推論エンジンを構築し、Qwen2.5-0.5B を動かした。当時 CPU（OpenBLAS + INT8 量子化）で 33 tok/s を達成していた。</p>
+
+            <p>この記事では続く最適化の過程を記録する：エンジンを GPU に移し、33 tok/s から <strong>504 tok/s</strong> まで一歩ずつ引き上げた。各最適化ステップには明確なプロファイリングデータに基づく裏付けがあり、推測ではない。</p>
+
+            <p>最適化パスの全体像：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>フェーズ</th>
+                        <th>Decode スループット</th>
+                        <th>向上</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>CPU BLAS + INT8</td>
+                        <td>33 tok/s</td>
+                        <td>baseline</td>
+                    </tr>
+                    <tr>
+                        <td>CUDA + cuBLAS + INT8</td>
+                        <td>110 tok/s</td>
+                        <td>3.3&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ FP16 inference</td>
+                        <td>153 tok/s</td>
+                        <td>4.6&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ Flash Attention</td>
+                        <td>161 tok/s</td>
+                        <td>4.9&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ GPU-resident sampling</td>
+                        <td>161 tok/s</td>
+                        <td>-</td>
+                    </tr>
+                    <tr>
+                        <td>+ CUDA caching allocator</td>
+                        <td><strong>504 tok/s</strong></td>
+                        <td><strong>15.3&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>最後のステップ（caching allocator）が最大の向上をもたらしたが、<code>nsys</code> プロファイリングが本当のボトルネックを明らかにしなければ、メモリ割り当ての最適化を思いつくことはなかっただろう。これがこの記事で最も伝えたいポイントである：<strong>先にプロファイル、次に最適化</strong>。</p>
+
+            <h3>Step 1: CUDA バックエンド &mdash; 計算を GPU に移す</h3>
+
+            <p>前回の Backend 抽象がここで効果を発揮する。新しい <code>BackendCUDA</code> サブクラスを作成し、同じインターフェースを実装し、内部は CUDA kernel に置き換える：</p>
+
+<pre><code>class BackendCUDA : public BackendCPU {
+public:
+    void linear(float* out, const float* inp, const float* weight,
+                const float* bias, std::size_t M, std::size_t N,
+                std::size_t K) override;
+    void rms_norm(...) override;
+    void rope(...) override;
+    void causal_attention(...) override;
+    // ... すべての演算子に GPU 実装
+};</code></pre>
+
+            <p>コア設計：</p>
+
+            <ul>
+                <li><strong>重みキャッシュ</strong>：重みは初回使用時に GPU にアップロードし（<code>cudaMemcpy H2D</code>）、以降は device pointer を再利用。<code>unordered_map&lt;host_ptr, device_ptr&gt;</code> で完了。</li>
+                <li><strong>cuBLAS GEMM</strong>：線形投影に <code>cublasGemmEx</code>（FP16 入力 &times; FP16 重み &rarr; FP32 出力）を使用し、Tensor Core で加速。</li>
+                <li><strong>GPU-resident KV Cache</strong>：KV キャッシュを GPU 上で直接割り当てて増加させ、attention の読み書きは PCIe を通らない。各 decode ステップで 96 回の memcpy を節約（2 tensor &times; 2 KV &times; 24 層）。</li>
+                <li><strong>INT8 &rarr; FP16 dequant</strong>：INT8 重みを GPU にアップロード後、カーネルで FP16 に逆量子化し、FP16 GEMM を実行。</li>
+            </ul>
+
+            <p>効果：CPU BLAS の 33 tok/s から CUDA の <strong>110 tok/s</strong> へ、3.3 倍。</p>
+
+            <h3>Step 2: FP16 全パイプライン推論</h3>
+
+            <p>第 1 版の CUDA バックエンドのデータフローは：FP32 中間結果 &rarr; FP16 に変換 &rarr; cuBLAS GEMM &rarr; FP32 出力。途中に大量の FP32&harr;FP16 変換がある。</p>
+
+            <p>最適化の方針：<strong>すべての中間 Tensor を FP16 にする</strong>。embedding 出力を FP16 に変換した後、パイプライン全体（RMSNorm、RoPE、Attention、MLP）を FP16 で実行し、最終的な logits 出力時のみ FP32 に変換する。</p>
+
+            <p>各カーネルに FP16 版を作成した。RMSNorm を例にすると、内部では FP32 で累積して精度損失を防ぐ：</p>
+
+<pre><code>__global__ void rms_norm_fp16_kernel(half* out, const half* x,
+                                      const half* weight, size_t n,
+                                      float eps) {
+    // FP32 で累積し、精度損失を防ぐ
+    float local_sum = 0.0f;
+    for (size_t i = tid; i &lt; n; i += stride) {
+        float v = __half2float(x[i]);
+        local_sum += v * v;
+    }
+    // ... reduction ...
+    float rms = sqrtf(sdata[0] / n + eps);
+
+    for (size_t i = tid; i &lt; n; i += stride) {
+        out[i] = __float2half(
+            __half2float(x[i]) / rms * __half2float(weight[i]));
+    }
+}</code></pre>
+
+            <p>ここに一つ罠がある：<strong>Sampler も logits のデータ型を知る必要がある</strong>。logits を FP16 から FP32 に変換してから sampler に渡すが、sampler 内部に GPU サンプリングカーネルがどの精度で読み取るかを示す <code>fp16</code> フラグがある。logits は既に FP32 なので、このフラグは常に 0 であるべきだが——コードが誤って <code>backend.is_fp16()</code> に基づいて設定していた。</p>
+
+            <p>結果：FP16 モードで出力がすべて文字化けになった。INT8 FP32 は正常、FP16 は文字化け——サンプリングカーネルが FP32 データを FP16 として読んだため、各バイトペアが half float として誤って解釈された。</p>
+
+            <p>1 行のコード修正：</p>
+
+<pre><code>// Before (bug):
+int fp16 = backend_.is_fp16() ? 1 : 0;
+return cuda_sample(d_logits_, logits.size(), ..., fp16);
+
+// After (fix):
+// Logits are always FP32 (converted in transformer_forward)
+return cuda_sample(d_logits_, logits.size(), ..., /*fp16=*/0);</code></pre>
+
+            <p>教訓：<strong>データ型はパイプラインのすべての段階で整合させる必要がある</strong>。ある場所で FP32 に変換したのに、下流がまだ FP16 として読んでいれば、破滅的な結果になる。</p>
+
+            <p>FP16 全パイプラインの実現後：110 tok/s &rarr; <strong>153 tok/s</strong>、+39%。帯域幅半減 + Tensor Core 利用率向上。</p>
+
+            <h3>Step 3: Flash Attention</h3>
+
+            <p>従来の attention カーネルは、完全な <code>scores[attend_len]</code> 配列を shared memory に保存していた。これには 2 つの問題がある：</p>
+
+            <ol>
+                <li>Shared memory のサイズがシーケンス長に比例して増加し、約 12K token で上限に達する（48KB 制限）</li>
+                <li>すべての QK<sup>T</sup> スコアを計算し終えてからでないと softmax ができず、softmax してからでないと V の加重ができない——3 ステップが直列</li>
+            </ol>
+
+            <p>Flash Attention の核心的洞察：<strong>softmax はインクリメンタルに計算できる</strong>。毎回小さなブロック（128 個の KV position）のみを処理し、2 つのスカラー <code>running_max</code> と <code>running_sum</code> で過去の累積値を補正する：</p>
+
+<pre><code>// メインループ：毎回 128 個の KV position を処理
+for (tile_start = 0; tile_start &lt; attend_len; tile_start += 128) {
+
+    // 1. この 128 個のスコアのみ計算 &rarr; shared memory (512 bytes)
+    for (t in tile)
+        scores[t] = dot(q, k[t]) * scale;
+
+    // 2. このタイルの max を求める
+    tile_max = reduce_max(scores);
+
+    // 3. 過去の値を補正（Flash Attention の真髄）
+    new_max = max(running_max, tile_max);
+    correction = exp(running_max - new_max);
+    running_sum *= correction;
+    out_acc *= correction;       // 過去のすべてのタイルの累積値を補正
+
+    // 4. 現在のタイルを累積
+    for (t in tile) {
+        e = exp(scores[t] - new_max);
+        running_sum += e;
+        out_acc += e * v[t];     // 加重 V の累積
+    }
+    running_max = new_max;
+}
+
+// 最終的な正規化
+out = out_acc / running_sum;</code></pre>
+
+            <p>なぜ <code>correction</code> で正しく補正できるのか？数学的に：</p>
+
+<pre class="diagram"><code>exp(score - old_max) &times; exp(old_max - new_max) = exp(score - new_max)
+
+したがって、すべての過去の累積値に correction を掛けることは、new_max で再計算したのと等価である。</code></pre>
+
+            <p>Shared memory が <code>(attend_len + 256) &times; 4</code> から<strong>定数 1536 バイト</strong>になり、シーケンスの長さに関係なく一定。</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>attend_len</th>
+                        <th>旧カーネル smem/head</th>
+                        <th>Flash Attention smem/head</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td>54</td><td>1.2 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>448</td><td>2.8 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>4096</td><td>17.0 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>12288</td><td>49.0 KB (OOM)</td><td><strong>1.5 KB</strong></td></tr>
+                </tbody>
+            </table>
+
+            <p>短いシーケンスではパフォーマンスはほぼ同等（ボトルネックが attention にない）だが、長いコンテキスト能力が解放された。Decode スループットは 50～750 token の attend_len 範囲で約 161 tok/s を安定して維持。</p>
+
+            <h3>Step 4: GPU-Resident Sampling</h3>
+
+            <p>Flash Attention の修正後、<code>nsys</code> でデータフローを確認したところ、不要な CPU ラウンドトリップが見つかった：</p>
+
+<pre class="diagram"><code>GPU: FP16 logits &rarr; fp16_to_fp32 &rarr; FP32 logits
+                                          &darr; cudaMemcpy D2H (593KB)
+CPU: std::vector&lt;float&gt; logits
+                                          &darr; cudaMemcpy H2D (593KB)
+GPU: sample_kernel &rarr; token ID</code></pre>
+
+            <p>Qwen2.5-0.5B の vocab_size=151936 で、各 decode ごとに <strong>1.2MB</strong> を PCIe 経由で往復転送。</p>
+
+            <p>修正方針：<code>forward()</code> が <code>std::vector&lt;float&gt;</code> ではなく <code>Tensor</code>（GPU-resident）を返すようにする。Sampler は GPU Tensor から直接サンプリングする：</p>
+
+<pre><code>// Before: forward() が CPU にダウンロードし、sampler が再度 GPU にアップロード
+std::vector&lt;float&gt; forward(model, token_ids, pos, kv_cache);
+sampler-&gt;sample(logits, step);  // 内部: H2D upload + sample kernel
+
+// After: logits は GPU 上に留まり、sampler が直接 device pointer を使用
+Tensor forward(model, token_ids, pos, kv_cache);
+sampler-&gt;sample(logits, step);  // 直接: sample kernel on device ptr</code></pre>
+
+            <p>この変更自体は decode スループットへの影響は大きくない（PCIe 転送はカーネル計算時間に比べて短い）が、コードがよりクリーンになり——次の最適化への道を開いた。</p>
+
+            <h3>Step 5: nsys Profile &rarr; 本当のボトルネックを発見 &rarr; CUDA Caching Allocator</h3>
+
+            <p>これがこの記事全体で最も重要なステップである。<strong>アルゴリズムの最適化ではなく、プロファイリングツールによって全く予想外のボトルネックが発見された。</strong></p>
+
+            <p><code>nsys profile</code> を実行：</p>
+
+<pre><code>nsys profile --trace=cuda,osrt --stats=true \
+  bazel-bin/bin/qwen/qwen \
+    --model models/Qwen2.5-0.5B \
+    --prompt "Once upon a time" \
+    --max_tokens 50 \
+    --backend cuda --quantize int8 --fp16</code></pre>
+
+            <p>CUDA API 時間分布：</p>
+
+<pre><code> Time (%)  Total Time (ns)  Num Calls   Name
+ --------  ---------------  ---------   ----
+     36.0%       216913486       1341   cudaFree           &larr; 36%!!
+     33.6%       202353991       2963   cudaMemcpy
+     17.3%       104017852      17773   cudaLaunchKernel   &larr; 実際の計算
+      8.2%        49292731       1341   cudaMalloc         &larr; 8%</code></pre>
+
+            <p>このデータを見て驚いた：<strong>cudaMalloc + cudaFree が CUDA API 時間の 44% を占め（266ms）、実際の GPU カーネル計算（104ms）より 2.5 倍も多い！</strong></p>
+
+            <p>なぜか？<code>cudaMalloc</code> と <code>cudaFree</code> はどちらも<strong>同期操作</strong>だからである——CPU スレッドをブロックし、GPU 上のすべての pending カーネルの実行完了を待つ。つまり、割り当て/解放のたびに GPU パイプラインが強制同期される。</p>
+
+            <p>1341 回の malloc + 1341 回の free。どこから？毎回の <code>transformer_forward()</code> が約 12 個の一時 Tensor を作成する：</p>
+
+<pre><code>Tensor x({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor norm_out({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor q({seq_len * num_heads * head_dim}, DType::Float16, Device::CUDA);
+Tensor k_new({seq_len * kv_dim}, DType::Float16, Device::CUDA);
+Tensor v_new({seq_len * kv_dim}, DType::Float16, Device::CUDA);
+Tensor attn_out({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor gate_up({seq_len * 2 * intermediate}, DType::Float16, Device::CUDA);
+Tensor gate({seq_len * intermediate}, DType::Float16, Device::CUDA);
+Tensor final_out({hidden}, DType::Float16, Device::CUDA);
+Tensor logits({vocab_size}, DType::Float16, Device::CUDA);
+// ... plus logits_fp32, x_fp32 for conversions</code></pre>
+
+            <p>関数が返るとき、これらの Tensor のデストラクタが <code>cudaFree</code> を呼ぶ。54 回の forward &times; 約 25 個の alloc/free &asymp; 1350 回。nsys レポートの 1341 と完全に一致する。</p>
+
+            <p>重要な洞察：<strong>decode フェーズでは、毎回の forward の Tensor shape は全く同じ</strong>（seq_len=1）。毎回同じサイズのバッファを malloc し、使い終わったら free し、次にまた同じサイズを malloc する——これは純粋な無駄である。</p>
+
+            <p><strong>修正：CUDA caching allocator</strong></p>
+
+            <p>核心的アイデアは極めてシンプル：解放された GPU バッファを本当には解放せず、free list（サイズでインデックス化）に入れる。次に同じサイズのバッファを要求した際、free list から直接取得し、O(1) 検索で GPU 同期ゼロ：</p>
+
+<pre><code>// Free list: byte_size &rarr; [ptr, ptr, ...] (exact size matching)
+static std::multimap&lt;std::size_t, void*&gt; cuda_free_list_;
+
+// Live allocations: ptr &rarr; byte_size (for returning to correct bucket)
+static std::unordered_map&lt;void*, std::size_t&gt; cuda_alloc_sizes_;
+
+static void* cuda_pool_alloc(std::size_t bytes) {
+    auto it = cuda_free_list_.find(bytes);
+    if (it != cuda_free_list_.end()) {
+        void* ptr = it-&gt;second;
+        cuda_free_list_.erase(it);
+        cuda_alloc_sizes_.emplace(ptr, bytes);
+        return ptr;    // &larr; ヒット！GPU 同期ゼロ
+    }
+    void* ptr = cuda_malloc(bytes);  // miss: 実際に割り当て
+    cuda_alloc_sizes_.emplace(ptr, bytes);
+    return ptr;
+}
+
+static void cuda_pool_free(void* ptr) {
+    auto it = cuda_alloc_sizes_.find(ptr);
+    if (it != cuda_alloc_sizes_.end()) {
+        cuda_free_list_.emplace(it-&gt;second, ptr);  // free list に回収
+        cuda_alloc_sizes_.erase(it);
+    } else {
+        cuda_free(ptr);  // pool 管理外のバッファは実際に解放
+    }
+}</code></pre>
+
+            <p>30 行のコード。<code>device_allocate()</code> と <code>device_deallocate()</code> に挿入するだけで、上位層に対して完全に透過的。</p>
+
+            <p>最初の forward では、すべての Tensor がミス（コールドスタート）し、<code>cudaMalloc</code> を通る。関数が返ると、バッファが free list に入る。2 回目の forward 以降、同じサイズのすべての Tensor がヒットし、直接再利用——cudaMalloc ゼロ、cudaFree ゼロ、GPU 同期ゼロ。</p>
+
+            <p>修正後に再度 <code>nsys</code> を実行：</p>
+
+<pre><code> Time (%)  Total Time (ns)  Num Calls   Name
+ --------  ---------------  ---------   ----
+      7.5%        45833654        751   cudaMalloc    &larr; -44% calls
+      7.3%        44586600        729   cudaFree      &larr; -79% time!
+     16.6%       101269184      17773   cudaLaunchKernel  &larr; 変化なし</code></pre>
+
+            <p>cudaFree が 217ms から 45ms に減少（-79%）。612 回の割り当てが pool にヒットし、GPU 同期を完全に回避した。</p>
+
+            <p>パフォーマンス結果：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>指標</th>
+                        <th>Before (pool なし)</th>
+                        <th>After (caching)</th>
+                        <th>向上</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Decode スループット</td>
+                        <td>153 tok/s</td>
+                        <td><strong>504 tok/s</strong></td>
+                        <td><strong>+3.3&times;</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Decode 平均レイテンシ</td>
+                        <td>6.5 ms</td>
+                        <td><strong>2.0 ms</strong></td>
+                        <td>-69%</td>
+                    </tr>
+                    <tr>
+                        <td>Decode P50 レイテンシ</td>
+                        <td>6.0 ms</td>
+                        <td><strong>1.6 ms</strong></td>
+                        <td>-73%</td>
+                    </tr>
+                    <tr>
+                        <td>cudaFree time</td>
+                        <td>217 ms</td>
+                        <td>45 ms</td>
+                        <td>-79%</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p><strong>3.3 倍の高速化が、30 行のメモリプールコードから。</strong>これがプロファイリングの価値——ボトルネックが演算子にあるとか、attention にあるとか、GEMM にあるとか推測するのではなく、データに語らせる：最大のボトルネックはなんと <code>cudaFree</code> だった。</p>
+
+            <h3>まとめ</h3>
+
+            <p>CPU の 33 tok/s から GPU の 504 tok/s へ、15 倍の高速化。プロセス全体の重要な経験：</p>
+
+            <p><strong>1. Profile first, optimize second.</strong> <code>nsys</code> を実行しなければ、CUDA カーネルの occupancy や shared memory レイアウトの最適化に数日を費やしていたかもしれない——しかし実際のボトルネックは <code>cudaFree</code> の GPU 同期だった。データは嘘をつかない。</p>
+
+            <p><strong>2. 最大の向上は最もシンプルな修正から来ることが多い。</strong>Flash Attention の実装に数時間かかり、効果は +5%。caching allocator は 30 行で、効果は +230%。複雑さと効果は比例しない。</p>
+
+            <p><strong>3. エンドツーエンドの思考。</strong>FP16 sampler のバグはエンドツーエンドの型整合の問題。GPU-resident sampling はデータ転送の問題。これらはカーネルレベルの最適化ではなく、システムレベルの最適化。パイプライン全体を見る必要があり、単一の演算子だけを見つめていてはいけない。</p>
+
+            <p><strong>4. 抽象層の価値はコード再利用だけではない。</strong>Backend 抽象により CPU/BLAS/CUDA の切り替えがゼロ侵襲。Tensor の device_allocate/device_deallocate 抽象により caching allocator を透過的に挿入でき、上位コードの変更は不要。良い抽象は最適化を局所化する。</p>
+
+            <p>プロジェクト全体は現在 6200 行の C++/CUDA で、Qwen2.5-0.5B を RTX 4060 上で 504 tok/s の decode を達成している。まだやれることは多い——INT4 量子化、prefill Q tiling、マルチリクエスト batching——しかしプロファイリング駆動の最適化ループは既に確立された。</p>
+
+            <p><em>"Premature optimization is the root of all evil. But so is premature pessimism &mdash; profile, then decide."</em></p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

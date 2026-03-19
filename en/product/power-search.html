@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PowerSearch: Building a Composable Frontend Advanced Search Bar - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PowerSearch: Building a Composable Frontend Advanced Search Bar</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/emmoser-celestial-globe.jpg" alt="Celestial Globe by Gerhard Emmoser">
+                <figcaption>Gerhard Emmoser, Celestial Globe, 1579 — Within a precise structure, every star has its own coordinates and classification. Advanced search works the same way: using structured conditions to precisely locate what you're looking for</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: Almost every B2B product needs advanced search, but most implementations are either crude piles of input boxes or half-baked solutions that can't compose or nest. This article shares a recursive condition tree data model that naturally supports AND/OR composition and infinite nesting — when the data structure is right, UI interactions and backend mapping both become simple.
+            </blockquote>
+
+            <h3>The Problem</h3>
+
+            <p>List pages in B2B products almost always need search and filtering. The simplest approach is placing a few input boxes and dropdowns, but this gets ugly with many fields and can't express complex logic — like "status is completed <strong>AND</strong> (creator is Alice <strong>OR</strong> creator is Bob)."</p>
+
+            <p>Products like Jira, Linear, and Notion have search bars that support dynamically adding filter conditions, selecting fields, operators, and values, and combining conditions with AND/OR and nested groups. This interaction is called <strong>PowerSearch</strong> (or Advanced Filter, Structured Search).</p>
+
+            <p>It looks complex, but the data structure is actually quite clear — it's essentially a condition expression tree.</p>
+
+            <h3>Data Model</h3>
+
+            <p>The entire system's type definitions are just a few:</p>
+
+<pre><code>// Field configuration — defines which fields can be searched
+type FieldConfig = {
+  id: string;          // "status"
+  label: string;       // "Status"
+  type: "text" | "number" | "date" | "select" | "boolean";
+  operators: OperatorOption[];     // Operators supported by this field
+  options?: { value: string; label: string }[];  // Options for select type
+};
+
+// Operator
+type OperatorOption = {
+  id: string;      // "eq"
+  label: string;   // "equals"
+  symbol: string;  // "="
+};
+
+// Single filter condition
+type FilterCondition = {
+  id: string;
+  type: "condition";
+  fieldId: string;     // Which field
+  operatorId: string;  // Which operator
+  value: string;       // Comparison value
+};
+
+// Condition group (recursive structure, supports nesting)
+type ConditionGroup = {
+  id: string;
+  type: "group";
+  operator: "AND" | "OR";
+  conditions: (FilterCondition | ConditionGroup)[];  // Can nest
+};</code></pre>
+
+            <p>The key is the last type: <code>ConditionGroup</code>'s <code>conditions</code> array can contain <code>FilterCondition</code> (leaf nodes) or <code>ConditionGroup</code> (subtrees). This is a recursive expression tree.</p>
+
+            <p>An actual query looks like this:</p>
+
+<pre><code>// "status = done AND (creator = Alice OR creator = Bob)"
+{
+  id: "root",
+  type: "group",
+  operator: "AND",
+  conditions: [
+    {
+      id: "c1", type: "condition",
+      fieldId: "status", operatorId: "eq", value: "done"
+    },
+    {
+      id: "g1", type: "group",
+      operator: "OR",
+      conditions: [
+        {
+          id: "c2", type: "condition",
+          fieldId: "creator", operatorId: "eq", value: "alice"
+        },
+        {
+          id: "c3", type: "condition",
+          fieldId: "creator", operatorId: "eq", value: "bob"
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+            <h3>Component API Design</h3>
+
+            <p>Consumers only need to provide two things: field configuration and a search callback.</p>
+
+<pre><code>const fields: FieldConfig[] = [
+  {
+    id: "name",
+    label: "Name",
+    type: "text",
+    operators: [
+      { id: "contains", label: "contains", symbol: "⊃" },
+      { id: "eq", label: "equals", symbol: "=" },
+      { id: "starts_with", label: "starts with", symbol: "^" },
+    ],
+  },
+  {
+    id: "status",
+    label: "Status",
+    type: "select",
+    operators: [
+      { id: "eq", label: "equals", symbol: "=" },
+      { id: "neq", label: "not equals", symbol: "≠" },
+    ],
+    options: [
+      { value: "active", label: "In Progress" },
+      { value: "done", label: "Completed" },
+      { value: "archived", label: "Archived" },
+    ],
+  },
+  {
+    id: "created_at",
+    label: "Created Date",
+    type: "date",
+    operators: [
+      { id: "after", label: "after", symbol: ">" },
+      { id: "before", label: "before", symbol: "&lt;" },
+    ],
+  },
+  {
+    id: "priority",
+    label: "Priority",
+    type: "number",
+    operators: [
+      { id: "eq", label: "equals", symbol: "=" },
+      { id: "gt", label: "greater than", symbol: ">" },
+      { id: "lt", label: "less than", symbol: "&lt;" },
+    ],
+  },
+  {
+    id: "enabled",
+    label: "Enabled",
+    type: "boolean",
+    operators: [
+      { id: "eq", label: "equals", symbol: "=" },
+    ],
+  },
+];
+
+function handleSearch(query: ConditionGroup) {
+  // Convert condition tree to API request
+  console.log(JSON.stringify(query, null, 2));
+}
+
+&lt;PowerSearchBar
+  fields={fields}
+  onSearch={handleSearch}
+  placeholder="Click to add filter conditions..."
+  defaultOperator="AND"
+/&gt;</code></pre>
+
+            <p>The component internally maintains a <code>ConditionGroup</code> tree as state. Each time a user adds/modifies/deletes a condition, the tree is updated and emitted via the <code>onSearch</code> callback. The caller takes this tree and converts it to a GraphQL where clause or REST API query string to send to the backend.</p>
+
+            <h3>Interaction Flow</h3>
+
+            <p>Adding a filter condition is a three-step guided flow:</p>
+
+<pre><code>1. Select field → Show field list (Field Dropdown)
+                ┌─────────────────┐
+                │ Select Field    │
+                ├─────────────────┤
+                │ Name      text  │
+                │ Status  select  │
+                │ Created   date  │
+                │ Priority number │
+                └─────────────────┘
+
+2. Select operator → Show operators based on field type
+                ┌─────────────────┐
+                │ Select Operator │
+                ├─────────────────┤
+                │ equals        = │
+                │ not equals    ≠ │
+                └─────────────────┘
+
+3. Enter value → Show different input methods based on field type
+   text    → Text input
+   number  → Number input
+   date    → Date picker
+   select  → Option list
+   boolean → true/false selection</code></pre>
+
+            <p>Each step automatically advances to the next upon completion, and the condition is automatically submitted when all three steps are done. This progressive guidance is a much better experience than showing three side-by-side dropdowns — users only need to make one decision at a time.</p>
+
+            <h3>State Management</h3>
+
+            <p>The component has two core states:</p>
+
+<pre><code>// 1. Condition tree (complete query structure)
+const [rootGroup, setRootGroup] = useState&lt;ConditionGroup&gt;({
+  id: "root",
+  type: "group",
+  operator: defaultOperator,
+  conditions: [],
+});
+
+// 2. Currently editing condition (intermediate state of the three-step guide)
+const [editingCondition, setEditingCondition] = useState&lt;{
+  condition: Partial&lt;FilterCondition&gt;;  // May only have the field, operator not yet selected
+  groupId: string;   // Which group it belongs to
+  index?: number;    // Index when editing an existing condition
+} | null&gt;(null);</code></pre>
+
+            <p>Condition tree modifications are done via deep copy (immutable update), ensuring React correctly detects changes:</p>
+
+<pre><code>// Deep clone condition tree
+const deepCloneGroup = (group: ConditionGroup): ConditionGroup =&gt; ({
+  ...group,
+  conditions: group.conditions.map((c) =&gt;
+    c.type === "group" ? deepCloneGroup(c) : { ...c }
+  ),
+});
+
+// Find target group in nested tree
+const findGroupById = (
+  group: ConditionGroup, id: string
+): ConditionGroup | null =&gt; {
+  if (group.id === id) return group;
+  for (const c of group.conditions) {
+    if (c.type === "group") {
+      const found = findGroupById(c, id);
+      if (found) return found;
+    }
+  }
+  return null;
+};</code></pre>
+
+            <p>Each modification: deep clone tree → find target group → modify → set new state → trigger <code>onSearch</code> callback.</p>
+
+            <h3>Value Input Type Adaptation</h3>
+
+            <p>Step 3 "enter value" renders different input components based on field type — a switch dispatch:</p>
+
+<pre><code>const renderValueInput = () =&gt; {
+  const field = getField(editingCondition.condition.fieldId);
+
+  switch (field.type) {
+    case "select":
+      // Render option list, click to submit directly
+      return &lt;OptionsList options={field.options} onSelect={handleSubmit} /&gt;;
+
+    case "boolean":
+      // Only two options: true/false
+      return &lt;BooleanPicker onSelect={handleSubmit} /&gt;;
+
+    case "date":
+      // Date picker
+      return &lt;input type="date" onChange={handleValueChange} /&gt;;
+
+    case "number":
+      // Number input
+      return &lt;input type="number" onChange={handleValueChange} /&gt;;
+
+    default:  // text
+      // Text input, Enter to submit
+      return &lt;input type="text" onChange={handleValueChange}
+                     onKeyDown={e =&gt; e.key === "Enter" && handleSubmit()} /&gt;;
+  }
+};</code></pre>
+
+            <p>Note the special handling for <code>select</code> and <code>boolean</code> types: clicking an option directly submits the condition, without needing an extra "confirm" button. This eliminates one click, making the interaction smoother.</p>
+
+            <h3>AND/OR Toggling and Condition Grouping</h3>
+
+            <p>The logical relationship between conditions is controlled by <code>ConditionGroup.operator</code>. In the UI, it's a clickable small label that toggles between AND and OR on each click:</p>
+
+<pre><code>const handleToggleOperator = (groupId: string) =&gt; {
+  setRootGroup((prev) =&gt; {
+    const updated = deepCloneGroup(prev);
+    const group = findGroupById(updated, groupId);
+    if (group) {
+      group.operator = group.operator === "AND" ? "OR" : "AND";
+    }
+    onSearch(updated);
+    return updated;
+  });
+};</code></pre>
+
+            <p>Nested grouping lets users express more complex logic. For example, "(A AND B) OR (C AND D)" — top level is OR, two sub-groups each are AND. The implementation limits maximum nesting depth to 3 levels, preventing overly complex condition trees:</p>
+
+<pre><code>// Only show "Add Group" button when depth &lt; 3
+{depth &lt; 3 && (
+  &lt;button onClick={() =&gt; handleAddGroup(group.id)}&gt;
+    Add Group
+  &lt;/button&gt;
+)}</code></pre>
+
+            <h3>Condition Rendering</h3>
+
+            <p>Condition tree rendering is also recursive. Each <code>ConditionGroup</code> renders its own operator label and conditions list, recursively calling itself for sub-groups:</p>
+
+<pre><code>const renderGroup = (group: ConditionGroup, depth = 0) =&gt; (
+  &lt;div className={depth &gt; 0 ? "nested-group" : ""}&gt;
+    {/* AND/OR toggle button */}
+    {group.conditions.length &gt; 0 && (
+      &lt;button onClick={() =&gt; handleToggleOperator(group.id)}&gt;
+        {group.operator}
+      &lt;/button&gt;
+    )}
+
+    {/* Render conditions one by one */}
+    {group.conditions.map((condition, index) =&gt; {
+      if (condition.type === "group") {
+        // Recursively render sub-group
+        return renderGroup(condition, depth + 1);
+      } else {
+        // Render single condition pill
+        const field = getField(condition.fieldId);
+        const operator = getOperator(condition.fieldId, condition.operatorId);
+        return (
+          &lt;div className="condition-pill"&gt;
+            &lt;span className="field"&gt;{field?.label}&lt;/span&gt;
+            &lt;span className="operator"&gt;{operator?.symbol}&lt;/span&gt;
+            &lt;span className="value"&gt;{condition.value}&lt;/span&gt;
+            &lt;button onClick={() =&gt; handleRemove(group.id, index)}&gt;×&lt;/button&gt;
+          &lt;/div&gt;
+        );
+      }
+    })}
+
+    {/* Add condition/group buttons */}
+    &lt;button onClick={() =&gt; handleAddCondition(group.id)}&gt;+ Add Filter&lt;/button&gt;
+    {depth &lt; 3 && &lt;button onClick={() =&gt; handleAddGroup(group.id)}&gt;() Add Group&lt;/button&gt;}
+  &lt;/div&gt;
+);</code></pre>
+
+            <p>Nested sub-groups are visually indented with a left border (<code>border-left + padding-left</code>), clearly expressing the hierarchy.</p>
+
+            <h3>Backend Integration</h3>
+
+            <p>The <code>onSearch</code> callback returns a <code>ConditionGroup</code> tree. The backend typically needs to convert it to a database query. This conversion is recursive:</p>
+
+<pre><code>// Convert to SQL WHERE clause (pseudocode)
+function toSQL(group: ConditionGroup): string {
+  const parts = group.conditions.map((c) =&gt; {
+    if (c.type === "group") {
+      return `(${toSQL(c)})`;
+    }
+    const op = operatorToSQL(c.operatorId);  // "eq" → "=", "contains" → "LIKE"
+    const val = escapeSQL(c.value);
+    return `${c.fieldId} ${op} ${val}`;
+  });
+  return parts.join(` ${group.operator} `);
+}
+
+// Output: status = 'done' AND (creator = 'alice' OR creator = 'bob')</code></pre>
+
+            <p>If using GraphQL, you can directly map the tree structure to a nested <code>where</code> input:</p>
+
+<pre><code>// GraphQL where input
+{
+  and: [
+    { status: { eq: "done" } },
+    {
+      or: [
+        { creator: { eq: "alice" } },
+        { creator: { eq: "bob" } }
+      ]
+    }
+  ]
+}</code></pre>
+
+            <p>The data structures are isomorphic — the frontend's <code>ConditionGroup</code> and GraphQL's <code>where</code> input are just different representations of the same tree. The conversion is almost a one-to-one mapping.</p>
+
+            <h3>Design Reflections</h3>
+
+            <ul>
+                <li><strong>Why a tree instead of a flat array</strong>: A flat <code>{ field, op, value }[]</code> array can only express all-AND or all-OR relationships. Once you need mixed logic ("A AND (B OR C)"), you must use a tree. A tree is the most general structure; a flat array is just a degenerate special case of a tree.</li>
+                <li><strong>Why FieldConfig includes operators</strong>: Different field types support different operators — text fields support "contains," number fields support "greater than/less than," boolean fields only support "equals." Binding operators to fields rather than defining them globally avoids meaningless combinations like "date field selected contains."</li>
+                <li><strong>Why three separate steps instead of three side-by-side dropdowns</strong>: Progressive guidance reduces cognitive load. Users only need to focus on one selection at a time, instead of facing three dropdowns simultaneously without knowing where to start.</li>
+                <li><strong>Limiting nesting depth</strong>: Theoretically, recursive structures can nest infinitely, but in practice, search conditions nested beyond 3 levels are nearly unmaintainable. Limiting depth protects the user.</li>
+                <li><strong>Conditions as data</strong>: The entire search state is a serializable JSON tree. This means it can be saved to a URL query string (share search results), persisted to user settings (save common filters), or saved as a "view" (similar to Notion's database views).</li>
+            </ul>
+
+            <h3>Extension Directions</h3>
+
+            <ul>
+                <li><strong>Save as view</strong>: Save the <code>ConditionGroup</code> JSON to the database, loading it directly when the user returns. Like filter views in Notion.</li>
+                <li><strong>URL serialization</strong>: Encode the condition tree into the URL (base64 or custom syntax), so search result pages can be shared with others.</li>
+                <li><strong>Inter-field dependencies</strong>: After selecting "country = China," the "city" field's options automatically filter to Chinese cities. Requires adding <code>dependsOn</code> and dynamic option loading to FieldConfig.</li>
+                <li><strong>Custom operators</strong>: Such as "in list" (IN), "is empty" (IS NULL), "in range" (BETWEEN). Just add new OperatorOptions to FieldConfig.operators, and the renderer adapts automatically.</li>
+                <li><strong>Keyboard navigation</strong>: Support arrow keys to move between conditions, Tab to switch steps, Delete to remove conditions. For power users, keyboard operations are much faster than mouse.</li>
+            </ul>
+
+            <h3>Summary</h3>
+
+            <p>The core of PowerSearch is two things: a recursive condition tree data structure, and a three-step progressive condition editing interaction. The data structure determines how complex a query it can express (arbitrary AND/OR nesting), and the interaction design determines whether complex queries are easy to build (the field → operator → value guided flow).</p>
+
+            <p>From an engineering perspective, this component's core code is small — type definitions 30 lines, state management 50 lines, recursive rendering 50 lines. Most of the code is in UI details (dropdown styles, hover effects, keyboard events). This is typical for frontend components: the core logic is simple, but delivering good interaction experience requires extensive detail polishing.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

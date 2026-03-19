@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <section class="posts">
+            <h3>Performance</h3>
+            <article>
+                <h4><a href="llm-inference-gpu.html">从 CPU 到 GPU：LLM 推理引擎的 CUDA 优化之路</a></h4>
+                <time>2026-03-18</time>
+                <p>用 nsys profiling 驱动优化：CUDA 后端、FP16 全链路、Flash Attention、caching allocator。从 33 tok/s 到 504 tok/s，15 倍加速。</p>
+            </article>
+            <article>
+                <h4><a href="llm-inference-engine.html">从零到生成：纯 C++ 手搓 LLM 推理引擎全记录</a></h4>
+                <time>2026-02-19</time>
+                <p>不用任何 ML 框架，用纯 C++ 从 mmap 加载权重到自回归生成，手搓一个能跑 Qwen2.5-0.5B 的推理引擎。</p>
+            </article>
+            <article>
+                <h4><a href="matmul-optimization.html">从 0.98 到 267 GFLOPS：矩阵乘法性能优化全记录</a></h4>
+                <time>2026-02-16</time>
+                <p>从教科书的三重循环到接近硬件峰值的 GEMM 实现，逐步优化的完整记录。</p>
+            </article>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

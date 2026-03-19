@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>From CPU to GPU: CUDA Optimization for an LLM Inference Engine - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>From CPU to GPU: CUDA Optimization for an LLM Inference Engine</h2>
+            <time>2026-03-18</time>
+
+            <div class="series-nav">
+                <strong>Series:</strong> LLM Inference Engine<br>
+                <a href="llm-inference-engine.html">Part 1: From Zero to Generation &mdash; Building an Inference Engine in Pure C++</a><br>
+                <span class="current">Part 2: From CPU to GPU &mdash; The CUDA Optimization Journey (this post)</span>
+            </div>
+
+            <figure class="post-cover">
+                <img src="../../images/charlie-chaplin-modern-times.jpg" alt="Charlie Chaplin, Modern Times (1936)">
+                <figcaption>Charlie Chaplin, "Modern Times", 1936 &mdash; The acceleration from manual to machine</figcaption>
+            </figure>
+
+            <h3>Introduction</h3>
+
+            <p>In the <a href="llm-inference-engine.html">previous post</a>, we built an LLM inference engine from scratch in pure C++, capable of running Qwen2.5-0.5B. On CPU (OpenBLAS + INT8 quantization) it achieved 33 tok/s.</p>
+
+            <p>This post documents the subsequent optimization journey: moving the engine onto GPU, step by step from 33 tok/s to <strong>504 tok/s</strong>. Every optimization step is driven by clear profiling data, no guessing.</p>
+
+            <p>Optimization path overview:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Stage</th>
+                        <th>Decode Throughput</th>
+                        <th>Improvement</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>CPU BLAS + INT8</td>
+                        <td>33 tok/s</td>
+                        <td>baseline</td>
+                    </tr>
+                    <tr>
+                        <td>CUDA + cuBLAS + INT8</td>
+                        <td>110 tok/s</td>
+                        <td>3.3&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ FP16 inference</td>
+                        <td>153 tok/s</td>
+                        <td>4.6&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ Flash Attention</td>
+                        <td>161 tok/s</td>
+                        <td>4.9&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ GPU-resident sampling</td>
+                        <td>161 tok/s</td>
+                        <td>-</td>
+                    </tr>
+                    <tr>
+                        <td>+ CUDA caching allocator</td>
+                        <td><strong>504 tok/s</strong></td>
+                        <td><strong>15.3&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>The last step (caching allocator) brought the largest improvement, but had <code>nsys</code> profiling not revealed the true bottleneck, I never would have thought to optimize memory allocation. This is the key message of this post: <strong>profile first, optimize second</strong>.</p>
+
+            <h3>Step 1: CUDA Backend &mdash; Moving Computation to GPU</h3>
+
+            <p>The Backend abstraction from the previous post paid off here. Create a new <code>BackendCUDA</code> subclass implementing the same interface, backed by CUDA kernels:</p>
+
+<pre><code>class BackendCUDA : public BackendCPU {
+public:
+    void linear(float* out, const float* inp, const float* weight,
+                const float* bias, std::size_t M, std::size_t N,
+                std::size_t K) override;
+    void rms_norm(...) override;
+    void rope(...) override;
+    void causal_attention(...) override;
+    // ... all operators have GPU implementations
+};</code></pre>
+
+            <p>Core design:</p>
+
+            <ul>
+                <li><strong>Weight caching</strong>: Weights are uploaded to GPU on first use (<code>cudaMemcpy H2D</code>), then device pointers are reused thereafter. An <code>unordered_map&lt;host_ptr, device_ptr&gt;</code> handles this.</li>
+                <li><strong>cuBLAS GEMM</strong>: Linear projections use <code>cublasGemmEx</code> (FP16 input &times; FP16 weight &rarr; FP32 output), leveraging Tensor Core acceleration.</li>
+                <li><strong>GPU-resident KV Cache</strong>: KV cache is allocated and grows directly on GPU, attention reads/writes don't cross PCIe. Each decode step saves 96 memcpys (2 tensors &times; 2 KV &times; 24 layers).</li>
+                <li><strong>INT8 &rarr; FP16 dequant</strong>: INT8 weights are uploaded to GPU, then a kernel dequantizes to FP16 for FP16 GEMM.</li>
+            </ul>
+
+            <p>Result: from CPU BLAS's 33 tok/s to CUDA's <strong>110 tok/s</strong>, 3.3x.</p>
+
+            <h3>Step 2: FP16 Full-Pipeline Inference</h3>
+
+            <p>The first CUDA backend's data flow was: FP32 intermediate results &rarr; convert to FP16 &rarr; cuBLAS GEMM &rarr; FP32 output. Lots of FP32&harr;FP16 conversions in between.</p>
+
+            <p>Optimization idea: <strong>make all intermediate Tensors FP16</strong>. After embedding output converts to FP16, the entire pipeline (RMSNorm, RoPE, Attention, MLP) runs on FP16, only converting back to FP32 for the final logits output.</p>
+
+            <p>Wrote FP16 versions of every kernel. Taking RMSNorm as an example, internally using FP32 for accumulation to avoid precision loss:</p>
+
+<pre><code>__global__ void rms_norm_fp16_kernel(half* out, const half* x,
+                                      const half* weight, size_t n,
+                                      float eps) {
+    // Accumulate in FP32 to avoid precision loss
+    float local_sum = 0.0f;
+    for (size_t i = tid; i &lt; n; i += stride) {
+        float v = __half2float(x[i]);
+        local_sum += v * v;
+    }
+    // ... reduction ...
+    float rms = sqrtf(sdata[0] / n + eps);
+
+    for (size_t i = tid; i &lt; n; i += stride) {
+        out[i] = __float2half(
+            __half2float(x[i]) / rms * __half2float(weight[i]));
+    }
+}</code></pre>
+
+            <p>There was a gotcha here: <strong>the Sampler also needs to know the logits data type</strong>. We convert logits from FP16 to FP32 before passing to the sampler, but the sampler had an <code>fp16</code> flag telling the GPU sampling kernel what precision to read. Since logits are already FP32, this flag should always be 0 &mdash; but the code erroneously set it based on <code>backend.is_fp16()</code>.</p>
+
+            <p>Result: FP16 mode produced all garbage. INT8 FP32 worked fine, FP16 produced garbage &mdash; because the sampling kernel read FP32 data as FP16, every pair of bytes was misinterpreted as a half float.</p>
+
+            <p>One-line fix:</p>
+
+<pre><code>// Before (bug):
+int fp16 = backend_.is_fp16() ? 1 : 0;
+return cuda_sample(d_logits_, logits.size(), ..., fp16);
+
+// After (fix):
+// Logits are always FP32 (converted in transformer_forward)
+return cuda_sample(d_logits_, logits.size(), ..., /*fp16=*/0);</code></pre>
+
+            <p>Lesson: <strong>data types must be aligned at every stage in the pipeline</strong>. If one stage converts to FP32 but downstream still reads as FP16, it's a disaster.</p>
+
+            <p>After getting the full FP16 pipeline working: 110 tok/s &rarr; <strong>153 tok/s</strong>, +39%. Halved bandwidth + improved Tensor Core utilization.</p>
+
+            <h3>Step 3: Flash Attention</h3>
+
+            <p>The old attention kernel stored the full <code>scores[attend_len]</code> array in shared memory. This had two problems:</p>
+
+            <ol>
+                <li>Shared memory grows linearly with sequence length, ~12K tokens would OOM (48KB limit)</li>
+                <li>Must compute all QK<sup>T</sup> scores before softmax, then compute V weighting &mdash; three serial steps</li>
+            </ol>
+
+            <p>Flash Attention's core insight: <strong>softmax can be computed incrementally</strong>. Process only a small tile (128 KV positions) at a time, using two scalars <code>running_max</code> and <code>running_sum</code> to correct historical accumulated values:</p>
+
+<pre><code>// Main loop: process 128 KV positions at a time
+for (tile_start = 0; tile_start &lt; attend_len; tile_start += 128) {
+
+    // 1. Compute only these 128 scores &rarr; shared memory (512 bytes)
+    for (t in tile)
+        scores[t] = dot(q, k[t]) * scale;
+
+    // 2. Find this tile's max
+    tile_max = reduce_max(scores);
+
+    // 3. Correct history (the essence of Flash Attention)
+    new_max = max(running_max, tile_max);
+    correction = exp(running_max - new_max);
+    running_sum *= correction;
+    out_acc *= correction;       // Correct all previous tiles' accumulated values
+
+    // 4. Accumulate current tile
+    for (t in tile) {
+        e = exp(scores[t] - new_max);
+        running_sum += e;
+        out_acc += e * v[t];     // Weighted V accumulation
+    }
+    running_max = new_max;
+}
+
+// Final normalization
+out = out_acc / running_sum;</code></pre>
+
+            <p>Why does <code>correction</code> correctly fix things? Mathematically:</p>
+
+<pre class="diagram"><code>exp(score - old_max) &times; exp(old_max - new_max) = exp(score - new_max)
+
+So multiplying all historical accumulated values by correction is equivalent to recomputing with new_max.</code></pre>
+
+            <p>Shared memory went from <code>(attend_len + 256) &times; 4</code> to a <strong>constant 1536 bytes</strong>, regardless of sequence length.</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>attend_len</th>
+                        <th>Old kernel smem/head</th>
+                        <th>Flash Attention smem/head</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td>54</td><td>1.2 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>448</td><td>2.8 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>4096</td><td>17.0 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>12288</td><td>49.0 KB (OOM)</td><td><strong>1.5 KB</strong></td></tr>
+                </tbody>
+            </table>
+
+            <p>Short sequence performance is roughly the same (attention isn't the bottleneck), but long context capability is unlocked. Decode throughput stays stable at ~161 tok/s across 50&ndash;750 token attend_len range.</p>
+
+            <h3>Step 4: GPU-Resident Sampling</h3>
+
+            <p>After Flash Attention, I used <code>nsys</code> to inspect the data flow and discovered an unnecessary CPU roundtrip:</p>
+
+<pre class="diagram"><code>GPU: FP16 logits &rarr; fp16_to_fp32 &rarr; FP32 logits
+                                          &darr; cudaMemcpy D2H (593KB)
+CPU: std::vector&lt;float&gt; logits
+                                          &darr; cudaMemcpy H2D (593KB)
+GPU: sample_kernel &rarr; token ID</code></pre>
+
+            <p>Qwen2.5-0.5B's vocab_size=151936, each decode step transfers <strong>1.2MB</strong> back and forth over PCIe.</p>
+
+            <p>Fix: have <code>forward()</code> return a <code>Tensor</code> (GPU-resident) instead of <code>std::vector&lt;float&gt;</code>. Sampler samples directly from the GPU Tensor:</p>
+
+<pre><code>// Before: forward() downloads to CPU, sampler re-uploads to GPU
+std::vector&lt;float&gt; forward(model, token_ids, pos, kv_cache);
+sampler-&gt;sample(logits, step);  // internally: H2D upload + sample kernel
+
+// After: logits stay on GPU, sampler uses device pointer directly
+Tensor forward(model, token_ids, pos, kv_cache);
+sampler-&gt;sample(logits, step);  // directly: sample kernel on device ptr</code></pre>
+
+            <p>This change didn't significantly impact decode throughput (PCIe transfer time is short relative to kernel computation time), but the code is cleaner &mdash; and it paved the way for the next optimization.</p>
+
+            <h3>Step 5: nsys Profile &rarr; Finding the Real Bottleneck &rarr; CUDA Caching Allocator</h3>
+
+            <p>This is the most important step in the entire post. <strong>Not optimizing an algorithm, but using a profiling tool to discover a completely unexpected bottleneck.</strong></p>
+
+            <p>Running <code>nsys profile</code>:</p>
+
+<pre><code>nsys profile --trace=cuda,osrt --stats=true \
+  bazel-bin/bin/qwen/qwen \
+    --model models/Qwen2.5-0.5B \
+    --prompt "Once upon a time" \
+    --max_tokens 50 \
+    --backend cuda --quantize int8 --fp16</code></pre>
+
+            <p>CUDA API time distribution:</p>
+
+<pre><code> Time (%)  Total Time (ns)  Num Calls   Name
+ --------  ---------------  ---------   ----
+     36.0%       216913486       1341   cudaFree           &larr; 36%!!
+     33.6%       202353991       2963   cudaMemcpy
+     17.3%       104017852      17773   cudaLaunchKernel   &larr; actual computation
+      8.2%        49292731       1341   cudaMalloc         &larr; 8%</code></pre>
+
+            <p>Seeing this data I was shocked: <strong>cudaMalloc + cudaFree accounted for 44% of CUDA API time (266ms), more than 2.5x the actual GPU kernel computation (104ms)!</strong></p>
+
+            <p>Why? Because <code>cudaMalloc</code> and <code>cudaFree</code> are both <strong>synchronous operations</strong> &mdash; they block the CPU thread, waiting for all pending kernels on the GPU to complete. This means every allocation/deallocation forces a GPU pipeline sync.</p>
+
+            <p>1341 mallocs + 1341 frees. Where from? Each <code>transformer_forward()</code> creates ~12 temporary Tensors:</p>
+
+<pre><code>Tensor x({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor norm_out({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor q({seq_len * num_heads * head_dim}, DType::Float16, Device::CUDA);
+Tensor k_new({seq_len * kv_dim}, DType::Float16, Device::CUDA);
+Tensor v_new({seq_len * kv_dim}, DType::Float16, Device::CUDA);
+Tensor attn_out({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor gate_up({seq_len * 2 * intermediate}, DType::Float16, Device::CUDA);
+Tensor gate({seq_len * intermediate}, DType::Float16, Device::CUDA);
+Tensor final_out({hidden}, DType::Float16, Device::CUDA);
+Tensor logits({vocab_size}, DType::Float16, Device::CUDA);
+// ... plus logits_fp32, x_fp32 for conversions</code></pre>
+
+            <p>When the function returns, these Tensors' destructors call <code>cudaFree</code>. 54 forwards &times; ~25 allocs/frees &asymp; 1350 times. Perfectly matching nsys's reported 1341.</p>
+
+            <p>Key insight: <strong>during the decode phase, every forward call creates Tensors with exactly the same shapes</strong> (seq_len=1). Mallocing the same size buffer every time, freeing it, then mallocing the same size again &mdash; pure waste.</p>
+
+            <p><strong>Fix: CUDA caching allocator</strong></p>
+
+            <p>The core idea is dead simple: freed GPU buffers aren't actually released, but placed in a free list (indexed by size). Next time a buffer of the same size is requested, it's taken from the free list, O(1) lookup, zero GPU synchronization:</p>
+
+<pre><code>// Free list: byte_size &rarr; [ptr, ptr, ...] (exact size matching)
+static std::multimap&lt;std::size_t, void*&gt; cuda_free_list_;
+
+// Live allocations: ptr &rarr; byte_size (for returning to correct bucket)
+static std::unordered_map&lt;void*, std::size_t&gt; cuda_alloc_sizes_;
+
+static void* cuda_pool_alloc(std::size_t bytes) {
+    auto it = cuda_free_list_.find(bytes);
+    if (it != cuda_free_list_.end()) {
+        void* ptr = it-&gt;second;
+        cuda_free_list_.erase(it);
+        cuda_alloc_sizes_.emplace(ptr, bytes);
+        return ptr;    // &larr; Hit! Zero GPU sync
+    }
+    void* ptr = cuda_malloc(bytes);  // miss: actual allocation
+    cuda_alloc_sizes_.emplace(ptr, bytes);
+    return ptr;
+}
+
+static void cuda_pool_free(void* ptr) {
+    auto it = cuda_alloc_sizes_.find(ptr);
+    if (it != cuda_alloc_sizes_.end()) {
+        cuda_free_list_.emplace(it-&gt;second, ptr);  // Return to free list
+        cuda_alloc_sizes_.erase(it);
+    } else {
+        cuda_free(ptr);  // Not pool-managed, actually release
+    }
+}</code></pre>
+
+            <p>30 lines of code. Inserted into <code>device_allocate()</code> and <code>device_deallocate()</code>, completely transparent to upper layers.</p>
+
+            <p>On the first forward, all Tensors miss (cold start), going through <code>cudaMalloc</code>. When the function returns, buffers enter the free list. From the second forward onward, all same-size Tensors hit, directly reused &mdash; zero cudaMalloc, zero cudaFree, zero GPU synchronization.</p>
+
+            <p>Running <code>nsys</code> again after the fix:</p>
+
+<pre><code> Time (%)  Total Time (ns)  Num Calls   Name
+ --------  ---------------  ---------   ----
+      7.5%        45833654        751   cudaMalloc    &larr; -44% calls
+      7.3%        44586600        729   cudaFree      &larr; -79% time!
+     16.6%       101269184      17773   cudaLaunchKernel  &larr; unchanged</code></pre>
+
+            <p>cudaFree dropped from 217ms to 45ms (-79%). 612 allocations hit the pool, completely avoiding GPU synchronization.</p>
+
+            <p>Performance results:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Before (no pool)</th>
+                        <th>After (caching)</th>
+                        <th>Improvement</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Decode throughput</td>
+                        <td>153 tok/s</td>
+                        <td><strong>504 tok/s</strong></td>
+                        <td><strong>+3.3&times;</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Decode avg latency</td>
+                        <td>6.5 ms</td>
+                        <td><strong>2.0 ms</strong></td>
+                        <td>-69%</td>
+                    </tr>
+                    <tr>
+                        <td>Decode P50 latency</td>
+                        <td>6.0 ms</td>
+                        <td><strong>1.6 ms</strong></td>
+                        <td>-73%</td>
+                    </tr>
+                    <tr>
+                        <td>cudaFree time</td>
+                        <td>217 ms</td>
+                        <td>45 ms</td>
+                        <td>-79%</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p><strong>3.3x speedup from 30 lines of memory pool code.</strong> This is the value of profiling &mdash; not guessing the bottleneck is in operators, attention, or GEMM, but letting the data tell you: the biggest bottleneck is actually <code>cudaFree</code>.</p>
+
+            <h3>Summary</h3>
+
+            <p>From CPU's 33 tok/s to GPU's 504 tok/s, 15x speedup. Key lessons from the entire journey:</p>
+
+            <p><strong>1. Profile first, optimize second.</strong> Without running <code>nsys</code>, I might have spent days optimizing CUDA kernel occupancy or shared memory layout &mdash; but the actual bottleneck was <code>cudaFree</code>'s GPU synchronization. Data doesn't lie.</p>
+
+            <p><strong>2. The biggest improvements often come from the simplest fixes.</strong> Flash Attention implementation took hours, yielding +5%. The caching allocator took 30 lines, yielding +230%. Complexity and payoff are not proportional.</p>
+
+            <p><strong>3. End-to-end thinking.</strong> The FP16 sampler bug was an end-to-end type alignment issue. GPU-resident sampling was a data transfer issue. These aren't kernel-level optimizations but system-level ones. You need to see the entire pipeline, not just stare at individual operators.</p>
+
+            <p><strong>4. The value of abstraction layers extends beyond code reuse.</strong> The Backend abstraction made CPU/BLAS/CUDA switching zero-invasive. The Tensor's device_allocate/device_deallocate abstraction let the caching allocator be transparently inserted without changing any upper-layer code. Good abstractions make optimization local.</p>
+
+            <p>The entire project is now 6200 lines of C++/CUDA, running Qwen2.5-0.5B on an RTX 4060 at 504 tok/s decode. There's still much to do &mdash; INT4 quantization, prefill Q tiling, multi-request batching &mdash; but the core profiling-driven optimization loop is established.</p>
+
+            <p><em>"Premature optimization is the root of all evil. But so is premature pessimism &mdash; profile, then decide."</em></p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

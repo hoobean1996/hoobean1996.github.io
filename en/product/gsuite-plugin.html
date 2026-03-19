@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building a Webpack Scaffold for Google Workspace Add-ons - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Building a Webpack Scaffold for Google Workspace Add-ons</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/celestial-globe-clockwork.jpg" alt="Celestial Globe with Clockwork, Metropolitan Museum of Art">
+                <figcaption>Celestial Globe with Clockwork — Within a precision constraint framework, gears combine to produce complex operating mechanisms. Building toolchains for the GSuite sandbox is a similar kind of engineering</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: The development experience for Google Workspace add-ons is quite primitive — no npm, no build tools, and all resources must be inlined in a single HTML file. This article shares a Webpack scaffold solution that lets you develop GSuite add-ons with React + TypeScript, with automatic entry discovery, automatic JS/CSS inlining, and a single build covering all GSuite products. If you need complex UI interactions in GSuite add-ons, this scaffold can save you a lot of repetitive work.
+            </blockquote>
+
+            <h3>What Are Google Workspace Add-ons</h3>
+
+            <p>Google Workspace (formerly GSuite) allows developers to build add-ons for Docs, Sheets, Slides, Forms, and other products. Add-on UI comes in two forms: <strong>Sidebar</strong> (side panel, persistent) and <strong>Dialog</strong> (popup, temporary).</p>
+
+            <p>The add-on architecture has two layers:</p>
+
+<pre><code>┌──────────────────────────────────────────┐
+│           Google Docs / Sheets / ...      │
+│                                           │
+│   ┌─────────────┐    ┌───────────────┐   │
+│   │   Sidebar    │    │    Dialog     │   │
+│   │  (HTML/JS)   │    │  (HTML/JS)   │   │
+│   │  ← iframe →  │    │  ← iframe → │   │
+│   └──────┬───────┘    └──────┬───────┘   │
+│          │                    │           │
+│          │  google.script.run │           │
+│          ▼                    ▼           │
+│   ┌──────────────────────────────────┐   │
+│   │      AppScript (Server-side)     │   │
+│   │  - Access Drive / Gmail / Sheets │   │
+│   │  - Manipulate document content   │   │
+│   │  - Send emails                   │   │
+│   └──────────────────────────────────┘   │
+└──────────────────────────────────────────┘</code></pre>
+
+            <ul>
+                <li><strong>Frontend</strong>: HTML pages running in an iframe sandbox, hosted by AppScript's <code>HtmlService</code></li>
+                <li><strong>Backend</strong>: AppScript code running on Google's servers, with access to Google APIs (Drive, Gmail, Sheets, etc.)</li>
+                <li><strong>Communication</strong>: Frontend calls backend functions asynchronously via <code>google.script.run</code></li>
+            </ul>
+
+            <p>This model has three hard constraints that directly determine our build approach:</p>
+
+            <ol>
+                <li><strong>CSP restrictions</strong>: The iframe sandbox prohibits loading external scripts and stylesheets. All JS and CSS must be inlined in the HTML file</li>
+                <li><strong>Single-file delivery</strong>: <code>HtmlService.createHtmlOutputFromFile("sidebar")</code> only accepts a single HTML filename. Cannot be split into multiple files</li>
+                <li><strong>Cross-product deployment</strong>: The same add-on must be deployed separately to Docs, Sheets, Slides, and Forms, each being an independent AppScript project</li>
+            </ol>
+
+            <p>The officially recommended development approach is writing HTML + JavaScript directly in the Apps Script editor. This works for simple add-ons, but once the UI requires state management, multi-step forms, or conditional rendering, the development experience without componentization and build tools becomes painful.</p>
+
+            <p>Below is the Webpack scaffold I built to solve these problems.</p>
+
+            <h3>Scaffold Goals</h3>
+
+            <p>I wanted this scaffold to achieve:</p>
+
+            <ol>
+                <li><strong>React + TypeScript development</strong>: Build GSuite add-on UI using modern frontend practices</li>
+                <li><strong>Self-contained HTML output</strong>: Build artifacts are single HTML files with all JS/CSS inlined, directly satisfying GSuite's CSP restrictions</li>
+                <li><strong>Auto-discovery</strong>: Adding a new dialog only requires creating a folder in the conventional directory, without changing any build configuration</li>
+                <li><strong>Multi-product matrix build</strong>: One build generates independent deployment directories for each GSuite product</li>
+                <li><strong>Local development</strong>: Debug UI in the browser without deploying to GSuite</li>
+            </ol>
+
+            <h3>Project Structure Convention</h3>
+
+<pre><code>project/
+├── src/
+│   ├── sidebar/           # Main sidebar (must exist)
+│   │   ├── App.tsx
+│   │   └── index.tsx
+│   └── dialogs/           # Dialog directory (auto-discovered)
+│       ├── about/
+│       │   ├── App.tsx
+│       │   └── index.tsx
+│       └── settings/
+│           ├── App.tsx
+│           └── index.tsx
+├── appscript/
+│   └── shared.gs          # AppScript server-side code
+├── clasp/
+│   ├── docs/
+│   │   ├── .clasp.json    # Docs AppScript project ID
+│   │   └── appsscript.json
+│   ├── sheets/
+│   │   └── .clasp.json    # Sheets AppScript project ID
+│   └── ...
+├── webpack.config.js
+└── package.json</code></pre>
+
+            <p>The core convention of this structure is: <strong><code>src/sidebar/</code> is the fixed entry, and every subdirectory under <code>src/dialogs/</code> containing an <code>index.tsx</code> automatically becomes a dialog entry</strong>.</p>
+
+            <h3>Step 1: Auto-Discover Entry Points</h3>
+
+            <p>Webpack's <code>entry</code> is usually configured manually. But we want adding dialogs without changing configuration. So we scan the filesystem at Webpack startup:</p>
+
+<pre><code>const path = require("path");
+const fs = require("fs");
+
+function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(item => item.isDirectory())
+    .filter(dir => {
+      return fs.existsSync(
+        path.join(dialogsPath, dir.name, "index.tsx")
+      );
+    })
+    .map(dir => dir.name);
+}
+
+// Dynamically generate entry points
+const dialogs = discoverDialogs();
+const entry = { sidebar: "./src/sidebar/index.tsx" };
+dialogs.forEach(name => {
+  entry[name] = `./src/dialogs/${name}/index.tsx`;
+});</code></pre>
+
+            <p>This makes <code>entry</code> become <code>{ sidebar: "...", about: "...", settings: "..." }</code>. Want to add a new dialog? Create a folder under <code>src/dialogs/</code>, add an <code>index.tsx</code>, and it takes effect automatically on the next build.</p>
+
+            <h3>Step 2: Inline JS and CSS</h3>
+
+            <p>Normal Webpack build artifacts are separate <code>.js</code> and <code>.css</code> files, with HTML referencing them via <code>&lt;script src&gt;</code> and <code>&lt;link rel="stylesheet"&gt;</code>. This doesn't work in GSuite — the iframe sandbox blocks loading these external resources.</p>
+
+            <p>The solution is a combination of two plugins:</p>
+
+<pre><code>const HtmlWebpackPlugin = require("html-webpack-plugin");
+const HtmlInlineScriptPlugin =
+  require("html-inline-script-webpack-plugin");
+
+// JS inlining: HtmlInlineScriptPlugin puts the Webpack JS bundle
+//              directly inside the HTML's &lt;script&gt; tag
+plugins: [
+  new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    chunks: ["sidebar"],
+    inject: "body",
+  }),
+  new HtmlInlineScriptPlugin(),
+]
+
+// CSS inlining: use style-loader instead of mini-css-extract-plugin
+module: {
+  rules: [
+    {
+      test: /\.css$/,
+      use: ["style-loader", "css-loader"],
+      // style-loader injects CSS into &lt;style&gt; tags at runtime
+      // instead of generating separate .css files
+    },
+  ],
+}</code></pre>
+
+            <p>After building, each HTML file is completely self-contained — zero external dependencies. <code>HtmlService.createHtmlOutputFromFile("sidebar")</code> works directly.</p>
+
+            <h3>Step 3: Multi-Product Matrix Generation</h3>
+
+            <p>The same add-on needs to be deployed to Docs, Sheets, Slides, and Forms. Each product is an independent AppScript project requiring its own deployment directory. The Webpack config dynamically generates all <code>HtmlWebpackPlugin</code> instances:</p>
+
+<pre><code>const GSUITE_PRODUCTS = ["docs", "slides", "sheets", "forms"];
+const htmlPlugins = [];
+
+GSUITE_PRODUCTS.forEach(product => {
+  // sidebar
+  htmlPlugins.push(new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+    inject: "body",
+  }));
+
+  // Each auto-discovered dialog
+  dialogs.forEach(name => {
+    htmlPlugins.push(new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+      inject: "body",
+    }));
+  });
+});</code></pre>
+
+            <p>Build artifact structure:</p>
+
+<pre><code>dist/
+├── docs/
+│   ├── sidebar.html       # Self-contained HTML
+│   ├── about.html
+│   ├── settings.html
+│   └── appscript/
+│       └── shared.gs      # Copied AppScript code
+├── sheets/
+│   ├── sidebar.html
+│   ├── about.html
+│   └── settings.html
+├── slides/
+│   └── ...
+└── forms/
+    └── ...</code></pre>
+
+            <p>4 products x 3 entries = 12 HTML files, all auto-generated. JS code is compiled once and distributed to the corresponding HTML files via the <code>chunks</code> configuration.</p>
+
+            <h3>Step 4: AppScript File Copying</h3>
+
+            <p>AppScript <code>.gs</code> files don't need compilation but need to be copied to each product's output directory. Using <code>CopyWebpackPlugin</code>:</p>
+
+<pre><code>const CopyWebpackPlugin = require("copy-webpack-plugin");
+
+GSUITE_PRODUCTS.forEach(product => {
+  plugins.push(new CopyWebpackPlugin({
+    patterns: [{
+      from: "appscript/",
+      to: `${product}/appscript/`,
+    }],
+  }));
+});</code></pre>
+
+            <p>This way, when running <code>clasp push</code>, each product directory has both HTML and <code>.gs</code> files — a complete AppScript project.</p>
+
+            <h3>Step 5: Local Development Support</h3>
+
+            <p><code>google.script.run</code> only exists in the GSuite environment. When developing locally in the browser, it's <code>undefined</code>. The approach is simple: detect the environment, and use mock data when it's not present.</p>
+
+<pre><code>// Wrap AppScript calls
+function callAppScript&lt;T&gt;(
+  methodName: string,
+  ...args: any[]
+): Promise&lt;T&gt; {
+  return new Promise((resolve, reject) => {
+    if (typeof google !== "undefined" && google.script) {
+      const runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject);
+      runner[methodName](...args);
+    } else {
+      // Local development: return mock data
+      resolve(getMockData(methodName, args) as T);
+    }
+  });
+}
+
+// Usage
+const sheets = await callAppScript&lt;Sheet[]&gt;("getGoogleSheets");</code></pre>
+
+            <p>This has two benefits:</p>
+
+            <ol>
+                <li><strong>Local development doesn't depend on the GSuite environment</strong>: Use <code>webpack-dev-server</code> to start a local server, debugging UI and interaction logic in the browser</li>
+                <li><strong>Wraps callback-style <code>google.script.run</code> as Promises</strong>: React components can use async/await, making code cleaner</li>
+            </ol>
+
+            <h3>Step 6: TypeScript Type Declarations</h3>
+
+            <p><code>google.script.run</code> has no official type definitions. Manual declarations are needed so TypeScript knows which AppScript functions are callable:</p>
+
+<pre><code>// types/google.d.ts
+interface AppScriptRunner {
+  getGoogleSheets: () => void;
+  getWorksheets: (spreadsheetId: string) => void;
+  getSelectedSheetData: (
+    spreadsheetId: string,
+    worksheetName: string
+  ) => void;
+  getDocumentHtml: (docId: string) => void;
+  sendMailMerge: (
+    spreadsheetId: string,
+    worksheetName: string,
+    docId: string,
+    subject: string,
+    replyTo: string,
+    testMode: boolean
+  ) => void;
+}
+
+declare const google: {
+  script: {
+    run: {
+      withSuccessHandler: (cb: (result: any) => void) => {
+        withFailureHandler: (
+          cb: (error: any) => void
+        ) => AppScriptRunner;
+      };
+    };
+  };
+};</code></pre>
+
+            <p>For each new AppScript function, add a declaration here. While return value types are still <code>any</code> (AppScript is dynamically typed), at least call parameters have type checking.</p>
+
+            <h3>Step 7: Deployment Pipeline</h3>
+
+            <p>Use Google's <code>clasp</code> CLI to push build artifacts to AppScript projects. Each GSuite product is an independent AppScript project with its own <code>.clasp.json</code>:</p>
+
+<pre><code># clasp/docs/.clasp.json
+{
+  "scriptId": "1a2b3c...",        # Docs AppScript project ID
+  "rootDir": "../../dist/docs"    # Points to build artifacts
+}
+
+# Deployment flow
+npm run build                     # Build HTML for all products
+cd clasp/docs && clasp push       # Push to Docs AppScript project
+cd clasp/sheets && clasp push     # Push to Sheets AppScript project
+# ... push separately for each product</code></pre>
+
+            <p><code>clasp push</code> uploads all <code>.html</code> and <code>.gs</code> files under <code>rootDir</code> to Google Apps Script. You can write a script to chain all product pushes:</p>
+
+<pre><code># deploy.sh
+npm run build
+for product in docs sheets slides forms; do
+  echo "Deploying to $product..."
+  (cd clasp/$product && clasp push)
+done</code></pre>
+
+            <h3>Complete webpack.config.js</h3>
+
+            <p>Combining all the steps above:</p>
+
+<pre><code>const path = require("path");
+const fs = require("fs");
+const HtmlWebpackPlugin = require("html-webpack-plugin");
+const HtmlInlineScriptPlugin =
+  require("html-inline-script-webpack-plugin");
+const CopyWebpackPlugin = require("copy-webpack-plugin");
+const TerserPlugin = require("terser-webpack-plugin");
+
+// ---- Auto-discovery ----
+function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .filter(d =>
+      fs.existsSync(path.join(dialogsPath, d.name, "index.tsx"))
+    )
+    .map(d => d.name);
+}
+
+const dialogs = discoverDialogs();
+const PRODUCTS = ["docs", "slides", "sheets", "forms"];
+
+// ---- Entry ----
+const entry = { sidebar: "./src/sidebar/index.tsx" };
+dialogs.forEach(name => {
+  entry[name] = `./src/dialogs/${name}/index.tsx`;
+});
+
+// ---- HTML + Copy plugins ----
+const plugins = [];
+
+PRODUCTS.forEach(product => {
+  // sidebar HTML
+  plugins.push(new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+    inject: "body",
+  }));
+  // dialog HTMLs
+  dialogs.forEach(name => {
+    plugins.push(new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+      inject: "body",
+    }));
+  });
+  // AppScript file copy
+  plugins.push(new CopyWebpackPlugin({
+    patterns: [{
+      from: "appscript/",
+      to: `${product}/appscript/`,
+    }],
+  }));
+});
+
+plugins.push(new HtmlInlineScriptPlugin());
+
+// ---- Export ----
+module.exports = {
+  mode: "production",
+  entry,
+  output: {
+    path: path.resolve(__dirname, "dist"),
+    clean: true,
+  },
+  resolve: {
+    extensions: [".ts", ".tsx", ".js", ".jsx"],
+  },
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: "ts-loader",
+        exclude: /node_modules/,
+      },
+      {
+        test: /\.css$/,
+        use: ["style-loader", "css-loader"],
+      },
+    ],
+  },
+  plugins,
+  optimization: {
+    minimizer: [
+      new TerserPlugin({
+        terserOptions: { compress: { drop_console: true } },
+      }),
+    ],
+  },
+};</code></pre>
+
+            <h3>GSuite AppScript-Side Patterns</h3>
+
+            <p>The scaffold solves the frontend build problems, but there are some patterns worth documenting on the AppScript side.</p>
+
+            <p><strong>Cross-product adaptation</strong>: The same add-on runs in Docs/Sheets/Slides/Forms, but AppScript has no "which product am I in" API. The only option is try/catch detection:</p>
+
+<pre><code>function getUi() {
+  try { return DocumentApp.getUi(); } catch(e) {}
+  try { return SpreadsheetApp.getUi(); } catch(e) {}
+  try { return SlidesApp.getUi(); } catch(e) {}
+  try { return FormApp.getUi(); } catch(e) {}
+  return null;
+}
+
+function showSidebar() {
+  var ui = getUi();
+  if (!ui) return;
+  var html = HtmlService.createHtmlOutputFromFile("sidebar")
+    .setTitle("My Plugin").setWidth(320);
+  ui.showSidebar(html);
+}</code></pre>
+
+            <p><strong>How google.script.run works</strong>: Frontend calls backend functions and gets results via callbacks. Every global function in AppScript can be called from the frontend:</p>
+
+<pre><code>// AppScript side — define global functions
+function getGoogleSheets() {
+  var files = DriveApp.getFilesByType(MimeType.GOOGLE_SHEETS);
+  var sheets = [];
+  while (files.hasNext()) {
+    var file = files.next();
+    sheets.push({
+      id: file.getId(),
+      name: file.getName(),
+      url: file.getUrl(),
+    });
+  }
+  return { success: true, sheets: sheets };
+}
+
+// React side — call it
+google.script.run
+  .withSuccessHandler((result) => {
+    setSheets(result.sheets);
+  })
+  .withFailureHandler((error) => {
+    console.error(error);
+  })
+  .getGoogleSheets();</code></pre>
+
+            <p><strong>Useful APIs</strong>: AppScript can export Google Docs as HTML, read Sheets data, send Gmail, etc. These are the core capabilities of GSuite add-ons:</p>
+
+<pre><code>// Read Sheets data
+function getSheetData(spreadsheetId, worksheetName) {
+  var spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = spreadsheet.getSheetByName(worksheetName);
+  var values = sheet.getDataRange().getValues();
+  return { headers: values[0], rows: values.slice(1) };
+}
+
+// Read Docs content (export as HTML, preserving formatting)
+function getDocumentHtml(docId) {
+  var url = "https://docs.google.com/feeds/download/"
+    + "documents/export/Export?id=" + docId
+    + "&exportFormat=html";
+  var response = UrlFetchApp.fetch(url, {
+    headers: {
+      Authorization: "Bearer " + ScriptApp.getOAuthToken()
+    }
+  });
+  return response.getContentText();
+}
+
+// Send email
+function sendEmail(to, subject, htmlBody) {
+  GmailApp.sendEmail(to, subject, "", {
+    htmlBody: htmlBody,
+  });
+}</code></pre>
+
+            <h3>Real-World Case: Mail Merge</h3>
+
+            <p>Using this scaffold, I built a Mail Merge feature: read a recipient list from Google Sheets, use a Google Doc as a template, and send personalized emails in bulk.</p>
+
+<pre><code>User workflow (4-step wizard in the sidebar):
+
+Step 1: Select data source → List Sheets in Drive → Select sheet tab → Preview headers
+Step 2: Select template   → List Docs in Drive → Preview HTML content
+Step 3: Configure         → Email subject (supports {{Name}} merge fields) → reply-to address
+Step 4: Execute           → Summary confirmation → Test mode → Send and show results</code></pre>
+
+            <p>The frontend is a standard React multi-step form (using state to control steps), with each step's data fetched from the backend via <code>callAppScript</code>. The backend does field replacement and sends emails:</p>
+
+<pre><code>function sendMailMerge(spreadsheetId, worksheetName,
+                       docId, subject, replyTo, testMode) {
+  var data = getSheetData(spreadsheetId, worksheetName);
+  var template = getDocumentHtml(docId);
+  var results = [];
+
+  for (var i = 0; i &lt; data.rows.length; i++) {
+    var row = {};
+    data.headers.forEach(function(h, j) { row[h] = data.rows[i][j]; });
+
+    var body = template.replace(/\{\{([^}]+)\}\}/g,
+      function(match, field) {
+        return row[field.trim()] || match;
+      });
+    var emailSubject = subject.replace(/\{\{([^}]+)\}\}/g,
+      function(match, field) {
+        return row[field.trim()] || match;
+      });
+
+    var recipient = testMode
+      ? Session.getActiveUser().getEmail()
+      : row["Email"];
+
+    try {
+      GmailApp.sendEmail(recipient, emailSubject, "", {
+        htmlBody: body,
+        replyTo: replyTo || undefined,
+      });
+      results.push({ row: i + 1, status: "sent" });
+    } catch (e) {
+      results.push({ row: i + 1, status: "error", error: e.message });
+    }
+
+    Utilities.sleep(100); // Rate limiting
+  }
+
+  return { success: true, results: results };
+}</code></pre>
+
+            <p>This Mail Merge demonstrates the scaffold's value: the frontend has complex multi-step interactions (selecting files, previewing data, configuring merge fields, displaying send results) that would be painful to write with raw HTML. React's componentization and state management have clear advantages here.</p>
+
+            <h3>Development Experience Pain Points</h3>
+
+            <p>This approach isn't perfect. A few unavoidable issues:</p>
+
+            <ul>
+                <li><strong>No hot reload</strong>: Changing AppScript code requires <code>clasp push</code> + refreshing the GSuite page to see the effect. The frontend portion can be debugged locally with <code>webpack-dev-server</code>, but logic involving AppScript interaction can only be tested in GSuite</li>
+                <li><strong>Bundle size</strong>: React inlined into HTML makes each file about 1MB. 4 products x N entries = total artifacts can be large. Consider using Preact instead of React, or using <code>TerserPlugin</code> for compression</li>
+                <li><strong>AppScript's 6-minute execution limit</strong>: Long tasks (like sending 1000 emails) may time out. Need to control rate in loops, or process in batches</li>
+                <li><strong>Debugging difficulty</strong>: console.log inside iframes may not always be visible. On the AppScript side, use <code>Logger.log()</code>, viewable in the Apps Script editor's execution logs</li>
+            </ul>
+
+            <h3>Summary</h3>
+
+            <p>The core idea of this scaffold: <strong>use Webpack to bridge "modern frontend development" and "GSuite sandbox constraints."</strong></p>
+
+            <ul>
+                <li><code>HtmlInlineScriptPlugin</code> + <code>style-loader</code> solves CSP restrictions — generating self-contained HTML</li>
+                <li>Filesystem scanning implements dialog auto-discovery — zero-config new entries</li>
+                <li>Product x entry matrix loop generates <code>HtmlWebpackPlugin</code> instances — one build covers all products</li>
+                <li><code>clasp</code> + <code>rootDir</code> configuration enables per-product deployment — each product pushed independently</li>
+                <li>Environment detection + mock data enables local development — debug UI without depending on the GSuite environment</li>
+            </ul>
+
+            <p>If you need complex UI interactions in GSuite add-ons, this scaffold can save a lot of repetitive work. If it's just a simple add-on with a button or two, writing raw HTML is sufficient — you don't need this setup.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <section class="posts">
+            <h3>Performance</h3>
+            <article>
+                <h4><a href="llm-inference-gpu.html">From CPU to GPU: CUDA Optimization for an LLM Inference Engine</a></h4>
+                <time>2026-03-18</time>
+                <p>Optimization driven by nsys profiling: CUDA backend, FP16 full pipeline, Flash Attention, caching allocator. From 33 tok/s to 504 tok/s, a 15x speedup.</p>
+            </article>
+            <article>
+                <h4><a href="llm-inference-engine.html">From Zero to Generation: Building an LLM Inference Engine in Pure C++</a></h4>
+                <time>2026-02-19</time>
+                <p>Without any ML framework, building an inference engine from scratch in pure C++ — from mmap-loading weights to autoregressive generation — capable of running Qwen2.5-0.5B.</p>
+            </article>
+            <article>
+                <h4><a href="matmul-optimization.html">From 0.98 to 267 GFLOPS: A Complete Record of Matrix Multiplication Optimization</a></h4>
+                <time>2026-02-16</time>
+                <p>A step-by-step optimization journey from the textbook triple loop to a GEMM implementation approaching hardware peak performance.</p>
+            </article>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

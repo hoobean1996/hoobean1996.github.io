@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用 OCaml 实现一个嵌入式表达式语言 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>用 OCaml 实现一个嵌入式表达式语言</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/hours-jeanne-devreux.jpg" alt="The Hours of Jeanne d'Evreux, Jean Pucelle, c. 1324-28, Metropolitan Museum of Art">
+                <figcaption>Jean Pucelle,《让娜·德·埃夫勒的时祷书》, c. 1324-28 — 中世纪手抄本用精密的规则和符号系统来传递复杂的信息。设计一门表达式语言，也是在定义一套符号和规则</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：在 Schema 驱动的 UI 系统里，条件渲染、字段校验、动态计算都需要一个表达式引擎。用字符串拼 JavaScript 再 eval 不安全也不可控。这篇文章分享用 OCaml 从零实现一个安全的嵌入式表达式语言的完整过程——Lexer、Parser、AST、Pattern Matching、类型推导、高阶函数——最终通过 js_of_ocaml 编译成 JavaScript，嵌入到前端 UI 框架里。如果你需要在产品中嵌入一个安全可控的计算引擎，这个方案可以参考。
+            </blockquote>
+
+            <h3>为什么需要自己的表达式语言</h3>
+
+            <p>在<a href="schema-driven-ui.html">Schema 驱动 UI</a> 那篇文章里，我们用 JSON 描述整个界面。但 JSON 是静态的——它描述不了"当 @age > 18 时显示这个字段"、"@price * @quantity 计算总价"这样的动态逻辑。</p>
+
+            <p>最简单的做法是用 JavaScript 的 <code>eval()</code> 或 <code>new Function()</code>。但这有两个致命问题：</p>
+
+            <ul>
+                <li><strong>安全性</strong>：<code>eval()</code> 可以执行任意代码。如果表达式来自用户输入（比如运营人员配置表单规则），这是一个巨大的安全漏洞</li>
+                <li><strong>可控性</strong>：你没法限制表达式能做什么。它可以访问 DOM、发网络请求、修改全局状态。在一个"配置驱动"的系统里，你需要的是一个沙箱化的、只能做计算的引擎</li>
+            </ul>
+
+            <p>所以我决定自己实现一个表达式语言。用 OCaml 写，通过 js_of_ocaml 编译成 JavaScript，嵌入到前端框架里。</p>
+
+            <h3>语言长什么样</h3>
+
+            <p>先看几个例子，感受一下这个语言的能力：</p>
+
+<pre><code>// 基本算术和比较
+1 + 2                         // → 3
+@price * @quantity            // → 引用表单字段计算
+@age >= 18 and @country = "CN"  // → 条件判断
+
+// LET 绑定
+let tax = @price * 0.1 in
+let total = @price + tax in
+total                         // → 变量绑定和作用域
+
+// 数组和记录
+let items = [1, 2, 3] in
+items[0]                      // → 1
+let user = {name: "Alice", age: 30} in
+user.name                     // → "Alice"
+
+// Record Spread
+let base = {x: 1, y: 2} in
+{...base, z: 3}              // → {x: 1, y: 2, z: 3}
+
+// 条件表达式
+if @score >= 90 then "A"
+else "B"                      // → OCaml 风格的 if-then-else
+
+// Pattern Matching
+match @status with
+| "active" -> "在线"
+| "idle" when @lastSeen > 60 -> "离开"
+| "idle" -> "空闲"
+| _ -> "离线"                 // → 带 guard 的模式匹配
+
+// Lambda 和 Pipe
+[1, 2, 3, 4]
+|> FILTER(fun x -> x > 2)
+|> MAP(fun x -> x * 10)      // → [30, 40]
+
+// 类型定义
+type User = {name: string, age: int} in
+let u: User = {name: "Bob", age: 25} in
+u.age                         // → 25</code></pre>
+
+            <p>这不是一个玩具——它有 LET 绑定、Pattern Matching with Guards、Lambda、柯里化、Pipe 操作符、Record Spread、类型系统。但它也不是一个通用编程语言——没有循环、没有副作用、没有 IO。它是一个纯粹的计算引擎。</p>
+
+            <h3>整体架构</h3>
+
+<pre><code>表达式字符串
+    ↓ Lexer (ocamllex)
+Token 流
+    ↓ Parser (menhir)
+AST
+    ↓ Type Inference (types.ml)
+类型检查结果
+    ↓ Evaluator (driver.ml + runtime.ml)
+计算结果
+
+    ↓ js_of_ocaml
+编译成 .js，嵌入前端</code></pre>
+
+            <p>经典的编译器前端架构。下面逐层展开。</p>
+
+            <h3>Lexer：ocamllex</h3>
+
+            <p>Lexer 把字符串切成 token 流。用 OCaml 的 <code>ocamllex</code> 工具生成：</p>
+
+<pre><code>(* lexer.mll *)
+let keyword_table = [
+  ("if", IF); ("then", THEN); ("else", ELSE);
+  ("let", LET); ("in", IN);
+  ("match", MATCH); ("with", WITH); ("when", WHEN);
+  ("fun", FUN); ("type", TYPE);
+  ("and", AND); ("or", OR);
+  ("true", TRUE); ("false", FALSE); ("null", NULL);
+]
+
+rule token = parse
+  | [' ' '\t' '\n']  { token lexbuf }       (* 跳过空白 *)
+  | "//" [^'\n']* '\n'  { token lexbuf }     (* 单行注释 *)
+  | "/*"              { comment lexbuf }      (* 多行注释 *)
+  | '-'? ['0'-'9']+ as i  { NUM (int_of_string i) }
+  | '"'              { read_string (Buffer.create 16) lexbuf }
+  | ['a'-'z''A'-'Z']['a'-'z''A'-'Z''0'-'9''_']* as id {
+      match keyword_of_string id with
+      | Some token -> token
+      | None -> IDENT id
+    }
+  | '@' ['a'-'z''A'-'Z']+ as id {
+      CONTEXT_VAR (String.sub id 1 (String.length id - 1))
+    }
+  | "->"  { ARROW }
+  | "|>"  { PIPE }
+  | "??"  { NULLCOALESCE }
+  | "..." { DOTDOTDOT }
+  | ...</code></pre>
+
+            <p>值得注意的是 <code>@</code> 前缀变量（<code>CONTEXT_VAR</code>）。在表达式里写 <code>@price</code>，Lexer 会识别为上下文变量——求值时从外部传入的 context 对象里查找。这是表达式语言和宿主环境的接口。</p>
+
+            <p>字符串处理支持转义字符和字符串插值（<code>"Hello ${name}"</code>），Lexer 检测到 <code>${</code> 模式时标记为 <code>INTERP_STRING</code>，后续在求值阶段递归解析插值表达式。</p>
+
+            <h3>AST：数据即程序</h3>
+
+            <p>AST 是整个语言的核心数据结构。OCaml 的代数数据类型（ADT）表达这个再合适不过：</p>
+
+<pre><code>(* ast.ml *)
+type pattern =
+  | PInt of int          (* 匹配整数字面量 *)
+  | PBool of bool        (* 匹配布尔值 *)
+  | PString of string    (* 匹配字符串 *)
+  | PVar of string       (* 绑定变量 *)
+  | PArray of pattern list    (* 解构数组 [x, y, z] *)
+  | PRecord of (string * pattern) list  (* 解构记录 {name, age} *)
+  | PAny                 (* 通配符 _ *)
+
+type expr =
+  | Num of int | Float of float | Bool of bool
+  | String of string | InterpString of string | Null
+  | Var of string
+  (* 数据结构 *)
+  | Array of expr list
+  | ArrayAccess of expr * expr
+  | Record of (string * expr) list
+  | RecordAccess of expr * string
+  | RecordSpread of expr * (string * expr) list
+  (* 算术和逻辑 *)
+  | Add of expr * expr | Sub of expr * expr
+  | Mul of expr * expr | Div of expr * expr
+  | Gt of expr * expr | Lt of expr * expr | ...
+  | And of expr * expr | Or of expr * expr | Eq of expr * expr
+  | NullCoalesce of expr * expr
+  (* 控制流 *)
+  | If of expr * expr * expr
+  | Let of string * type_expr option * expr * expr
+  | Match of expr * (guarded_pattern * expr) list
+  (* 函数 *)
+  | FuncDef of string * string list * expr
+  | Lambda of string list * expr
+  | App of expr * expr      (* 柯里化应用 f x *)
+  | Pipe of expr * expr     (* x |> f *)
+  (* 类型系统 *)
+  | TypeDef of type_decl * expr
+  | Seq of expr * expr
+
+and guarded_pattern = pattern * expr option</code></pre>
+
+            <p>几个设计决策值得说明：</p>
+
+            <ul>
+                <li><strong>Let 带可选类型注解</strong>：<code>Let of string * type_expr option * expr * expr</code>——<code>let x: int = 5 in ...</code> 或 <code>let x = 5 in ...</code> 都合法</li>
+                <li><strong>Match 的 case 是 <code>guarded_pattern * expr</code></strong>：<code>guarded_pattern = pattern * expr option</code>，<code>expr option</code> 就是可选的 <code>when</code> guard</li>
+                <li><strong>App 是二元的</strong>：<code>f x y</code> 解析为 <code>App(App(f, x), y)</code>——标准的柯里化表示</li>
+            </ul>
+
+            <h3>Parser：menhir</h3>
+
+            <p>Parser 用 <code>menhir</code>（OCaml 的 LR parser generator）定义。优先级从低到高：</p>
+
+<pre><code>(* parser.mly *)
+%nonassoc IN
+%nonassoc ARROW
+%left SEMICOLON
+%left PIPE
+%nonassoc ELSE THEN
+%left BAR
+%left NULLCOALESCE
+%left AND OR
+%left EQ
+%left LT GT LTE GTE
+%left PLUS MINUS
+%left TIMES DIV
+%nonassoc APP           (* 柯里化函数应用 *)
+%left DOT
+%nonassoc LBRAKET       (* 数组访问 *)</code></pre>
+
+            <p>Pattern Matching 的语法规则：</p>
+
+<pre><code>match_cases:
+  | guarded_pattern ARROW expr                     { [($1, $3)] }
+  | BAR guarded_pattern ARROW expr                 { [($2, $4)] }
+  | guarded_pattern ARROW expr BAR match_cases     { ($1, $3) :: $5 }
+  | BAR guarded_pattern ARROW expr BAR match_cases { ($2, $4) :: $6 }
+
+guarded_pattern:
+  | pattern                  { ($1, None) }
+  | pattern WHEN expr        { ($1, Some $3) }
+
+pattern:
+  | NUM { PInt $1 }
+  | UNDERSCORE { PAny }
+  | bool_literal { PBool $1 }
+  | STRING { PString $1 }
+  | IDENT { PVar $1 }
+  | LBRAKET array_patterns RBRAKET { PArray $2 }
+  | LBRACE record_pattern_fields RBRACE { PRecord $2 }</code></pre>
+
+            <p>第一个 <code>BAR</code>（<code>|</code>）是可选的，所以可以写：</p>
+
+<pre><code>// 两种风格都行
+match x with
+  1 -> "one"
+| 2 -> "two"
+| _ -> "other"
+
+match x with
+| 1 -> "one"
+| 2 -> "two"
+| _ -> "other"</code></pre>
+
+            <p>Record pattern 支持 shorthand：<code>{name}</code> 等价于 <code>{name: name}</code>，和 JavaScript 的解构语法一致。</p>
+
+            <h3>求值器：Pattern Matching 的实现</h3>
+
+            <p>求值器是一个递归函数 <code>eval_expr : env -> expr -> value * env</code>。大部分节点的求值都很直白（加法就是加、比较就是比），最有意思的是 Pattern Matching。</p>
+
+            <p>核心是 <code>pattern_matches</code> 函数——给一个值和一个模式，返回匹配成功时的变量绑定（<code>Some env</code>）或失败（<code>None</code>）：</p>
+
+<pre><code>let rec pattern_matches value = function
+  | PInt i ->
+      (match value with
+       | VInt i' when i' = i -> Some Env.empty
+       | _ -> None)
+  | PString s ->
+      (match value with
+       | VString s' when s' = s -> Some Env.empty
+       | _ -> None)
+  | PVar name ->
+      (* 变量模式：总是匹配，绑定变量名 *)
+      Some (Env.singleton name value)
+  | PArray patterns ->
+      (match value with
+       | VArray elements ->
+           if List.length patterns <> List.length elements then None
+           else
+             (* 递归匹配每个元素 *)
+             let matches = List.mapi
+               (fun i pat -> pattern_matches (List.nth elements i) pat)
+               patterns in
+             if List.exists (fun x -> x = None) matches then None
+             else Some (merge_all_envs matches)
+       | _ -> None)
+  | PRecord pattern_fields ->
+      (match value with
+       | VRecord value_fields ->
+           (* 对每个模式字段，在值的记录里查找并递归匹配 *)
+           let matches = List.map (fun (key, pat) ->
+             match List.assoc_opt key value_fields with
+             | Some field_value -> pattern_matches field_value pat
+             | None -> None
+           ) pattern_fields in
+           if List.exists (fun x -> x = None) matches then None
+           else Some (merge_all_envs matches)
+       | _ -> None)
+  | PAny -> Some Env.empty</code></pre>
+
+            <p>Match 表达式的求值逻辑——从上到下尝试每个 case，匹配成功且 guard 通过时求值 body：</p>
+
+<pre><code>| Match (e1, cases) ->
+    let v1, _ = eval_expr env e1 in
+    let rec try_match v = function
+      | [] -> failwith "Match error: no pattern matches"
+      | ((pattern, guard_opt), body) :: rest ->
+          match pattern_matches v pattern with
+          | Some pattern_env ->
+              let merged_env = Env.union ... pattern_env env in
+              (* 检查 guard *)
+              let guard_passes = match guard_opt with
+                | None -> true
+                | Some guard_expr ->
+                    match eval_expr merged_env guard_expr with
+                    | VBool b, _ -> b
+                    | _ -> failwith "Guard must be boolean"
+              in
+              if guard_passes then eval_expr merged_env body
+              else try_match v rest    (* guard 失败，继续下一个 case *)
+          | None -> try_match v rest   (* 模式不匹配，继续 *)
+    in
+    try_match v1 cases</code></pre>
+
+            <p>关键点：pattern_env 和当前 env 合并后传给 guard 和 body。这意味着 guard 可以引用模式绑定的变量：</p>
+
+<pre><code>match user with
+| {name, age} when age > 18 -> CONCAT(name, " is adult")
+//  ↑ name 和 age 在 guard 里可用
+| {name} -> CONCAT(name, " is minor")</code></pre>
+
+            <h3>柯里化和 Pipe</h3>
+
+            <p>函数应用支持柯里化——如果参数不够，返回一个新的闭包：</p>
+
+<pre><code>| App (func_expr, arg_expr) ->
+    (* 收集所有参数 *)
+    let func_base, collected_args = collect_args func_expr [arg_val] in
+    match find_closure func_base with
+    | VClosure (params, body, closure_env) ->
+        let n_params = List.length params in
+        let n_args = List.length collected_args in
+        if n_args < n_params then
+          (* 部分应用：返回新闭包 *)
+          let applied = take n_args params in
+          let remaining = drop n_args params in
+          let env' = bind_params closure_env applied collected_args in
+          (VClosure (remaining, body, env'), env)
+        else if n_args = n_params then
+          (* 完全应用：求值 body *)
+          let env' = bind_params closure_env params collected_args in
+          eval_expr env' body
+        else
+          failwith "Too many arguments"</code></pre>
+
+            <p>Pipe 操作符（<code>|></code>）把左侧的值作为右侧函数的第一个参数：</p>
+
+<pre><code>// 这两个等价
+[1, 2, 3] |> MAP(fun x -> x * 2)
+MAP([1, 2, 3], fun x -> x * 2)
+
+// 可以链式调用
+[1, 2, 3, 4, 5]
+|> FILTER(fun x -> x > 2)     // → [3, 4, 5]
+|> MAP(fun x -> x * 10)       // → [30, 40, 50]
+|> SUM                         // → 120</code></pre>
+
+            <p>实现上，Pipe 会根据右侧的类型做不同的处理：如果是函数调用 <code>FUNC(args)</code>，就把左侧值插入为第一个参数；如果是变量名，就把它当作单参数函数调用；如果是 Lambda，直接应用。</p>
+
+            <h3>类型系统</h3>
+
+            <p>这个语言有一个完整的类型推导系统。类型表示：</p>
+
+<pre><code>type typ =
+  | TInt | TFloat | TBool | TString | TDate | TNull
+  | TArray of typ
+  | TRecord of (string * typ) list
+  | TFunction of typ list * typ
+  | TUnion of typ list        (* int | string *)
+  | TAny                      (* 动态类型 *)
+  | TName of string           (* 用户定义类型引用 *)</code></pre>
+
+            <p>类型推导是双向的：</p>
+
+<pre><code>// 从值推导类型
+let x = 42 in ...              // x : int
+let arr = [1, 2, 3] in ...     // arr : int[]
+let u = {name: "Alice"} in ... // u : {name: string}
+
+// 从类型注解检查
+let x: int = 42 in ...         // OK
+type User = {name: string, age: int} in
+let u: User = {name: "Bob", age: 25} in ...  // OK</code></pre>
+
+            <p>类型系统支持结构化子类型（structural subtyping）——Record 类型的子类型关系基于字段是否包含，而不是名字是否相同：</p>
+
+<pre><code>let is_subtype t1 t2 =
+  match (t1, t2) with
+  | _, TAny -> true              (* 所有类型都是 Any 的子类型 *)
+  | TInt, TFloat -> true         (* Int 可以用在 Float 的位置 *)
+  | TNull, _ -> true             (* Null 可以是任何类型 *)
+  | TRecord f1, TRecord f2 ->
+      (* 结构化子类型：f1 包含 f2 的所有字段 *)
+      List.for_all (fun (k2, v2) ->
+        match List.assoc_opt k2 f1 with
+        | Some v1 -> is_subtype v1 v2
+        | None -> false
+      ) f2
+  | ...</code></pre>
+
+            <p>If-then-else 的类型推导使用 <code>unify</code>——两个分支的类型取并集，如果不兼容就返回 Union 类型：</p>
+
+<pre><code>| If (_, then_expr, else_expr) ->
+    let t1 = infer_type env then_expr in
+    let t2 = infer_type env else_expr in
+    simplify_type (unify t1 t2)
+    // if ... then 1 else 2.0  → float（Int 提升为 Float）
+    // if ... then 1 else "a"  → int | string（Union 类型）</code></pre>
+
+            <h3>内置函数库</h3>
+
+            <p>除了语言本身的特性，还有一个丰富的内置函数库，按类别组织：</p>
+
+            <table>
+                <thead>
+                    <tr><th>类别</th><th>函数</th><th>示例</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>文本</td><td>UPPER, LOWER, TRIM, CONCAT, LEFT, RIGHT, MID, FIND, SUBSTITUTE</td><td><code>UPPER("hello")</code> → <code>"HELLO"</code></td></tr>
+                    <tr><td>数学</td><td>ABS, ROUND, FLOOR, CEIL, POW, SQRT, SUM, MAX, MIN, AVERAGE</td><td><code>ROUND(3.7)</code> → <code>4</code></td></tr>
+                    <tr><td>数组</td><td>LEN, CONTAINS, INDEX, SLICE, SORT, REVERSE, UNIQUE, JOIN</td><td><code>UNIQUE([1,2,2,3])</code> → <code>[1,2,3]</code></td></tr>
+                    <tr><td>高阶</td><td>MAP, FILTER, REDUCE, EVERY, SOME, FLATMAP</td><td><code>FILTER([1,2,3], fun x -> x > 1)</code> → <code>[2,3]</code></td></tr>
+                    <tr><td>条件</td><td>IFS, IFNA</td><td><code>IFS(@x > 0, "正", @x < 0, "负", true, "零")</code></td></tr>
+                    <tr><td>日期</td><td>TODAY, YEAR, MONTH, DAY, DATEADD, DATEDIFF</td><td><code>YEAR(TODAY())</code> → <code>2026</code></td></tr>
+                    <tr><td>类型</td><td>TYPE_OF, IS_STRING, IS_NUMBER, IS_ARRAY, IS_BOOL</td><td><code>TYPE_OF(42)</code> → <code>"int"</code></td></tr>
+                    <tr><td>格式化</td><td>FORMAT_NUMBER, FORMAT_PERCENT</td><td><code>FORMAT_PERCENT(0.85)</code> → <code>"85%"</code></td></tr>
+                </tbody>
+            </table>
+
+            <p>高阶函数的实现需要特殊处理——内置函数需要调用用户传入的 Lambda。这里用了一个引用来打破循环依赖：</p>
+
+<pre><code>(* builtin.ml *)
+(* 引用 eval_expr，由 driver.ml 初始化 *)
+let eval_closure_ref : (value Env.t -> expr -> value) ref =
+  ref (fun _ _ -> failwith "eval_closure not initialized")
+
+let apply_closure closure args =
+  match closure with
+  | VClosure (params, body, closure_env) ->
+      let env' = bind_params closure_env params args in
+      !eval_closure_ref env' body
+  | _ -> failwith "Expected a function"
+
+(* driver.ml 初始化 *)
+let () =
+  Builtin.eval_closure_ref := fun env expr ->
+    let result, _ = eval_expr env expr in
+    result</code></pre>
+
+            <p>这是 OCaml 里处理模块间循环依赖的经典模式——用 <code>ref</code> 做延迟绑定。</p>
+
+            <h3>编译到 JavaScript</h3>
+
+            <p>整个 OCaml 代码通过 <code>js_of_ocaml</code> 编译成一个 JavaScript 文件，发布为 npm 包 <code>@gigaboo/expr</code>：</p>
+
+<pre><code>// JavaScript 端使用
+import { libexpr } from '@gigaboo/expr';
+
+// 简单求值
+libexpr.eval('1 + 2');                    // → 3
+libexpr.eval('LET x = 10 IN x * 2');     // → 20
+
+// 带上下文求值（@ 变量从这里取值）
+libexpr.evalInContext('@price * @qty', {
+  price: 99.9,
+  qty: 3
+});                                       // → 299.7
+
+// 类型推导
+libexpr.inferType('LET x = [1, 2] IN x'); // → "int[]"</code></pre>
+
+            <p>在 Schema 驱动 UI 里的实际用法：</p>
+
+<pre><code>// ComponentSchema 里的条件渲染
+{
+  "type": "TextField",
+  "props": { "label": "公司名称" },
+  "when": "@employmentType = \"employed\"",
+  "validation": {
+    "rule": "LEN(@companyName) >= 2",
+    "message": "公司名称至少2个字符"
+  }
+}
+
+// 前端渲染器调用表达式引擎
+const shouldShow = libexpr.evalInContext(
+  schema.when,
+  formState  // { employmentType: "employed", ... }
+);
+if (shouldShow) {
+  renderComponent(schema);
+}</code></pre>
+
+            <h3>真值表生成：让业务人员自己验证规则</h3>
+
+            <p>做 Schema 驱动表单时发现一个问题：业务人员（产品经理、运营）配置条件规则时，经常不确定自己写的逻辑对不对。比如一个审批流规则 <code>isManager and (amount > 1000 or isUrgent)</code>，他们很难在脑子里穷举所有情况。</p>
+
+            <p>但他们会用 Excel。很多业务人员验证逻辑的方式就是在 Excel 里手动列一个真值表——把所有变量组合列出来，逐行检查结果是否符合预期。</p>
+
+            <p>既然有了表达式求值器，这件事可以自动化。给一个布尔表达式，自动生成完整的真值表：</p>
+
+<pre><code>libexpr.analyze('a and (b or c)');
+
+// 输出：
+// -------------------
+// | a | b | c | result |
+// -------------------
+// | T | T | T | T      |
+// | T | T | F | T      |
+// | T | F | T | T      |
+// | T | F | F | F      |
+// | F | T | T | F      |
+// | F | T | F | F      |
+// | F | F | T | F      |
+// | F | F | F | F      |
+// -------------------</code></pre>
+
+            <p>实现方式：从表达式 AST 里递归收集所有变量名，生成 2^n 个布尔组合，逐个求值。</p>
+
+<pre><code>let rec collect_vars = function
+  | Var name -> [name]
+  | And (e1, e2) | Or (e1, e2) -> collect_vars e1 @ collect_vars e2
+  | _ -> []
+
+let rec gen_combinations = function
+  | [] -> [[]]
+  | v :: vs ->
+      let rest = gen_combinations vs in
+      List.map (fun l -> (v, true) :: l) rest
+      @ List.map (fun l -> (v, false) :: l) rest
+
+let analyze_expr expr =
+  let vars = List.sort_uniq String.compare (collect_vars expr) in
+  let combinations = gen_combinations vars in
+  List.map (fun env ->
+    let env_map = (* 把 [(name, bool)] 转成求值环境 *) in
+    let result = eval_expr env_map expr in
+    (env, result)
+  ) combinations</code></pre>
+
+            <p>在产品里，这个功能被集成到表单规则的配置界面：业务人员写完条件表达式后，点一下"验证"就能看到真值表，直观地确认每种情况下的行为是否符合预期。不需要发布上线再测试，也不需要找开发帮忙检查逻辑。</p>
+
+            <h3>为什么用 OCaml</h3>
+
+            <p>用 OCaml 写表达式引擎，不是因为它多酷，而是因为它的几个特性让这类工作异常顺手：</p>
+
+            <ul>
+                <li><strong>代数数据类型 + Pattern Matching</strong>：AST 定义和递归求值用 ADT 写出来极其自然。写 <code>match expr with Add(e1, e2) -> ...</code> 比写一堆 if-else 或 visitor pattern 清爽太多</li>
+                <li><strong>ocamllex + menhir</strong>：工业级的 Lexer/Parser 生成器，直接从语法定义生成高效的解析代码。不需要手写递归下降</li>
+                <li><strong>js_of_ocaml</strong>：编译到 JavaScript 的成熟方案。生成的 JS 文件可以直接当 npm 包发布，对调用方完全透明</li>
+                <li><strong>类型安全</strong>：OCaml 的类型系统保证了求值器的穷尽性——如果你在 AST 里加了一个新节点但忘了处理，编译器会报错</li>
+            </ul>
+
+            <h3>总结</h3>
+
+            <p>这个表达式语言的设计目标是：<strong>在配置驱动的 UI 系统里，提供一个安全、可控、表达力足够的计算引擎</strong>。</p>
+
+            <p>它的能力边界很清晰：</p>
+            <ul>
+                <li><strong>能做的</strong>：算术、比较、逻辑运算、条件分支、模式匹配、数组/记录操作、高阶函数、类型检查</li>
+                <li><strong>不能做的</strong>：循环、副作用、IO、访问 DOM、发网络请求</li>
+            </ul>
+
+            <p>这个"不能做"恰恰是它的价值——在一个运营人员可以配置表单规则的系统里，你希望表达式引擎只能做计算，不能做任何危险的事情。</p>
+
+            <p>完整的实现大约 1000 行 OCaml 代码（lexer + parser + AST + evaluator + type system + builtins）。如果你也需要在产品中嵌入表达式引擎，OCaml + js_of_ocaml 是一个值得考虑的方案。</p>
+
+            <p><em>这篇文章是 Schema 驱动系列的延伸。系列其他文章：<a href="form-builder.html">Schema 驱动表单（上）：数据模型与渲染器</a>、<a href="schema-driven-ui.html">Schema 驱动表单（下）：表达式引擎与通用 UI 渲染</a></em></p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

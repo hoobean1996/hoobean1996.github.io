@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL 存储引擎内幕（中）：索引扫描与 MVCC - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL 存储引擎内幕（中）：索引扫描与 MVCC</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/rembrandt-magnifying-glass.jpg" alt="Man with a Magnifying Glass, Rembrandt, early 1660s">
+                <figcaption>Rembrandt,《持放大镜的男人》, 约 1660s — 他举起放大镜，透过镜片审视眼前的事物。这就是 MVCC 的快照：同一份数据，不同的事务透过不同的"镜片"看到不同的版本。可见与不可见，取决于你何时拿起这面镜子</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL 存储引擎内幕</strong><br>
+                <a href="pg-heap-buffer.html">上：Heap Page 与 Buffer Pool</a> ·
+                <span class="current">中：索引扫描与 MVCC</span> ·
+                <a href="pg-wal-checkpoint.html">下：WAL、Checkpoint 与持久性</a>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：上一篇我们看到了 Heap Page 的内部布局和 Buffer Pool 如何管理页面缓存。但一个关键问题还没回答：当多个事务同时读写同一张表时，每个事务看到的数据是怎么决定的？这篇文章追踪两条路径——索引扫描如何从 B-Tree 叶节点跳到 Heap Page 取回数据，以及 MVCC 快照如何决定一行数据"对你可见还是不可见"。理解这些，你才能真正理解事务隔离级别不是一个抽象概念，而是一个具体的数据结构。
+            </blockquote>
+
+            <h3>索引扫描：从 B-Tree 到 Heap</h3>
+
+            <p>上一篇讲了顺序扫描——逐页遍历整个 Heap。索引扫描是另一条路径：先在索引中定位 TID，再用 TID 去 Heap 取数据。</p>
+
+            <h4>索引也是表</h4>
+
+            <p>在 PostgreSQL 中，索引和普通表一样是一个 Relation，有自己的文件、自己的 Page 结构。区别在于索引 Page 里存的不是用户数据，而是<strong>索引键 + TID</strong>的映射。</p>
+
+<pre class="diagram"><code>  CREATE INDEX users_age_idx ON users(age);
+
+  索引扫描涉及两个 Relation：
+
+  indexRelation (users_age_idx)          heapRelation (users)
+  ┌─────────────────────────┐           ┌──────────────────────────┐
+  │  B-Tree Page            │           │  Heap Page               │
+  │                         │           │                          │
+  │  ┌───────────────────┐  │           │  ┌────────────────────┐  │
+  │  │ age=20 → TID(1,3) │  │     ┌────►  │ ItemId[3] → Tuple  │  │
+  │  │ age=25 → TID(5,1) │──┼─────┘    │  │  (id=42, name=     │  │
+  │  │ age=25 → TID(8,7) │  │          │  │   'Alice', age=25) │  │
+  │  │ age=30 → TID(2,5) │  │          │  └────────────────────┘  │
+  │  └───────────────────┘  │           │                          │
+  └─────────────────────────┘           └──────────────────────────┘
+
+  IndexScanDesc 同时持有两个 Relation 的引用</code></pre>
+
+            <p><code>IndexScanDesc</code> 是索引扫描的描述符，核心字段：</p>
+            <ul>
+                <li><code>heapRelation</code>：被索引的那张表</li>
+                <li><code>indexRelation</code>：索引本身</li>
+                <li><code>xs_heaptid</code>：当前找到的 TID，用于下一步回表</li>
+            </ul>
+
+            <h4>ExecIndexScan 的执行流程</h4>
+
+<pre class="diagram"><code>  ExecIndexScan
+      │
+      │ 有 Runtime Key？（如 WHERE id = $1）
+      │ 是 → 先计算参数值，再开始扫描
+      │
+      ├── 有 ORDER BY？
+      │   是 → IndexNextWithReorder（带排序的索引扫描）
+      │   否 → IndexNext（普通索引扫描）
+      │
+      ▼
+  IndexNext
+      │
+      ▼
+  index_getnext_slot ─────────────────────────────────────┐
+      │                                                    │
+      │  ┌─────────────────────────────────┐               │
+      │  │ 阶段 1: 从索引获取 TID          │               │
+      │  │                                  │               │
+      │  │ amgettuple(scan, direction)      │               │
+      │  │  → B-Tree: btgettuple()         │               │
+      │  │  → Hash:   hashgettuple()       │               │
+      │  │  → GIN:    gingettuple()        │               │
+      │  │  → GiST:   gistgettuple()      │               │
+      │  │                                  │               │
+      │  │ 结果: scan->xs_heaptid = TID    │               │
+      │  └─────────────────────────────────┘               │
+      │                                                    │
+      │  ┌─────────────────────────────────┐               │
+      │  │ 阶段 2: 用 TID 回表取 Tuple     │               │
+      │  │                                  │               │
+      │  │ index_fetch_heap()              │               │
+      │  │  → table_index_fetch_tuple()    │               │
+      │  │  → heapam_index_fetch_tuple()   │               │
+      │  │  → heap_hot_search_buffer()     │  ← HOT 链遍历 │
+      │  │                                  │               │
+      │  │ 包含 MVCC 可见性检查             │               │
+      │  └─────────────────────────────────┘               │
+      │                                                    │
+      │  如果 Tuple 不可见 → 回到阶段 1 取下一个 TID       │
+      └────────────────────────────────────────────────────┘</code></pre>
+
+            <p>Runtime Key 是一个重要的概念：查询规划时无法确定的值。比如 <code>WHERE id = $1</code> 的参数、<code>WHERE id = (SELECT max_id FROM others)</code> 的子查询结果。这些值在 executor 启动时才计算，然后传给索引扫描。</p>
+
+            <h4>B-Tree 内部：btgettuple</h4>
+
+            <p>B-Tree 是 PostgreSQL 最常用的索引类型。<code>btgettuple</code> 的逻辑很直接：</p>
+
+            <ul>
+                <li><strong>首次调用</strong>：<code>_bt_first()</code> 在 B-Tree 中定位起始位置——从根节点向下遍历到叶节点，找到第一个满足扫描条件的索引条目</li>
+                <li><strong>后续调用</strong>：<code>_bt_next()</code> 在叶节点链表上向前/向后移动，取下一个条目</li>
+                <li>找到位置后，<code>_bt_returnitem()</code> 从当前位置提取 TID：<code>scan->xs_heaptid = currItem->heapTid</code></li>
+            </ul>
+
+<pre class="diagram"><code>  B-Tree 结构（简化）：
+
+          ┌──────────────┐
+          │  Root Page   │
+          │  [20] [50]   │
+          └──┬──────┬────┘
+             │      │
+      ┌──────▼──┐  ┌▼──────────┐
+      │ Internal │  │ Internal   │
+      │ [10][20] │  │ [30][50]   │
+      └──┬───┬──┘  └──┬────┬───┘
+         │   │        │    │
+    ┌────▼┐ ┌▼────┐ ┌─▼──┐ ┌▼────┐
+    │Leaf │↔│Leaf │↔│Leaf│↔│Leaf │    ← 叶节点双向链表
+    │5,8  │ │12,18│ │25  │ │35,42│
+    │TIDs │ │TIDs │ │TIDs│ │TIDs │
+    └─────┘ └─────┘ └────┘ └─────┘
+
+  WHERE age = 25:
+  1. _bt_first: Root → Internal → 定位到第3个 Leaf
+  2. 在 Leaf 中找到 age=25 的条目，提取 TID
+  3. _bt_next: 继续在 Leaf 链表上扫描，直到 age ≠ 25</code></pre>
+
+            <h4>回表：从 TID 到 Tuple</h4>
+
+            <p>拿到 TID 后，<code>index_fetch_heap</code> 去 Heap 取数据。对于堆表，实际调用 <code>heapam_index_fetch_tuple</code>，核心是 <code>heap_hot_search_buffer</code>：</p>
+
+<pre><code>// 索引回表的完整路径（简化）
+
+// 1. 索引给出 TID = (5, 1)
+scan->xs_heaptid = {block: 5, offset: 1};
+
+// 2. 读取 Heap Page 5 到 Buffer Pool
+buffer = ReadBuffer(heapRelation, 5);
+
+// 3. 在 Page 5 上搜索 HOT 链
+heap_hot_search_buffer(
+    tid,        // 起始 TID (5, 1)
+    relation,   // users 表
+    buffer,     // Page 5 的 buffer
+    snapshot,   // 当前事务的快照  ← MVCC 在这里生效
+    &found
+);
+
+// 4. 沿 HOT 链遍历：
+//    ItemId[1] → Tuple A (t_ctid 指向 ItemId[2])
+//    ItemId[2] → Tuple B (t_ctid 指向 ItemId[3])
+//    ItemId[3] → Tuple C (t_ctid 指向自己 = 链尾)
+//
+//    对每个版本调用 HeapTupleSatisfiesVisibility(snapshot)
+//    返回对当前快照可见的那个版本</code></pre>
+
+            <p>注意这里出现了 <code>snapshot</code> 参数——这就是 MVCC 的入口。索引本身不存储版本信息，所有版本判断都发生在回表之后。这意味着索引扫描可能从索引拿到一个 TID，回表后发现该行对当前事务不可见，然后继续取下一个 TID。</p>
+
+            <h4>Lossy 索引与 Recheck</h4>
+
+            <p>某些索引（如 GIN、GiST）是"有损"的——索引告诉你"这个 Tuple 可能匹配"，但不保证一定匹配。回表后需要用原始条件重新检查：</p>
+
+<pre><code>// IndexNext 中的 recheck 逻辑
+while (index_getnext_slot(scandesc, direction, slot)) {
+    if (scandesc->xs_recheck) {
+        // 索引是 lossy 的，需要用原始条件重新验证
+        if (!ExecQualAndReset(node->indexqualorig, econtext))
+            continue;  // 不匹配，跳过
+    }
+    return slot;  // 匹配，返回
+}</code></pre>
+
+            <h3>MVCC：多版本并发控制</h3>
+
+            <p>现在进入这篇文章的核心。MVCC 的目标是<strong>读不阻塞写，写不阻塞读</strong>。PG 通过让每行数据同时存在多个版本来实现这一点——每个事务看到的是某个时间点的"快照"。</p>
+
+            <h4>事务 ID：逻辑时钟</h4>
+
+            <p>PG 用事务 ID（TransactionId，简称 XID）作为"逻辑时钟"。每个写事务启动时分配一个单调递增的 XID。可见性判断的核心就是比较 XID：</p>
+
+            <table>
+                <thead>
+                    <tr><th>行头字段</th><th>含义</th><th>可见性判断</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>t_xmin</code></td><td>创建该版本的事务</td><td>如果 xmin 的事务已提交且在快照之前 → 该版本"出生了"</td></tr>
+                    <tr><td><code>t_xmax</code></td><td>删除/更新该版本的事务</td><td>如果 xmax = 0 或 xmax 未提交 → 该版本"还活着"</td></tr>
+                </tbody>
+            </table>
+
+            <p>一个 Tuple 对你可见的条件：<strong>它已经出生（xmin 已提交）且还没死（xmax 无效或未提交）</strong>。</p>
+
+<pre class="diagram"><code>  事务时间线：
+
+  XID:  100      101      102      103      104
+         │        │        │        │        │
+         │  INSERT │        │ UPDATE │        │
+         │  xmin=101       │ 新版本  │        │
+         │        │        │ xmin=103│        │
+         │        │        │ 旧版本  │        │
+         │        │        │ xmax=103│        │
+
+  事务 104 的快照拍摄于此 ─────────────────►│
+
+  对事务 104 来说：
+  旧版本：xmin=101(已提交✓) xmax=103(已提交✓) → 已死 → 不可见
+  新版本：xmin=103(已提交✓) xmax=0(还活着✓)   → 可见 ✓</code></pre>
+
+            <h4>SnapshotData：快照的数据结构</h4>
+
+            <p>快照不是一个"时间点"，而是一个具体的数据结构：</p>
+
+<pre><code>typedef struct SnapshotData {
+    TransactionId xmin;    // 所有 XID < xmin 的事务都已提交（确定可见）
+    TransactionId xmax;    // 所有 XID >= xmax 的事务都未开始（确定不可见）
+    TransactionId *xip;    // xmin 和 xmax 之间正在运行的事务列表
+    uint32 xcnt;           // xip 数组的长度
+} SnapshotData;</code></pre>
+
+<pre class="diagram"><code>  快照的三个区间：
+
+  XID:  95  96  97  98  99  100  101  102  103  104  105
+        ────────────┬───────────────────────┬────────────
+                    │                       │
+               snapshot.xmin           snapshot.xmax
+
+  ◄── 确定可见 ──►│◄── 需要查 xip 数组 ──►│◄── 确定不可见 ──►
+
+  xip[] = {99, 101}  ← 拍快照时仍在运行的事务
+
+  判断逻辑：
+  XID 96: < xmin → 已提交 → 可见 ✓
+  XID 99: 在 xip 中 → 仍在运行 → 不可见 ✗
+  XID 100: 不在 xip 中 → 已提交 → 可见 ✓
+  XID 101: 在 xip 中 → 仍在运行 → 不可见 ✗
+  XID 104: >= xmax → 未开始 → 不可见 ✗</code></pre>
+
+            <p>这个设计很精妙：<code>xmin</code> 和 <code>xmax</code> 快速排除大部分事务，只有落在中间区间的才需要查 <code>xip</code> 数组。</p>
+
+            <h4>隔离级别：快照什么时候拍</h4>
+
+            <p>事务隔离级别的本质区别不在于"看到什么"，而在于<strong>什么时候拍快照</strong>：</p>
+
+            <table>
+                <thead>
+                    <tr><th>隔离级别</th><th>快照策略</th><th>效果</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Read Committed</strong></td><td>每条语句开始时拍新快照</td><td>同一事务内，两次 SELECT 可能看到不同数据</td></tr>
+                    <tr><td><strong>Repeatable Read</strong></td><td>事务开始时拍一次快照，整个事务复用</td><td>同一事务内，多次 SELECT 看到一致的数据</td></tr>
+                    <tr><td><strong>Serializable</strong></td><td>同 Repeatable Read + 额外的冲突检测</td><td>模拟串行执行，检测到冲突时回滚</td></tr>
+                </tbody>
+            </table>
+
+<pre><code>-- Read Committed：每条语句一个新快照
+BEGIN;
+SELECT count(*) FROM users;  -- 快照 S1 → 看到 100 行
+-- 此时另一个事务插入 1 行并提交
+SELECT count(*) FROM users;  -- 快照 S2（新的！）→ 看到 101 行
+COMMIT;
+
+-- Repeatable Read：整个事务复用一个快照
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM users;  -- 快照 S1 → 看到 100 行
+-- 此时另一个事务插入 1 行并提交
+SELECT count(*) FROM users;  -- 还是快照 S1 → 仍然看到 100 行
+COMMIT;</code></pre>
+
+            <p>在代码层面，<code>GetTransactionSnapshot()</code> 负责这个决策：</p>
+
+            <ul>
+                <li>Read Committed：每次调用都创建新快照</li>
+                <li>Repeatable Read / Serializable：首次调用创建快照并缓存，后续调用返回缓存的快照</li>
+            </ul>
+
+            <h4>什么时候需要快照</h4>
+
+            <p>不是所有 SQL 都需要快照：</p>
+
+            <table>
+                <thead>
+                    <tr><th>语句类型</th><th>需要快照？</th><th>原因</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>SELECT / INSERT / UPDATE / DELETE</td><td>是</td><td>需要访问表数据，必须判断可见性</td></tr>
+                    <tr><td>CREATE TABLE / DROP TABLE / ALTER</td><td>否</td><td>DDL 操作元数据，不涉及行级可见性</td></tr>
+                    <tr><td>EXPLAIN</td><td>可能</td><td>如果是 EXPLAIN ANALYZE 需要实际执行，则需要</td></tr>
+                </tbody>
+            </table>
+
+            <p>PG 通过 <code>analyze_requires_snapshot</code> 函数判断当前语句是否需要快照，避免为不需要的操作创建快照的开销。</p>
+
+            <h4>可见性判断的完整规则</h4>
+
+            <p>实际的可见性判断比"xmin 已提交且 xmax 无效"复杂得多。<code>HeapTupleSatisfiesMVCC</code> 需要处理这些情况：</p>
+
+            <table>
+                <thead>
+                    <tr><th>场景</th><th>xmin 状态</th><th>xmax 状态</th><th>结果</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>刚插入，事务未提交</td><td>进行中</td><td>—</td><td>仅插入者自己可见</td></tr>
+                    <tr><td>已插入并提交</td><td>已提交，在快照前</td><td>无效 (0)</td><td>可见</td></tr>
+                    <tr><td>已删除，删除事务未提交</td><td>已提交</td><td>进行中</td><td>可见（删除还没生效）</td></tr>
+                    <tr><td>已删除并提交</td><td>已提交</td><td>已提交，在快照前</td><td>不可见（已死）</td></tr>
+                    <tr><td>被更新，新版本存在</td><td>已提交</td><td>已提交</td><td>不可见（看新版本）</td></tr>
+                    <tr><td>插入事务已回滚</td><td>已回滚</td><td>—</td><td>不可见（从未存在）</td></tr>
+                </tbody>
+            </table>
+
+            <p>PG 还有一个优化：<code>t_infomask</code> 中的 hint bits。首次检查某行的 xmin/xmax 状态时需要查 CLOG（事务提交日志），确认后在 <code>t_infomask</code> 中设置"已提交"或"已回滚"标记，后续检查直接读标记，跳过 CLOG 查询。</p>
+
+            <h4>EPQ：并发更新的冲突处理</h4>
+
+            <p>当扫描发现一个 Tuple 正在被另一个事务修改时，会触发 <strong>EvalPlanQual（EPQ）</strong>机制：</p>
+
+            <ul>
+                <li>正常扫描中发现目标 Tuple 被并发修改</li>
+                <li>等待修改事务完成（提交或回滚）</li>
+                <li>获取修改后的新版本 Tuple</li>
+                <li>用当前查询的 WHERE 条件重新评估新版本</li>
+                <li>如果新版本仍满足条件 → 返回新版本；否则跳过</li>
+            </ul>
+
+            <p>这是 Read Committed 隔离级别下 UPDATE 和 DELETE 的必要机制——你不能跳过一个正在被修改的行，也不能基于旧版本做决策。</p>
+
+            <h3>扫描方式全景</h3>
+
+            <p>PG 提供多种扫描方式，每种都有不同的 accessMtd 函数指针：</p>
+
+            <table>
+                <thead>
+                    <tr><th>扫描方式</th><th>accessMtd</th><th>原理</th><th>适用场景</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Sequential Scan</strong></td><td>SeqNext</td><td>逐页遍历整个 Heap</td><td>全表扫描、无索引</td></tr>
+                    <tr><td><strong>Index Scan</strong></td><td>IndexNext</td><td>B-Tree 定位 → 回表取 Tuple</td><td>高选择性查询</td></tr>
+                    <tr><td><strong>Index Only Scan</strong></td><td>IndexOnlyNext</td><td>只读索引，不回表</td><td>查询列全在索引中</td></tr>
+                    <tr><td><strong>Bitmap Heap Scan</strong></td><td>BitmapHeapNext</td><td>先收集所有 TID 排序，再批量回表</td><td>中等选择性，减少随机 I/O</td></tr>
+                    <tr><td><strong>TID Scan</strong></td><td>TidNext</td><td>直接按 TID 定位</td><td>CURRENT OF 游标</td></tr>
+                </tbody>
+            </table>
+
+            <p>所有扫描方式最终都通过 <code>ExecScanExtended</code> 统一调度：</p>
+
+<pre><code>// 统一扫描框架
+ExecScanExtended(
+    ScanState *node,
+    ExecScanAccessMtd accessMtd,    // SeqNext / IndexNext / BitmapHeapNext / ...
+    ExecScanRecheckMtd recheckMtd,  // 对应的 recheck 函数
+    EPQState *epqstate,             // 并发控制
+    ExprState *qual,                // WHERE 条件
+    ProjectionInfo *projInfo        // SELECT 投影
+);</code></pre>
+
+            <p>这个设计让存储访问方法完全可插拔——<code>heapam_methods</code> 是默认的堆表实现，但 PG 的 Table Access Method API 允许你替换整个存储引擎：</p>
+
+<pre><code>// heapam_methods：堆表的函数表
+static const TableAmRoutine heapam_methods = {
+    .scan_begin          = heap_beginscan,
+    .scan_getnextslot    = heap_getnextslot,
+    .index_fetch_tuple   = heapam_index_fetch_tuple,
+    .tuple_insert        = heapam_tuple_insert,
+    .tuple_delete        = heapam_tuple_delete,
+    .tuple_update        = heapam_tuple_update,
+    // ... 50+ 个函数指针
+};</code></pre>
+
+            <p>这意味着理论上可以实现列式存储引擎、LSM-Tree 引擎等，插入 PG 的执行框架中。Heap 只是默认选择，不是唯一选择。</p>
+
+            <h3>索引类型全景</h3>
+
+            <p>PG 支持多种索引类型，每种都有自己的 <code>IndexAmRoutine</code>：</p>
+
+            <table>
+                <thead>
+                    <tr><th>索引类型</th><th>amgettuple</th><th>数据结构</th><th>适用场景</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>B-Tree</strong></td><td>btgettuple</td><td>平衡搜索树，叶节点链表</td><td>等值查询、范围查询、排序（最通用）</td></tr>
+                    <tr><td><strong>Hash</strong></td><td>hashgettuple</td><td>哈希桶</td><td>等值查询（比 B-Tree 快，但不支持范围）</td></tr>
+                    <tr><td><strong>GIN</strong></td><td>gingettuple</td><td>倒排索引</td><td>全文搜索、数组包含、JSONB</td></tr>
+                    <tr><td><strong>GiST</strong></td><td>gistgettuple</td><td>广义搜索树</td><td>几何数据、范围类型、全文搜索</td></tr>
+                    <tr><td><strong>BRIN</strong></td><td>—</td><td>块范围索引</td><td>时序数据等物理有序的大表</td></tr>
+                </tbody>
+            </table>
+
+            <p>它们共享同一个 <code>index_getnext_slot</code> 调用框架，通过 <code>rd_indam->amgettuple</code> 函数指针分派到具体实现。</p>
+
+            <h3>把它们串起来：一次索引查询的完整路径</h3>
+
+<pre class="diagram"><code>  SELECT name FROM users WHERE age = 25;
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ Executor                                                  │
+  │                                                           │
+  │  ExecIndexScan                                            │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  IndexNext                                                │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  index_getnext_slot                                       │
+  │      │                                                    │
+  │      ├─── btgettuple ──────────────────────────┐          │
+  │      │    B-Tree: Root → Internal → Leaf        │          │
+  │      │    找到 age=25, TID=(5,1)               │          │
+  │      │                                          │          │
+  │      ├─── index_fetch_heap ◄───────────────────┘          │
+  │      │    读取 Heap Page 5 到 Buffer Pool                 │
+  │      │                                                    │
+  │      ├─── heap_hot_search_buffer                          │
+  │      │    │                                               │
+  │      │    │  ItemId[1] → Tuple v1 (xmin=90, xmax=95)     │
+  │      │    │  HeapTupleSatisfiesMVCC(snapshot) → 不可见     │
+  │      │    │                                               │
+  │      │    │  沿 t_ctid → ItemId[2]                        │
+  │      │    │  Tuple v2 (xmin=95, xmax=0)                   │
+  │      │    │  HeapTupleSatisfiesMVCC(snapshot) → 可见 ✓     │
+  │      │    │                                               │
+  │      │    └─► 返回 Tuple v2                               │
+  │      │                                                    │
+  │      ├─── ExecQual(WHERE age=25) → 通过                   │
+  │      │    （B-Tree 是精确的，但 recheck 仍然存在）         │
+  │      │                                                    │
+  │      └─── ExecProject → 投影出 name 列 → 返回给客户端     │
+  │                                                           │
+  └──────────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>总结</h3>
+
+            <p>几个值得记住的关键直觉：</p>
+
+            <ul>
+                <li><strong>索引不存储版本信息</strong>：索引只存 key → TID 映射，所有 MVCC 判断都发生在回表之后。这意味着索引扫描可能取到一个 TID，回表发现不可见，再取下一个。Index Only Scan 是唯一的例外——它通过 Visibility Map 避免回表</li>
+                <li><strong>快照是一个数据结构，不是一个时间点</strong>：<code>SnapshotData</code> 的 xmin/xmax 快速排除大部分事务，xip 数组精确判断中间区间。隔离级别的区别仅在于何时拍快照</li>
+                <li><strong>可见性 = xmin 已提交 + xmax 无效</strong>：这是最核心的直觉。所有复杂情况（回滚、进行中、HOT 链）都是这个规则的变体</li>
+                <li><strong>hint bits 避免重复查 CLOG</strong>：首次可见性检查后在行头设置标记，后续检查直接读标记</li>
+                <li><strong>存储引擎是可插拔的</strong>：<code>TableAmRoutine</code> 定义了 50+ 个函数指针，heapam 只是默认实现。<code>IndexAmRoutine</code> 同理——B-Tree、Hash、GIN、GiST 共享同一个调用框架</li>
+            </ul>
+
+            <p>下一篇，我们进入 WAL 和 Checkpoint 的世界：一次写入如何变成一条 WAL 记录、WAL Writer 如何将内存中的日志刷到磁盘、Checkpoint 如何创建一致性恢复点、以及这一切如何支撑复制和故障恢复。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand-Rolling an SSR Server: Building Custom Server-Side Rendering for GraphQL Apps - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Hand-Rolling an SSR Server: Building Custom Server-Side Rendering for GraphQL Apps</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/hokusai-great-wave.jpg" alt="The Great Wave off Kanagawa by Katsushika Hokusai">
+                <figcaption>Katsushika Hokusai, "The Great Wave off Kanagawa", c. 1831 — Surging waves, like the rush of data in streaming rendering</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: Next.js is great, but if your tech stack is Relay + GraphQL, its SSR model conflicts with Relay's EntryPoint data preloading philosophy. This article documents the process of hand-rolling an SSR Server from scratch: route matching, data preloading, streaming rendering, Hydration, and how to make Relay's EntryPoint pattern work correctly on the server side. Suitable for teams that need deeply customized SSR solutions.
+            </blockquote>
+
+            <h3>Background</h3>
+
+            <p>Next.js is a great tool, but its integration with Relay (Meta's GraphQL client) has always been a bit rough. Relay has its own data preloading philosophy — the EntryPoint pattern. It wants to start fetching data at route matching time, not wait until components render to issue requests. This has a subtle conflict with Next.js's <code>getServerSideProps</code> / Server Components model.</p>
+
+            <p>So I decided to write my own SSR server, tailored specifically for the Relay + Fluent UI tech stack. This article documents the key steps and pitfalls encountered in this process.</p>
+
+            <h3>Overall Architecture</h3>
+
+<pre><code>Browser request GET /pages/admin/42?sort=name
+    ↓
+Express Server
+    ↓
+Route matching (ssrrouter.lookup)
+    ↓ Returns entrypoint name + parameter bindings
+EntryPoint resolution
+    ↓ Find EntryPoint config by name
+GraphQL data preloading (Relay loadQuery)
+    ↓
+React renderToPipeableStream (streaming SSR)
+    ↓
+HTML streaming response → Browser
+    ↓
+hydrateRoot (client takeover)</code></pre>
+
+            <h3>Step 1: Define the EntryPoint Interface</h3>
+
+            <p>EntryPoint is the core abstraction of the entire architecture. Each "page" is not a React component, but an EntryPoint object that describes: what component to render, what parameters are needed, and what data to preload.</p>
+
+<pre><code>// EntryPoint.tsx
+interface EntryPoint&lt;TParams&gt; {
+  root: ComponentType&lt;PreloadedProps&gt;;
+  getParams: (path: string) =&gt; TParams;
+  getPreloadedProps: (params: TParams) =&gt; PreloadedProps;
+}
+
+interface PreloadedProps {
+  queries: {
+    [key: string]: {
+      query: GraphQLTaggedNode;
+      variables: Variables;
+    };
+  };
+}</code></pre>
+
+            <p>A concrete EntryPoint looks like this:</p>
+
+<pre><code>// App.entrypoint.tsx
+const AppEntryPoint: EntryPoint&lt;Params&gt; = {
+  root: App,
+  getParams: (path: string): Params =&gt; {
+    return { limit: 10 };
+  },
+  getPreloadedProps: (params: Params): PreloadedProps =&gt; {
+    return {
+      queries: {
+        preloadedQuery: {
+          query: AppQuery,        // Relay GraphQL query
+          variables: {},
+        },
+      },
+    };
+  },
+};</code></pre>
+
+            <p>This design comes from the Relay team's EntryPoint pattern. The key idea is: <strong>data dependencies are declared at the routing layer, not the component layer</strong>. The moment a route matches, you know what data needs to be fetched, without waiting for the React render tree to be built.</p>
+
+            <h3>Step 2: Route Matching</h3>
+
+            <p>Route configuration maps URL patterns to EntryPoints:</p>
+
+<pre><code>// routes.ts
+export const ssrRouterConfig = [
+  "route /      AppEntrypoint",
+  "route /admin AdminEntrypoint",
+  "route /admin/:id(int) AppEntrypoint",
+];
+
+export const ssrEntrypointConfig = new Map&lt;string, EntryPoint&lt;any&gt;&gt;([
+  ["AppEntrypoint", AppEntryPoint],
+  ["AdminEntrypoint", AdminEntryPoint],
+]);</code></pre>
+
+            <p>When a request comes in, route matching happens first, then the corresponding EntryPoint is looked up:</p>
+
+<pre><code>const path = req.path.substring(6);  // Strip /pages prefix
+const entrypointRoute = ssrrouter.lookup(path);
+const entrypoint =
+  ssrEntrypointConfig.get(entrypointRoute?.entrypoint ?? "") ??
+  FallbackEntryPoint;</code></pre>
+
+            <h3>Step 3: GraphQL Data Preloading</h3>
+
+            <p>This is the most critical step of SSR. After obtaining the EntryPoint, call <code>getPreloadedProps</code> to get all required GraphQL queries, then use Relay's <code>loadQuery</code> to issue server-side requests:</p>
+
+<pre><code>const { root: Root, getPreloadedProps, getParams } = entrypoint;
+const params = getParams(path);
+const { queries } = getPreloadedProps(params);
+
+const preloadedData = Object.keys(queries).reduce((acc, key) =&gt; {
+  acc[key] = loadQuery(
+    RelayEnvironment,    // Server-side Relay Environment
+    queries[key].query,
+    queries[key].variables
+  );
+  return acc;
+}, {});</code></pre>
+
+            <p><code>loadQuery</code> immediately starts fetching and returns a reference. When React renders to a component that needs this data, if the data has arrived it's used directly, if not it suspends (with Suspense).</p>
+
+            <h3>Step 4: Streaming SSR Rendering</h3>
+
+            <p>React 18 introduced <code>renderToPipeableStream</code>, supporting streaming HTML output. Compared to the old <code>renderToString</code>, it has two core advantages:</p>
+
+            <ul>
+                <li><strong>Shorter Time to First Byte</strong>: Start sending as soon as the shell is ready, without waiting for all data</li>
+                <li><strong>Suspense support</strong>: Parts where data isn't ready send a fallback first, with data streamed in later</li>
+            </ul>
+
+<pre><code>const { pipe, abort } = renderToPipeableStream(
+  &lt;RelayEnvironmentProvider environment={RelayEnvironment}&gt;
+    &lt;Suspense fallback={&lt;div&gt;...&lt;/div&gt;}&gt;
+      &lt;RendererProvider renderer={renderer}&gt;
+        &lt;SSRProvider&gt;
+          &lt;FluentProvider theme={webLightTheme}&gt;
+            &lt;Root queries={preloadedData} /&gt;
+          &lt;/FluentProvider&gt;
+        &lt;/SSRProvider&gt;
+      &lt;/RendererProvider&gt;
+    &lt;/Suspense&gt;
+  &lt;/RelayEnvironmentProvider&gt;,
+  {
+    bootstrapScripts: ["/entrypoint.client.js"],
+    onShellReady() {
+      res.setHeader("content-type", "text/html");
+      res.write(`&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;...styles...&lt;/head&gt;
+&lt;body&gt;
+  &lt;div id="root"&gt;`);
+      pipe(res);        // Pipe React render stream to HTTP response
+      res.write(`&lt;/div&gt;
+&lt;/body&gt;
+&lt;/html&gt;`);
+    },
+    onShellError(error) {
+      res.statusCode = 500;
+      res.send("Something went wrong");
+    },
+  }
+);</code></pre>
+
+            <p>Note the <code>onShellReady</code> callback — it fires when React finishes rendering the synchronous part (shell). At this point, write the HTML header first, then <code>pipe(res)</code> connects the render stream to the HTTP response stream. Async data inside Suspense boundaries is injected later as <code>&lt;script&gt;</code> tags in a streaming fashion.</p>
+
+            <h3>Step 5: Fluent UI SSR Style Handling</h3>
+
+            <p>Fluent UI (Microsoft's React component library) uses CSS-in-JS, which requires special handling during SSR to avoid page flashing (FOUC):</p>
+
+<pre><code>const renderer = createDOMRenderer();
+const style = renderToStaticMarkup(
+  &lt;&gt;{renderToStyleElements(renderer)}&lt;/&gt;
+);</code></pre>
+
+            <p>First create a DOM renderer, collect all used styles during rendering, then inline the styles into HTML's <code>&lt;head&gt;</code>. During client-side hydration, these styles are reused to avoid duplicate injection.</p>
+
+            <h3>Step 6: Client-Side Hydration</h3>
+
+            <p>The client needs to do the exact same route matching and data preloading as the server, but with one key difference — <code>fetchPolicy: "store-only"</code>:</p>
+
+<pre><code>// Entrypoint.client.tsx
+ssrrouter.createRouter(ssrRouterConfig);  // Same routes
+
+const path = window.location.pathname.substring(6);
+const entrypointRoute = ssrrouter.lookup(path);
+const entrypoint = ssrEntrypointConfig.get(entrypointRoute?.entrypoint ?? "");
+const { root: Root, getPreloadedProps, getParams } = entrypoint;
+const params = getParams(path);
+const { queries } = getPreloadedProps(params);
+
+const preloadedData = Object.keys(queries).reduce((acc, key) =&gt; {
+  acc[key] = loadQuery(
+    RelayEnvironment,
+    queries[key].query,
+    queries[key].variables,
+    { fetchPolicy: "store-only" }  // Only read from store, don't re-fetch
+  );
+  return acc;
+}, {});
+
+hydrateRoot(
+  document.getElementById("root"),
+  &lt;RelayEnvironmentProvider environment={RelayEnvironment}&gt;
+    &lt;Root queries={preloadedData} /&gt;
+  &lt;/RelayEnvironmentProvider&gt;
+);</code></pre>
+
+            <p><code>store-only</code> means the client won't re-issue GraphQL requests, instead using data the server already fetched and transmitted through HTML. This avoids duplicate requests during hydration.</p>
+
+            <h3>Major Challenges</h3>
+
+            <h3>1. Relay Environment Server/Client Differences</h3>
+
+            <p>Relay's Environment encapsulates the network layer. The server can call the GraphQL server directly (or even call functions directly), while the client needs to go through HTTP. The two sides have completely different Environment configurations, but use the same queries. How to seamlessly transfer server-fetched data to the client was the biggest challenge.</p>
+
+            <p>Solution: After the server fetches data, Relay's store is serialized into the HTML (React 18's streaming injection mechanism handles this). The client uses <code>store-only</code> during hydration to read it.</p>
+
+            <h3>2. Streaming Rendering and Suspense Timing Issues</h3>
+
+            <p><code>renderToPipeableStream</code> is asynchronous. When <code>onShellReady</code> fires, only the synchronous portion has been rendered. If all data is behind Suspense boundaries, the shell might be nearly empty. Careful design is needed for what goes outside Suspense (rendered immediately) and what goes inside (can be delayed).</p>
+
+            <h3>3. CSS-in-JS and Streaming Rendering Conflicts</h3>
+
+            <p>Fluent UI's styles are dynamically generated during rendering. But streaming rendering means <code>&lt;head&gt;</code> needs to be sent before rendering starts. The solution is to do a "pre-render" first to collect styles, then do the actual streaming render. This means the component tree is actually rendered twice — once for styles, once for HTML.</p>
+
+            <h3>4. Isomorphic Routing Logic</h3>
+
+            <p>Server and client must use exactly the same route matching logic, otherwise hydration will fail (client render result doesn't match the server's). This is why the router is compiled to JS — ensuring the same code runs on both sides.</p>
+
+            <h3>5. Request Abort Handling</h3>
+
+            <p>Users might leave before the page finishes loading. During streaming rendering, you must listen for request close events and promptly abort rendering:</p>
+
+<pre><code>req.on("close", () =&gt; {
+  abort();
+});</code></pre>
+
+            <p>Without handling this, the server would continue rendering a page nobody wants, wasting resources.</p>
+
+            <h3>Looking Back</h3>
+
+            <p>This project gave me deep understanding of every SSR step, but honestly, <strong>I don't recommend doing this in production</strong>. Reasons:</p>
+
+            <ul>
+                <li><strong>Extremely high maintenance cost</strong>: React SSR's internal behavior can change even in minor version updates. You need to continuously keep up. The Next.js team works closely with the React team to ensure these details are correct — you can't keep up alone.</li>
+                <li><strong>Too many missing features</strong>: Code splitting, prefetching, ISR, static generation, middleware, error boundaries... a production-grade SSR framework needs far more than just "rendering components to HTML."</li>
+                <li><strong>Relay's SSR support is itself incomplete</strong>: The Relay team has their own SSR infrastructure internally at Meta. The open-source version has very little SSR documentation and examples. You'll spend a lot of time searching for answers in source code.</li>
+            </ul>
+
+            <p>But as a learning project, the value is significant:</p>
+
+            <ul>
+                <li>You'll truly understand what <code>renderToPipeableStream</code> does, not just "it's faster than renderToString"</li>
+                <li>You'll understand why hydration mismatches happen, because you hand-wrote the rendering logic for both sides</li>
+                <li>You'll understand why the EntryPoint pattern is more suitable for large applications than <code>getServerSideProps</code> — data dependencies are hoisted to the routing layer, decoupling data fetching from component rendering</li>
+                <li>You'll understand the real pain points of CSS-in-JS in SSR scenarios</li>
+            </ul>
+
+            <h3>If You Want to Try This Too</h3>
+
+            <p>Suggested steps:</p>
+
+            <ol>
+                <li>Start with <code>renderToString</code> + Express to build the simplest SSR (no GraphQL, pure static components)</li>
+                <li>Switch to <code>renderToPipeableStream</code>, understand streaming rendering and <code>onShellReady</code></li>
+                <li>Add Suspense, letting some data load asynchronously</li>
+                <li>Integrate a GraphQL client (Apollo is easier to start with than Relay), handle server-side data preloading</li>
+                <li>Implement client-side hydration, ensuring both sides render identical results</li>
+                <li>Handle CSS (start with vanilla CSS, then try CSS-in-JS)</li>
+            </ol>
+
+            <p>Each step deepens your understanding of SSR. Don't try to do everything at once — that will only leave you lost in hydration mismatch error messages.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

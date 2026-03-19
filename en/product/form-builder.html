@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema-Driven Forms (Part 1): Data Model and Renderer - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Schema-Driven Forms (Part 1): Data Model and Renderer</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/roman-mosaic-floor.jpg" alt="Roman Mosaic Floor Panel, 2nd century CE">
+                <figcaption>Roman Mosaic Floor, 2nd century CE — Each small stone is arranged according to strict rules, assembling a complete pattern. Schema-driven forms work the same way: using structured rules to compose flexible interfaces</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: B2B product form requirements are never-ending — registration, approval, surveys, configuration, each scenario is different. Rather than writing a component for every form, design a JSON Schema to describe the form structure and let the frontend render automatically. This article shares a production-tested data model: the FormSpec → Question → QuestionResponse three-layer structure, supporting 15+ field types, pagination, validation, and enabling non-developers to create forms by editing JSON.
+            </blockquote>
+
+            <h3>The Starting Point</h3>
+
+            <p>Almost every B2B product encounters the same problem: <strong>there are too many forms</strong>.</p>
+
+            <p>Registration forms, approval forms, surveys, configuration pages, data entry... every business scenario needs a set of forms, and each set has different fields, validation rules, and layouts. If every form requires a handwritten React component, the codebase would explode, and changing a single field would require a new release.</p>
+
+            <p>Even worse, many form creators aren't developers — they're product managers, operations staff, or HR. They need a "drag and drop to build forms" tool, not a spot on the sprint queue.</p>
+
+            <p>This is where Schema-driven forms come in: <strong>describe the form structure with a JSON document, and the frontend automatically renders the complete form from that JSON</strong>. Change a field? Change the JSON. Add validation? Change the JSON. Change the layout? Still change the JSON. No code changes, no releases needed.</p>
+
+            <h3>Core Idea</h3>
+
+            <p>The core of Schema-driven forms is a simple separation:</p>
+
+<pre><code>Form definition (What)  →  JSON Schema  →  Stored in database
+Form rendering (How)    →  Generic renderer  →  One set of code for all forms
+Form data (Data)        →  JSON response  →  Structured storage and querying</code></pre>
+
+            <p>The relationship between these three:</p>
+
+<pre><code>┌─────────────────────────────────────────────────────┐
+│                    Form Builder                      │
+│  Product managers/ops create forms via visual UI      │
+│  Output: FormSpec (JSON Schema)                      │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                    Form Schema                       │
+│  {                                                   │
+│    "title": "Employee Onboarding",                   │
+│    "groups": [                                       │
+│      { "label": "Basic Information",                 │
+│        "questions": [                                │
+│          { "type": "short_text", "label": "Name",    │
+│            "required": true },                       │
+│          { "type": "date", "label": "Start Date" },  │
+│          { "type": "drop_down", "label": "Dept",     │
+│            "options": ["Engineering", "Product",     │
+│                        "Design"] }                   │
+│        ] }                                           │
+│    ]                                                 │
+│  }                                                   │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                  Form Renderer                       │
+│  Automatically renders form UI from Schema           │
+│  Collects user input → FormResponse                  │
+└─────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>Data Model Design</h3>
+
+            <p>A complete Schema-driven form system needs a three-layer data model:</p>
+
+            <p><strong>Layer 1: FormSpec (Form Definition)</strong></p>
+
+<pre><code>// FormSpec — metadata for a form
+type FormSpec struct {
+    ID          int
+    Name        string       // "Employee Onboarding"
+    Description string       // Form description
+    Cover       string       // Cover image URL
+    Enabled     bool         // Whether enabled
+    CreatedBy   int          // Creator
+    Groups      []QuestionGroup  // Question groups
+}
+
+// QuestionGroup — question grouping (for form pagination or sectioning)
+type QuestionGroup struct {
+    ID        int
+    Label     string       // "Basic Information" / "Work Experience"
+    Order     int          // Sort order
+    Questions []Question
+}</code></pre>
+
+            <p><strong>Layer 2: Question (Question Definition)</strong></p>
+
+<pre><code>type QuestionType string
+
+const (
+    ShortText   QuestionType = "short_text"
+    Paragraph   QuestionType = "paragraph"
+    MultiChoice QuestionType = "multi_choice"
+    Checkboxes  QuestionType = "checkboxes"
+    DropDown    QuestionType = "drop_down"
+    FileUpload  QuestionType = "file"
+    LinearScale QuestionType = "linear_scale"
+    Date        QuestionType = "date"
+    Time        QuestionType = "time"
+)
+
+type Question struct {
+    ID       int
+    Label    string         // "Your name"
+    Type     QuestionType   // "short_text"
+    Required bool           // Whether required
+    Options  []string       // Options for choice questions
+    Config   QuestionConfig // Additional configuration
+}
+
+type QuestionConfig struct {
+    Placeholder  string  // Input hint
+    MinLength    *int    // Minimum length
+    MaxLength    *int    // Maximum length
+    MinValue     *int    // linear_scale minimum
+    MaxValue     *int    // linear_scale maximum
+    FileTypes    []string // Allowed file types
+}</code></pre>
+
+            <p><strong>Layer 3: QuestionResponse (User Response)</strong></p>
+
+<pre><code>type QuestionResponse struct {
+    ID             int
+    QuestionID     int      // Links to Question
+    FormInstanceID int      // Links to a specific submission
+    Label          string   // Redundant storage of question label (for querying)
+    Value          string   // User's answer (uniformly stored as string)
+}
+
+type FormInstance struct {
+    ID         int
+    FormSpecID int          // Links to FormSpec
+    SubmittedBy int         // Submitter
+    SubmittedAt time.Time
+    Responses  []QuestionResponse
+}</code></pre>
+
+            <p>There's a key design decision here: <strong>QuestionResponse.Value is uniformly stored as string</strong>. Whether it's a date, number, or multi-select, everything is serialized to a string. The advantage is a simple schema without needing different columns for each type. The downside is that queries require deserialization, but for form scenarios, most queries are "export all responses for a submission" rather than "find all responses where age > 25," so this trade-off is worthwhile.</p>
+
+            <h3>Frontend Renderer</h3>
+
+            <p>The renderer's core is a switch statement — rendering different UI components based on the Question's type field:</p>
+
+<pre><code>// Question.tsx
+function Question({ question, value, onChange }) {
+  switch (question.type) {
+    case "short_text":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}{question.required && " *"}&lt;/label&gt;
+          &lt;input
+            type="text"
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            placeholder={question.config?.placeholder}
+            required={question.required}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    case "paragraph":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;textarea
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            rows={4}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    case "multi_choice":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          {question.options.map(opt => (
+            &lt;label key={opt} className="radio-option"&gt;
+              &lt;input
+                type="radio"
+                name={`q-${question.id}`}
+                value={opt}
+                checked={value === opt}
+                onChange={() => onChange(opt)}
+              /&gt;
+              {opt}
+            &lt;/label&gt;
+          ))}
+        &lt;/div&gt;
+      );
+
+    case "checkboxes":
+      const selected = value ? JSON.parse(value) : [];
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          {question.options.map(opt => (
+            &lt;label key={opt} className="checkbox-option"&gt;
+              &lt;input
+                type="checkbox"
+                checked={selected.includes(opt)}
+                onChange={() => {
+                  const next = selected.includes(opt)
+                    ? selected.filter(s => s !== opt)
+                    : [...selected, opt];
+                  onChange(JSON.stringify(next));
+                }}
+              /&gt;
+              {opt}
+            &lt;/label&gt;
+          ))}
+        &lt;/div&gt;
+      );
+
+    case "drop_down":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;select value={value} onChange={e => onChange(e.target.value)}&gt;
+            &lt;option value=""&gt;Please select&lt;/option&gt;
+            {question.options.map(opt => (
+              &lt;option key={opt} value={opt}&gt;{opt}&lt;/option&gt;
+            ))}
+          &lt;/select&gt;
+        &lt;/div&gt;
+      );
+
+    case "date":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;input type="date" value={value} onChange={e => onChange(e.target.value)} /&gt;
+        &lt;/div&gt;
+      );
+
+    case "file":
+      return (
+        &lt;div className="form-field"&gt;
+          &lt;label&gt;{question.label}&lt;/label&gt;
+          &lt;input
+            type="file"
+            accept={question.config?.fileTypes?.join(",")}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (file) uploadAndGetUrl(file).then(onChange);
+            }}
+          /&gt;
+        &lt;/div&gt;
+      );
+
+    default:
+      return &lt;div&gt;Unsupported question type: {question.type}&lt;/div&gt;;
+  }
+}</code></pre>
+
+            <p>This switch statement looks "simple," but that's precisely its advantage: <strong>each type's rendering logic is completely independent, with no interference</strong>. Adding a new type? Add a case. Changing a type's UI? Only modify that case. There's no "modifying radio buttons affects checkboxes" problem.</p>
+
+            <h3>Complete Form Rendering</h3>
+
+            <p>Composing Question components to render the entire form:</p>
+
+<pre><code>function FormRenderer({ formSpec }) {
+  const [responses, setResponses] = useState({});
+
+  const handleChange = (questionId, value) => {
+    setResponses(prev => ({ ...prev, [questionId]: value }));
+  };
+
+  const handleSubmit = async () => {
+    // Validate required fields
+    for (const group of formSpec.groups) {
+      for (const q of group.questions) {
+        if (q.required && !responses[q.id]) {
+          alert(`Please fill in: ${q.label}`);
+          return;
+        }
+      }
+    }
+
+    // Construct submission data
+    const payload = Object.entries(responses).map(([qId, value]) => ({
+      questionId: parseInt(qId),
+      value: String(value),
+    }));
+
+    await submitFormResponse(formSpec.id, payload);
+  };
+
+  return (
+    &lt;form onSubmit={e => { e.preventDefault(); handleSubmit(); }}&gt;
+      &lt;h2&gt;{formSpec.name}&lt;/h2&gt;
+      &lt;p&gt;{formSpec.description}&lt;/p&gt;
+
+      {formSpec.groups.map(group => (
+        &lt;fieldset key={group.id}&gt;
+          &lt;legend&gt;{group.label}&lt;/legend&gt;
+          {group.questions.map(q => (
+            &lt;Question
+              key={q.id}
+              question={q}
+              value={responses[q.id] || ""}
+              onChange={v => handleChange(q.id, v)}
+            /&gt;
+          ))}
+        &lt;/fieldset&gt;
+      ))}
+
+      &lt;button type="submit"&gt;Submit&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+            <h3>Backend API Design</h3>
+
+            <p>Using GraphQL for API design is particularly natural because the form's data structure is inherently nested:</p>
+
+<pre><code>type FormSpec {
+  id: ID!
+  name: String!
+  description: String
+  enabled: Boolean!
+  groups: [QuestionGroup!]!
+}
+
+type QuestionGroup {
+  id: ID!
+  label: String!
+  order: Int!
+  questions: [Question!]!
+}
+
+type Question {
+  id: ID!
+  label: String!
+  type: QuestionType!
+  required: Boolean!
+  options: [String!]
+  config: QuestionConfig
+}
+
+enum QuestionType {
+  SHORT_TEXT
+  PARAGRAPH
+  MULTI_CHOICE
+  CHECKBOXES
+  DROP_DOWN
+  FILE
+  LINEAR_SCALE
+  DATE
+  TIME
+}
+
+# Query
+type Query {
+  formSpec(id: ID!): FormSpec
+  formInstances(formSpecId: ID!): [FormInstance!]!
+}
+
+# Submission
+input QuestionResponseInput {
+  questionId: ID!
+  value: String!
+}
+
+type Mutation {
+  submitForm(formSpecId: ID!, responses: [QuestionResponseInput!]!): FormInstance!
+}</code></pre>
+
+            <p>GraphQL's nested queries let the frontend fetch a complete form definition (FormSpec → Groups → Questions) in a single request, without multiple round trips. Combined with Relay or Apollo's fragment mechanism, Question components can declare what data they need, and the framework automatically merges queries.</p>
+
+            <h3>Simplifying the Backend with ORM Code Generation</h3>
+
+            <p>If you use Go + Ent ORM, you can directly generate CRUD code and GraphQL resolvers from schema definitions:</p>
+
+<pre><code>// ent/schema/formspec.go
+func (FormSpec) Fields() []ent.Field {
+    return []ent.Field{
+        field.String("name").NotEmpty(),
+        field.String("description").Optional(),
+        field.String("cover").Optional(),
+        field.Bool("enabled").Default(true),
+        field.Time("created_at").Default(time.Now),
+        field.Int("created_by"),
+    }
+}
+
+func (FormSpec) Edges() []ent.Edge {
+    return []ent.Edge{
+        edge.To("question_groups", QuestionGroup.Type),
+    }
+}
+
+// ent/schema/question.go
+func (Question) Fields() []ent.Field {
+    return []ent.Field{
+        field.String("label").NotEmpty(),
+        field.Enum("type").Values(
+            "short_text", "paragraph", "multi_choice",
+            "checkboxes", "drop_down", "file",
+            "linear_scale", "date", "time",
+        ),
+        field.Bool("required").Default(false),
+        field.JSON("options", []string{}).Optional(),
+    }
+}</code></pre>
+
+            <p>Ent automatically generates from these schema definitions: database migrations, Go type definitions, CRUD methods, and GraphQL types and resolvers (with entgql). From schema to usable API, almost no glue code is needed.</p>
+
+            <h3>Validation Strategy</h3>
+
+            <p>Form validation is split into two layers:</p>
+
+            <p><strong>Frontend validation (instant feedback):</strong></p>
+
+<pre><code>function validate(question, value) {
+  if (question.required && !value) {
+    return `${question.label} is required`;
+  }
+
+  const config = question.config;
+  if (!config) return null;
+
+  switch (question.type) {
+    case "short_text":
+    case "paragraph":
+      if (config.minLength && value.length < config.minLength)
+        return `Minimum ${config.minLength} characters required`;
+      if (config.maxLength && value.length > config.maxLength)
+        return `Maximum ${config.maxLength} characters allowed`;
+      break;
+
+    case "file":
+      if (config.fileTypes && !config.fileTypes.some(t => value.endsWith(t)))
+        return `Only ${config.fileTypes.join(", ")} formats are supported`;
+      break;
+  }
+  return null;
+}</code></pre>
+
+            <p><strong>Backend validation (security guarantee):</strong></p>
+
+<pre><code>func ValidateResponse(spec *ent.FormSpec, responses []ResponseInput) error {
+    questionMap := buildQuestionMap(spec)
+
+    for _, resp := range responses {
+        q, ok := questionMap[resp.QuestionID]
+        if !ok {
+            return fmt.Errorf("unknown question ID: %d", resp.QuestionID)
+        }
+        if q.Required && resp.Value == "" {
+            return fmt.Errorf("question %q is required", q.Label)
+        }
+        if err := validateType(q.Type, resp.Value); err != nil {
+            return fmt.Errorf("question %q: %w", q.Label, err)
+        }
+    }
+
+    // Check that all required questions have responses
+    for id, q := range questionMap {
+        if q.Required && !hasResponse(responses, id) {
+            return fmt.Errorf("missing required question: %q", q.Label)
+        }
+    }
+    return nil
+}</code></pre>
+
+            <p>Frontend validation is for user experience (see errors without waiting for a server round trip), backend validation is for data integrity (frontend validation can be bypassed). Neither layer can be omitted.</p>
+
+            <h3>Issues You'll Encounter in Practice</h3>
+
+            <ul>
+                <li><strong>Schema versioning</strong>: After publishing a form, if the Schema is modified (e.g., deleting a question), what happens to already-submitted Responses? The common approach is to create a new version rather than modifying the original, or soft-delete questions while preserving historical responses.</li>
+                <li><strong>Conditional logic</strong>: Real-world forms often have logic like "if A is selected, show question X." This requires adding a <code>visibility_rules</code> field to the Schema, with the renderer dynamically showing/hiding questions based on current responses. This is the main source of complexity.</li>
+                <li><strong>Performance</strong>: When rendering large forms (100+ questions), re-rendering each Question component becomes a bottleneck. Solution: <code>React.memo</code> + wrapping onChange callbacks with <code>useCallback</code>, ensuring only Questions with changed values re-render.</li>
+                <li><strong>File upload</strong>: File-type questions need special handling — first upload to OSS to get a URL, then store the URL as the value. This means file upload and form submission are two independent processes.</li>
+                <li><strong>Export and analysis</strong>: Form data ultimately needs to be exported to Excel or analyzed statistically. Since Value is a string type, formatting during export is needed based on Question Type (converting dates to Date format, multi-select to comma-separated, etc.).</li>
+            </ul>
+
+            <h3>Comparison with Existing Solutions</h3>
+
+            <table>
+                <tr>
+                    <th>Solution</th>
+                    <th>Schema Storage</th>
+                    <th>Rendering</th>
+                    <th>Suitable For</th>
+                </tr>
+                <tr>
+                    <td>Google Forms</td>
+                    <td>Proprietary format</td>
+                    <td>Google-hosted</td>
+                    <td>Simple surveys</td>
+                </tr>
+                <tr>
+                    <td>JSON Schema + react-jsonschema-form</td>
+                    <td>Standard JSON Schema</td>
+                    <td>Auto-generated</td>
+                    <td>Developer tools, config forms</td>
+                </tr>
+                <tr>
+                    <td>Formily / XRender</td>
+                    <td>Custom DSL</td>
+                    <td>Visual editor + renderer</td>
+                    <td>Enterprise complex forms</td>
+                </tr>
+                <tr>
+                    <td>Custom FormSpec model</td>
+                    <td>Database + ORM</td>
+                    <td>Custom renderer</td>
+                    <td>Products needing deep customization</td>
+                </tr>
+            </table>
+
+            <p><code>react-jsonschema-form</code> uses standard JSON Schema (Draft 7). Its advantage is a good ecosystem with ready-made validation libraries (ajv). But standard JSON Schema is designed to describe data structures, not form UI — it lacks concepts like "grouping," "placeholder," and "conditional display," which need to be supplemented via <code>uiSchema</code>.</p>
+
+            <p>The custom FormSpec model's advantage is complete control over the data structure, enabling deep customization for business needs (e.g., adding approval workflows, permission controls, template marketplaces). The cost is needing to write your own renderer and validation logic.</p>
+
+            <h3>Architectural Reflections</h3>
+
+            <ul>
+                <li><strong>Schema as contract</strong>: FormSpec is the sole contract between frontend and backend. The backend doesn't need to know how the frontend renders, and the frontend doesn't need to know how the backend stores. As long as the Schema format doesn't change, both sides can evolve independently.</li>
+                <li><strong>Code generation vs handwriting</strong>: With code generation tools like Ent + gqlgen, the path from Schema definition to API endpoint is almost fully automated. Handwriting CRUD code has zero value — let machines generate it and focus your energy on business logic.</li>
+                <li><strong>The aesthetics of the switch statement</strong>: The big switch in the renderer looks "primitive," but it's the right level of abstraction. Don't over-abstract into a "registry pattern" or "plugin system" — unless you truly need third-party developers to extend question types. Most of the time, 9 types are enough.</li>
+                <li><strong>About string storage for Value</strong>: This is a classic "flexibility vs. query capability" trade-off. If your scenario requires complex queries on responses ("find all users who selected option A"), consider PostgreSQL's JSONB type, or write to a wide table for analysis at submission time.</li>
+            </ul>
+
+            <h3>Summary</h3>
+
+            <p>Schema-driven forms are essentially a concrete application of an old software engineering idea: <strong>separation of data and behavior</strong>. The form's structure (data) is described by the Schema, and rendering and validation (behavior) are handled by generic code. This lets non-developers create and modify forms, and lets developers serve all form scenarios with a single codebase.</p>
+
+            <p>This pattern isn't limited to forms. Configuration pages, approval workflows, data dashboards — any scenario where "structure varies but behavior is fixed" can be implemented with a Schema-driven approach. The core is always: define a good Schema, write a good renderer.</p>
+
+            <p>But so far, our Schema can only describe flat form fields. What if we need conditional rendering, dynamic expressions, layout nesting, and interaction actions? In the next article, we'll extend the Schema's capabilities to the entire UI tree.</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>Next:</strong> <a href="schema-driven-ui.html">Schema-Driven Forms (Part 2): Expression Engine and Generic UI Rendering</a>
+            </p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

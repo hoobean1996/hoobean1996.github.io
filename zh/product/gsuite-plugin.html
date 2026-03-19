@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>为 Google Workspace 插件打造 Webpack 脚手架 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>为 Google Workspace 插件打造 Webpack 脚手架</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/celestial-globe-clockwork.jpg" alt="Celestial Globe with Clockwork, Metropolitan Museum of Art">
+                <figcaption>天球仪与钟表机构 — 在精密的约束框架内，用齿轮组合出复杂的运行机制。为 GSuite 沙箱设计构建工具链，也是类似的工程</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：Google Workspace 插件的开发体验很原始——没有 npm、没有构建工具、所有资源必须内联在单个 HTML 文件里。这篇文章分享一套 Webpack 脚手架方案，让你可以用 React + TypeScript 开发 GSuite 插件，自动发现新入口、自动内联 JS/CSS、一次构建覆盖所有 GSuite 产品。如果你需要在 GSuite 插件里做复杂的 UI 交互，这套脚手架可以省掉大量重复劳动。
+            </blockquote>
+
+            <h3>Google Workspace 插件是什么</h3>
+
+            <p>Google Workspace（原 GSuite）允许开发者为 Docs、Sheets、Slides、Forms 等产品开发插件。插件的 UI 形态有两种：<strong>Sidebar</strong>（侧边栏，常驻）和 <strong>Dialog</strong>（弹窗，临时）。</p>
+
+            <p>插件的架构分两层：</p>
+
+<pre><code>┌──────────────────────────────────────────┐
+│           Google Docs / Sheets / ...      │
+│                                           │
+│   ┌─────────────┐    ┌───────────────┐   │
+│   │   Sidebar    │    │    Dialog     │   │
+│   │  (HTML/JS)   │    │  (HTML/JS)   │   │
+│   │  ← iframe →  │    │  ← iframe → │   │
+│   └──────┬───────┘    └──────┬───────┘   │
+│          │                    │           │
+│          │  google.script.run │           │
+│          ▼                    ▼           │
+│   ┌──────────────────────────────────┐   │
+│   │        AppScript (服务端)         │   │
+│   │  - 访问 Drive / Gmail / Sheets   │   │
+│   │  - 操作文档内容                    │   │
+│   │  - 发送邮件                       │   │
+│   └──────────────────────────────────┘   │
+└──────────────────────────────────────────┘</code></pre>
+
+            <ul>
+                <li><strong>前端</strong>：运行在 iframe 沙箱里的 HTML 页面，由 AppScript 的 <code>HtmlService</code> 托管</li>
+                <li><strong>后端</strong>：AppScript 代码，运行在 Google 的服务器上，可以调用 Google API（Drive、Gmail、Sheets 等）</li>
+                <li><strong>通信</strong>：前端通过 <code>google.script.run</code> 异步调用后端函数</li>
+            </ul>
+
+            <p>这个模型有三个硬性约束，直接决定了我们的构建方案：</p>
+
+            <ol>
+                <li><strong>CSP 限制</strong>：iframe 沙箱禁止加载外部脚本和样式表。所有 JS 和 CSS 必须内联在 HTML 文件里</li>
+                <li><strong>单文件交付</strong>：<code>HtmlService.createHtmlOutputFromFile("sidebar")</code> 只接受一个 HTML 文件名。不能拆分成多个文件</li>
+                <li><strong>跨产品部署</strong>：同一个插件要分别部署到 Docs、Sheets、Slides、Forms，每个产品是独立的 AppScript 项目</li>
+            </ol>
+
+            <p>官方推荐的开发方式是直接在 Apps Script 编辑器里写 HTML + JavaScript。这对简单插件够用，但一旦 UI 有状态管理、多步表单、条件渲染这些需求，没有组件化和构建工具的开发体验会很痛苦。</p>
+
+            <p>下面分享我用 Webpack 打造的一套脚手架，解决这些问题。</p>
+
+            <h3>脚手架的目标</h3>
+
+            <p>我希望这套脚手架做到：</p>
+
+            <ol>
+                <li><strong>React + TypeScript 开发</strong>：用现代前端的方式写 GSuite 插件 UI</li>
+                <li><strong>自包含 HTML 输出</strong>：构建产物是单个 HTML 文件，JS/CSS 全部内联，直接满足 GSuite 的 CSP 限制</li>
+                <li><strong>自动发现</strong>：新增一个 dialog，只需要在约定目录下建文件夹，不需要改任何构建配置</li>
+                <li><strong>多产品矩阵构建</strong>：一次构建，为每个 GSuite 产品生成独立的部署目录</li>
+                <li><strong>本地开发</strong>：不部署到 GSuite 也能在浏览器里调试 UI</li>
+            </ol>
+
+            <h3>项目结构约定</h3>
+
+<pre><code>project/
+├── src/
+│   ├── sidebar/           # 主 sidebar（必须存在）
+│   │   ├── App.tsx
+│   │   └── index.tsx
+│   └── dialogs/           # dialog 目录（自动发现）
+│       ├── about/
+│       │   ├── App.tsx
+│       │   └── index.tsx
+│       └── settings/
+│           ├── App.tsx
+│           └── index.tsx
+├── appscript/
+│   └── shared.gs          # AppScript 服务端代码
+├── clasp/
+│   ├── docs/
+│   │   ├── .clasp.json    # Docs 的 AppScript 项目 ID
+│   │   └── appsscript.json
+│   ├── sheets/
+│   │   └── .clasp.json    # Sheets 的 AppScript 项目 ID
+│   └── ...
+├── webpack.config.js
+└── package.json</code></pre>
+
+            <p>这个结构的核心约定是：<strong><code>src/sidebar/</code> 是固定入口，<code>src/dialogs/</code> 下每个含 <code>index.tsx</code> 的子目录自动成为一个 dialog 入口</strong>。</p>
+
+            <h3>第一步：自动发现 Entry Points</h3>
+
+            <p>Webpack 的 <code>entry</code> 通常是手动配置的。但我们希望加 dialog 不改配置。所以在 Webpack 启动时扫描文件系统：</p>
+
+<pre><code>const path = require("path");
+const fs = require("fs");
+
+function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(item => item.isDirectory())
+    .filter(dir => {
+      return fs.existsSync(
+        path.join(dialogsPath, dir.name, "index.tsx")
+      );
+    })
+    .map(dir => dir.name);
+}
+
+// 动态生成 entry points
+const dialogs = discoverDialogs();
+const entry = { sidebar: "./src/sidebar/index.tsx" };
+dialogs.forEach(name => {
+  entry[name] = `./src/dialogs/${name}/index.tsx`;
+});</code></pre>
+
+            <p>这样 <code>entry</code> 会变成 <code>{ sidebar: "...", about: "...", settings: "..." }</code>。想加一个新 dialog？在 <code>src/dialogs/</code> 下建个文件夹、放一个 <code>index.tsx</code>，下次构建自动生效。</p>
+
+            <h3>第二步：内联 JS 和 CSS</h3>
+
+            <p>正常的 Webpack 构建产物是独立的 <code>.js</code> 和 <code>.css</code> 文件，HTML 通过 <code>&lt;script src&gt;</code> 和 <code>&lt;link rel="stylesheet"&gt;</code> 引用。这在 GSuite 里行不通——iframe 沙箱会阻止加载这些外部资源。</p>
+
+            <p>解决方案是两个插件的组合：</p>
+
+<pre><code>const HtmlWebpackPlugin = require("html-webpack-plugin");
+const HtmlInlineScriptPlugin =
+  require("html-inline-script-webpack-plugin");
+
+// JS 内联：HtmlInlineScriptPlugin 把 Webpack 输出的 JS bundle
+//          直接塞进 HTML 的 &lt;script&gt; 标签里
+plugins: [
+  new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    chunks: ["sidebar"],
+    inject: "body",
+  }),
+  new HtmlInlineScriptPlugin(),
+]
+
+// CSS 内联：用 style-loader 代替 mini-css-extract-plugin
+module: {
+  rules: [
+    {
+      test: /\.css$/,
+      use: ["style-loader", "css-loader"],
+      // style-loader 会在运行时把 CSS 注入 &lt;style&gt; 标签
+      // 而不是生成独立的 .css 文件
+    },
+  ],
+}</code></pre>
+
+            <p>构建后每个 HTML 文件是完全自包含的——零外部依赖。<code>HtmlService.createHtmlOutputFromFile("sidebar")</code> 直接能用。</p>
+
+            <h3>第三步：多产品矩阵生成</h3>
+
+            <p>同一个插件要部署到 Docs、Sheets、Slides、Forms 四个产品。每个产品是独立的 AppScript 项目，需要独立的部署目录。Webpack 配置动态生成所有 <code>HtmlWebpackPlugin</code> 实例：</p>
+
+<pre><code>const GSUITE_PRODUCTS = ["docs", "slides", "sheets", "forms"];
+const htmlPlugins = [];
+
+GSUITE_PRODUCTS.forEach(product => {
+  // sidebar
+  htmlPlugins.push(new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+    inject: "body",
+  }));
+
+  // 每个自动发现的 dialog
+  dialogs.forEach(name => {
+    htmlPlugins.push(new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+      inject: "body",
+    }));
+  });
+});</code></pre>
+
+            <p>构建产物的结构：</p>
+
+<pre><code>dist/
+├── docs/
+│   ├── sidebar.html       # 自包含 HTML
+│   ├── about.html
+│   ├── settings.html
+│   └── appscript/
+│       └── shared.gs      # 复制过来的 AppScript 代码
+├── sheets/
+│   ├── sidebar.html
+│   ├── about.html
+│   └── settings.html
+├── slides/
+│   └── ...
+└── forms/
+    └── ...</code></pre>
+
+            <p>4 个产品 × 3 个入口 = 12 个 HTML 文件，全自动生成。JS 代码只编译一次，通过 <code>chunks</code> 配置分发到对应的 HTML 里。</p>
+
+            <h3>第四步：AppScript 文件复制</h3>
+
+            <p>AppScript 的 <code>.gs</code> 文件不需要编译，但需要复制到每个产品的输出目录。用 <code>CopyWebpackPlugin</code>：</p>
+
+<pre><code>const CopyWebpackPlugin = require("copy-webpack-plugin");
+
+GSUITE_PRODUCTS.forEach(product => {
+  plugins.push(new CopyWebpackPlugin({
+    patterns: [{
+      from: "appscript/",
+      to: `${product}/appscript/`,
+    }],
+  }));
+});</code></pre>
+
+            <p>这样 <code>clasp push</code> 时，每个产品目录下既有 HTML 又有 <code>.gs</code>，是一个完整的 AppScript 项目。</p>
+
+            <h3>第五步：本地开发支持</h3>
+
+            <p><code>google.script.run</code> 只在 GSuite 环境里存在。在本地浏览器开发时，它是 <code>undefined</code>。解决思路很简单：检测环境，不存在时用 mock 数据。</p>
+
+<pre><code>// 封装 AppScript 调用
+function callAppScript&lt;T&gt;(
+  methodName: string,
+  ...args: any[]
+): Promise&lt;T&gt; {
+  return new Promise((resolve, reject) => {
+    if (typeof google !== "undefined" && google.script) {
+      const runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject);
+      runner[methodName](...args);
+    } else {
+      // 本地开发：返回 mock 数据
+      resolve(getMockData(methodName, args) as T);
+    }
+  });
+}
+
+// 使用
+const sheets = await callAppScript&lt;Sheet[]&gt;("getGoogleSheets");</code></pre>
+
+            <p>这样做有两个好处：</p>
+
+            <ol>
+                <li><strong>本地开发不依赖 GSuite 环境</strong>：用 <code>webpack-dev-server</code> 起一个本地服务，在浏览器里调试 UI 和交互逻辑</li>
+                <li><strong>把 callback 风格的 <code>google.script.run</code> 包装成 Promise</strong>：在 React 组件里可以用 async/await，代码更干净</li>
+            </ol>
+
+            <h3>第六步：TypeScript 类型声明</h3>
+
+            <p><code>google.script.run</code> 没有官方的类型定义。需要手动声明，让 TypeScript 知道有哪些可调用的 AppScript 函数：</p>
+
+<pre><code>// types/google.d.ts
+interface AppScriptRunner {
+  getGoogleSheets: () => void;
+  getWorksheets: (spreadsheetId: string) => void;
+  getSelectedSheetData: (
+    spreadsheetId: string,
+    worksheetName: string
+  ) => void;
+  getDocumentHtml: (docId: string) => void;
+  sendMailMerge: (
+    spreadsheetId: string,
+    worksheetName: string,
+    docId: string,
+    subject: string,
+    replyTo: string,
+    testMode: boolean
+  ) => void;
+}
+
+declare const google: {
+  script: {
+    run: {
+      withSuccessHandler: (cb: (result: any) => void) => {
+        withFailureHandler: (
+          cb: (error: any) => void
+        ) => AppScriptRunner;
+      };
+    };
+  };
+};</code></pre>
+
+            <p>每新增一个 AppScript 函数，在这里加一行声明。虽然返回值类型还是 <code>any</code>（AppScript 是动态类型的），但至少调用参数有类型检查。</p>
+
+            <h3>第七步：部署流水线</h3>
+
+            <p>用 Google 的 <code>clasp</code> CLI 把构建产物推送到 AppScript 项目。每个 GSuite 产品是独立的 AppScript 项目，有独立的 <code>.clasp.json</code>：</p>
+
+<pre><code># clasp/docs/.clasp.json
+{
+  "scriptId": "1a2b3c...",        # Docs 的 AppScript 项目 ID
+  "rootDir": "../../dist/docs"    # 指向构建产物
+}
+
+# 部署流程
+npm run build                     # 构建所有产品的 HTML
+cd clasp/docs && clasp push       # 推送到 Docs 的 AppScript 项目
+cd clasp/sheets && clasp push     # 推送到 Sheets 的 AppScript 项目
+# ... 每个产品分别推送</code></pre>
+
+            <p><code>clasp push</code> 会上传 <code>rootDir</code> 下的所有 <code>.html</code> 和 <code>.gs</code> 文件到 Google Apps Script。可以写一个脚本把所有产品的推送串起来：</p>
+
+<pre><code># deploy.sh
+npm run build
+for product in docs sheets slides forms; do
+  echo "Deploying to $product..."
+  (cd clasp/$product && clasp push)
+done</code></pre>
+
+            <h3>完整的 webpack.config.js</h3>
+
+            <p>把上面所有步骤组合起来：</p>
+
+<pre><code>const path = require("path");
+const fs = require("fs");
+const HtmlWebpackPlugin = require("html-webpack-plugin");
+const HtmlInlineScriptPlugin =
+  require("html-inline-script-webpack-plugin");
+const CopyWebpackPlugin = require("copy-webpack-plugin");
+const TerserPlugin = require("terser-webpack-plugin");
+
+// ---- 自动发现 ----
+function discoverDialogs() {
+  const dialogsPath = path.resolve(__dirname, "src/dialogs");
+  if (!fs.existsSync(dialogsPath)) return [];
+  return fs.readdirSync(dialogsPath, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .filter(d =>
+      fs.existsSync(path.join(dialogsPath, d.name, "index.tsx"))
+    )
+    .map(d => d.name);
+}
+
+const dialogs = discoverDialogs();
+const PRODUCTS = ["docs", "slides", "sheets", "forms"];
+
+// ---- Entry ----
+const entry = { sidebar: "./src/sidebar/index.tsx" };
+dialogs.forEach(name => {
+  entry[name] = `./src/dialogs/${name}/index.tsx`;
+});
+
+// ---- HTML + Copy 插件 ----
+const plugins = [];
+
+PRODUCTS.forEach(product => {
+  // sidebar HTML
+  plugins.push(new HtmlWebpackPlugin({
+    template: "./public/index.html",
+    filename: `${product}/sidebar.html`,
+    chunks: ["sidebar"],
+    inject: "body",
+  }));
+  // dialog HTMLs
+  dialogs.forEach(name => {
+    plugins.push(new HtmlWebpackPlugin({
+      template: "./public/index.html",
+      filename: `${product}/${name}.html`,
+      chunks: [name],
+      inject: "body",
+    }));
+  });
+  // AppScript 文件复制
+  plugins.push(new CopyWebpackPlugin({
+    patterns: [{
+      from: "appscript/",
+      to: `${product}/appscript/`,
+    }],
+  }));
+});
+
+plugins.push(new HtmlInlineScriptPlugin());
+
+// ---- 导出 ----
+module.exports = {
+  mode: "production",
+  entry,
+  output: {
+    path: path.resolve(__dirname, "dist"),
+    clean: true,
+  },
+  resolve: {
+    extensions: [".ts", ".tsx", ".js", ".jsx"],
+  },
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: "ts-loader",
+        exclude: /node_modules/,
+      },
+      {
+        test: /\.css$/,
+        use: ["style-loader", "css-loader"],
+      },
+    ],
+  },
+  plugins,
+  optimization: {
+    minimizer: [
+      new TerserPlugin({
+        terserOptions: { compress: { drop_console: true } },
+      }),
+    ],
+  },
+};</code></pre>
+
+            <h3>GSuite AppScript 侧的模式</h3>
+
+            <p>脚手架解决了前端的构建问题，但 AppScript 侧也有一些值得记录的模式。</p>
+
+            <p><strong>跨产品适配</strong>：同一个插件运行在 Docs/Sheets/Slides/Forms 里，但 AppScript 没有"当前是哪个产品"的 API。只能用 try/catch 检测：</p>
+
+<pre><code>function getUi() {
+  try { return DocumentApp.getUi(); } catch(e) {}
+  try { return SpreadsheetApp.getUi(); } catch(e) {}
+  try { return SlidesApp.getUi(); } catch(e) {}
+  try { return FormApp.getUi(); } catch(e) {}
+  return null;
+}
+
+function showSidebar() {
+  var ui = getUi();
+  if (!ui) return;
+  var html = HtmlService.createHtmlOutputFromFile("sidebar")
+    .setTitle("My Plugin").setWidth(320);
+  ui.showSidebar(html);
+}</code></pre>
+
+            <p><strong>google.script.run 的工作方式</strong>：前端调用后端函数，通过 callback 拿结果。每个 AppScript 的全局函数都可以被前端调用：</p>
+
+<pre><code>// AppScript 侧——定义全局函数
+function getGoogleSheets() {
+  var files = DriveApp.getFilesByType(MimeType.GOOGLE_SHEETS);
+  var sheets = [];
+  while (files.hasNext()) {
+    var file = files.next();
+    sheets.push({
+      id: file.getId(),
+      name: file.getName(),
+      url: file.getUrl(),
+    });
+  }
+  return { success: true, sheets: sheets };
+}
+
+// React 侧——调用它
+google.script.run
+  .withSuccessHandler((result) => {
+    setSheets(result.sheets);
+  })
+  .withFailureHandler((error) => {
+    console.error(error);
+  })
+  .getGoogleSheets();</code></pre>
+
+            <p><strong>实用 API</strong>：AppScript 可以调用 Google Docs 导出 HTML、读 Sheets 数据、发 Gmail 等。这些是 GSuite 插件的核心能力：</p>
+
+<pre><code>// 读 Sheets 数据
+function getSheetData(spreadsheetId, worksheetName) {
+  var spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = spreadsheet.getSheetByName(worksheetName);
+  var values = sheet.getDataRange().getValues();
+  return { headers: values[0], rows: values.slice(1) };
+}
+
+// 读 Docs 内容（导出为 HTML，保留格式）
+function getDocumentHtml(docId) {
+  var url = "https://docs.google.com/feeds/download/"
+    + "documents/export/Export?id=" + docId
+    + "&exportFormat=html";
+  var response = UrlFetchApp.fetch(url, {
+    headers: {
+      Authorization: "Bearer " + ScriptApp.getOAuthToken()
+    }
+  });
+  return response.getContentText();
+}
+
+// 发邮件
+function sendEmail(to, subject, htmlBody) {
+  GmailApp.sendEmail(to, subject, "", {
+    htmlBody: htmlBody,
+  });
+}</code></pre>
+
+            <h3>实际案例：Mail Merge</h3>
+
+            <p>用这套脚手架做了一个 Mail Merge 功能：从 Google Sheets 读收件人列表，用 Google Docs 做模板，批量发送个性化邮件。</p>
+
+<pre><code>用户操作（sidebar 里的 4 步向导）：
+
+Step 1: 选数据源 → 列出 Drive 里的 Sheets → 选择 sheet tab → 预览 headers
+Step 2: 选模板   → 列出 Drive 里的 Docs → 预览 HTML 内容
+Step 3: 配置     → 邮件主题（支持 {{Name}} 合并字段）→ reply-to 地址
+Step 4: 执行     → 汇总确认 → Test mode → 发送并显示结果</code></pre>
+
+            <p>前端是标准的 React 多步表单（用 state 控制 step），每一步的数据通过 <code>callAppScript</code> 从后端获取。后端做字段替换并发邮件：</p>
+
+<pre><code>function sendMailMerge(spreadsheetId, worksheetName,
+                       docId, subject, replyTo, testMode) {
+  var data = getSheetData(spreadsheetId, worksheetName);
+  var template = getDocumentHtml(docId);
+  var results = [];
+
+  for (var i = 0; i &lt; data.rows.length; i++) {
+    var row = {};
+    data.headers.forEach(function(h, j) { row[h] = data.rows[i][j]; });
+
+    var body = template.replace(/\{\{([^}]+)\}\}/g,
+      function(match, field) {
+        return row[field.trim()] || match;
+      });
+    var emailSubject = subject.replace(/\{\{([^}]+)\}\}/g,
+      function(match, field) {
+        return row[field.trim()] || match;
+      });
+
+    var recipient = testMode
+      ? Session.getActiveUser().getEmail()
+      : row["Email"];
+
+    try {
+      GmailApp.sendEmail(recipient, emailSubject, "", {
+        htmlBody: body,
+        replyTo: replyTo || undefined,
+      });
+      results.push({ row: i + 1, status: "sent" });
+    } catch (e) {
+      results.push({ row: i + 1, status: "error", error: e.message });
+    }
+
+    Utilities.sleep(100); // 控制发送速率
+  }
+
+  return { success: true, results: results };
+}</code></pre>
+
+            <p>这个 Mail Merge 展示了脚手架的价值：前端是复杂的多步交互（选文件、预览数据、配置合并字段、显示发送结果），如果用原生 HTML 写会很痛苦。React 的组件化和状态管理在这里有明显优势。</p>
+
+            <h3>开发体验的痛点</h3>
+
+            <p>这套方案不完美。几个绕不过的问题：</p>
+
+            <ul>
+                <li><strong>没有 hot reload</strong>：改了 AppScript 代码必须 <code>clasp push</code> + 刷新 GSuite 页面才能看到效果。前端部分可以用 <code>webpack-dev-server</code> 本地调试，但涉及 AppScript 交互的逻辑只能在 GSuite 里测</li>
+                <li><strong>Bundle 大小</strong>：React 内联进 HTML 后，每个文件约 1MB。4 产品 × N 个入口 = 总产物可能很大。可以用 Preact 替代 React，或者用 <code>TerserPlugin</code> 压缩</li>
+                <li><strong>AppScript 的 6 分钟执行限制</strong>：长任务（如发 1000 封邮件）可能超时。需要在循环里控制速率，或者分批处理</li>
+                <li><strong>调试困难</strong>：iframe 里的 console.log 不一定能看到。AppScript 侧用 <code>Logger.log()</code>，在 Apps Script 编辑器的执行日志里查看</li>
+            </ul>
+
+            <h3>总结</h3>
+
+            <p>这套脚手架的核心思路：<strong>用 Webpack 把"现代前端开发"和"GSuite 沙箱约束"桥接起来</strong>。</p>
+
+            <ul>
+                <li><code>HtmlInlineScriptPlugin</code> + <code>style-loader</code> 解决 CSP 限制——生成自包含 HTML</li>
+                <li>文件系统扫描实现 dialog 自动发现——零配置新增入口</li>
+                <li>产品 × 入口的矩阵循环生成 <code>HtmlWebpackPlugin</code>——一次构建覆盖所有产品</li>
+                <li><code>clasp</code> + <code>rootDir</code> 配置实现按产品部署——每个产品独立推送</li>
+                <li>环境检测 + mock 数据实现本地开发——不依赖 GSuite 环境调试 UI</li>
+            </ul>
+
+            <p>如果你需要在 GSuite 插件里做复杂的 UI 交互，这套脚手架可以省掉很多重复劳动。如果只是一两个按钮的简单插件，直接写原生 HTML 就够了——不需要这套东西。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

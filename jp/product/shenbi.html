@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>神筆：ブラウザ上で子ども向けプログラミング言語を作る - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>神筆：ブラウザ上で子ども向けプログラミング言語を作る</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/children-playing-goldfish.jpg" alt="Two Children Playing with Goldfish, Metropolitan Museum of Art">
+                <figcaption>《二人の子供と金魚》— 子どもは生まれながらにして探索と対話の中で学ぶ。子ども向けプログラミングもそうあるべきだ——構文を教えるのではなく、「自分が書いたものが世界を制御できる」という魔法を子どもに体験させること</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：Scratch は強力だが小さな子どもには複雑すぎ、Apple Swift Playgrounds は美しいが実際のプログラミング言語との接続がない。この記事では別のアプローチを共有する——ブラウザ上でゼロから中英バイリンガルの Python ライクなプログラミング言語を実装する。完全な Lexer → Parser → Compiler → VM パイプライン、ブロック/コードの双方向同期、そして同じ言語で異なるタイプのゲームを駆動できる World 抽象を含む。「言語の作り方」や「子ども向けプログラミングプロダクトの設計」に興味があれば、ここに完全なエンジニアリングの詳細がある。
+            </blockquote>
+
+            <h3>なぜ自作するのか</h3>
+
+            <p>市場にある子ども向けプログラミングツールは大きく二種類に分かれる：</p>
+
+            <ul>
+                <li><strong>Scratch 系</strong>：純粋なブロックのドラッグ＆ドロップで、機能は非常に強力（イベントシステム、並行処理、メッセージブロードキャスト）だが、5-8 歳の子どもには概念が多すぎる。「キャラクターをゴールまで歩かせる」というタスクで、Scratch では座標系、イベントループ、ブロードキャストメッセージの理解が必要になる——これらはプログラミングの本質ではなく、Scratch 自体の複雑さである</li>
+                <li><strong>Apple Swift Playgrounds 系</strong>：美しい 3D インターフェース、ガイド付き学習、体験は良い。しかし教えているのは Swift の構文であり、子どもが将来使う Python/JavaScript とは何の関係もない。Playgrounds を終えても、他の言語に移る時はゼロからやり直しになる</li>
+            </ul>
+
+            <p>私が求めていたのは：</p>
+
+            <ol>
+                <li><strong>十分にシンプル</strong>：5 歳の子どもがブロックを理解でき、8 歳の子どもがコードを読める</li>
+                <li><strong>実際の言語と接続</strong>：構文が Python と高度に一致し、学び終えたらそのまま本物の Python に移行できる</li>
+                <li><strong>中英バイリンガル</strong>：<code>如果</code> と <code>if</code> は同じもので、子どもは中国語で入門し、徐々に英語に切り替えられる</li>
+                <li><strong>ブロックとコードの双方向切替</strong>：「ブロックがコードを生成する」一方向の関係ではなく、ブロックとコードがいつでも相互変換できる</li>
+            </ol>
+
+            <p>これらの条件を満たすツールが見つからなかったので、自分で作った。<strong>神筆</strong>（Shenbi）と名付けた——コードを書くのは絵を描くように、描いたものが動き出す。</p>
+
+            <h3>全体アーキテクチャ</h3>
+
+<pre><code>┌─────────────────────────────────────────────┐
+│                  用户界面                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
+│  │ 积木编辑器 │  │ 代码编辑器 │  │  游戏画布  │   │
+│  │ (Block)   │  │ (Code)   │  │ (Canvas) │   │
+│  └─────┬─────┘  └─────┬─────┘  └─────▲─────┘   │
+│        │    ↕ 双向同步   │              │        │
+│        └───────┬────────┘              │        │
+│                ▼                       │        │
+│  ┌──────────────────────┐              │        │
+│  │    MiniPython 语言     │              │        │
+│  │  Lexer → Parser →     │              │        │
+│  │  Compiler → IR        │              │        │
+│  └──────────┬───────────┘              │        │
+│             ▼                          │        │
+│  ┌──────────────────────┐              │        │
+│  │     栈式虚拟机 (VM)    │──────────────┘        │
+│  │  单步执行 / 断点 /     │                       │
+│  │  回退调试              │                       │
+│  └──────────┬───────────┘                       │
+│             ▼                                   │
+│  ┌──────────────────────┐                       │
+│  │    World (游戏世界)    │                       │
+│  │  MazeWorld / TurtleWorld / ...               │
+│  └──────────────────────┘                       │
+└─────────────────────────────────────────────────┘</code></pre>
+
+            <p>下から上に見ると：<strong>World</strong> はゲームの状態、<strong>VM</strong> はコードを実行して World を操作し、<strong>Canvas</strong> は World の状態をレンダリングし、<strong>ブロック/コードエディタ</strong> は MiniPython コードを編集する二つの方法である。</p>
+
+            <h3>第一部：言語を作る</h3>
+
+            <h4>Lexer：中英バイリンガルはここで実現</h4>
+
+            <p>中英バイリンガルのコア設計は非常にシンプルで、Lexer 層で中国語キーワードと英語キーワードを同じ Token タイプにマッピングする。Parser 以降のすべてのステージは、ユーザーが中国語で書いたか英語で書いたかをまったく知らない。</p>
+
+<pre><code>const KEYWORDS: Record&lt;string, TokenType&gt; = {
+  // 中英文映射到相同的 Token
+  '如果': 'IF',      'if': 'IF',
+  '否则如果': 'ELIF', 'elif': 'ELIF',
+  '否则': 'ELSE',    'else': 'ELSE',
+  '重复': 'REPEAT',  'repeat': 'REPEAT',
+  '次': 'TIMES',     'times': 'TIMES',
+  '当': 'WHILE',     'while': 'WHILE',
+  '对于': 'FOR',     'for': 'FOR',
+  '在': 'IN',        'in': 'IN',
+  '定义': 'DEF',     'def': 'DEF',
+  '返回': 'RETURN',  'return': 'RETURN',
+  '真': 'TRUE',      'True': 'TRUE',
+  '假': 'FALSE',     'False': 'FALSE',
+  '和': 'AND',       'and': 'AND',
+  '或': 'OR',        'or': 'OR',
+  '不': 'NOT',       'not': 'NOT',
+  '类': 'CLASS',     'class': 'CLASS',
+};</code></pre>
+
+            <p>識別子も中国語文字（Unicode CJK 範囲）をサポートしているので、変数名を中国語にできる：</p>
+
+<pre><code>// この二つのコードは Lexer 以降完全に等価
+重复 3 次:
+    前进()
+    左转()
+
+repeat 3 times:
+    forward()
+    turnLeft()</code></pre>
+
+            <p>Lexer は Python スタイルのインデントも処理する必要がある——コードブロックの開始と終了を波括弧ではなく INDENT/DEDENT トークンで表現する。これが Lexer 全体で最も複雑な部分である。</p>
+
+            <h4>Parser → Compiler → IR</h4>
+
+            <p>Parser は手書きの再帰下降で、AST を生成する。Compiler は複数パスのコンパイルを行う：まず関数とクラスの定義を収集し、次にメインコードをコンパイルし、最後に関数本体とクラスメソッドをコンパイルする。出力は線形のスタック式命令セットである：</p>
+
+<pre><code>// IR 指令集（~35 个 opcode）
+type OpCode =
+  // 栈操作
+  | 'PUSH' | 'POP' | 'DUP'
+  // 变量
+  | 'LOAD' | 'STORE'
+  // 算术
+  | 'ADD' | 'SUB' | 'MUL' | 'DIV' | 'MOD' | 'NEG'
+  // 比较
+  | 'EQ' | 'NEQ' | 'LT' | 'GT' | 'LTE' | 'GTE'
+  // 控制流
+  | 'JUMP' | 'JUMP_IF' | 'JUMP_IF_NOT'
+  // 函数
+  | 'CALL' | 'CALL_USER' | 'RETURN'
+  // 数据结构
+  | 'ARRAY_CREATE' | 'ARRAY_GET' | 'ARRAY_SET'
+  | 'OBJECT_CREATE' | 'OBJECT_GET' | 'OBJECT_SET'
+  // 类
+  | 'CLASS_DEF' | 'NEW' | 'METHOD_CALL'
+  | 'HALT' | 'NOP';</code></pre>
+
+            <p>シンプルな例のコンパイル結果：</p>
+
+<pre><code>// MiniPython 源码
+重复 3 次:
+    前进()
+
+// 编译后的 IR
+PUSH 0          // 循环计数器 = 0
+STORE $i        // 保存到变量
+PUSH 3          // 循环上限
+STORE $limit
+LOAD $i         // ← 循环开始
+LOAD $limit
+LT              // i < limit ?
+JUMP_IF_NOT end // 不满足则跳出
+CALL forward:0  // 调用 forward()，0 个参数
+POP             // 丢弃返回值
+LOAD $i
+PUSH 1
+ADD
+STORE $i        // i++
+JUMP loop       // 跳回循环开始
+HALT            // ← end</code></pre>
+
+            <h4>VM：一時停止できる仮想マシン</h4>
+
+            <p>VM はスタック式仮想マシンで、プログラムカウンタ（PC）、オペランドスタック、グローバル変数テーブル、コールスタックを持つ。ただし、すべての命令を一気に実行するのではなく、<strong>毎回一ステップだけ実行</strong>してから呼び出し元に制御を返す。</p>
+
+            <p>これは子ども向けプログラミングのコア要件である：子どもが <code>前進()</code> と書いたら、キャラクターが一マス進むアニメーションを見せてから次の命令を実行する必要がある。VM が一気に実行してしまうと、ユーザーは最終状態しか見られない。</p>
+
+<pre><code>// VM.step() 返回执行结果，而不是跑到底
+step(): StepResult {
+  const inst = this.program[this.pc];
+
+  switch (inst.opcode) {
+    case 'CALL': {
+      const { name, argCount } = parseCallArg(inst.arg);
+      const args = this.popN(argCount);
+
+      // 游戏命令：_forward, _turnLeft, ...
+      if (this.commandHandlers.has(name)) {
+        this.commandHandlers.get(name)!(args);
+        this.stack.push(null);
+        this.pc++;
+        return { action: name, actionArgs: args };
+        //       ↑ 返回给调用方："刚执行了 forward"
+        //         调用方可以播放动画，然后再调 step()
+      }
+
+      // 传感器：frontBlocked, atGoal, ...
+      if (this.sensorHandlers.has(name)) {
+        const result = this.sensorHandlers.get(name)!(args);
+        this.stack.push(result);
+        this.pc++;
+        return { sensorQuery: name };
+      }
+
+      // 内置函数：len, print, random, ...
+      // ...
+    }
+    // ... 其他 opcode
+  }
+}</code></pre>
+
+            <p>この設計は<strong>ステップ実行デバッグ</strong>と<strong>ブレークポイント</strong>も自然にサポートする：呼び出し元がいつ <code>step()</code> を呼ぶかを制御し、各ステップの間で変数を検査したり現在の行をハイライトしたりできる。</p>
+
+            <p>さらに、VM は<strong>巻き戻しデバッグ</strong>もサポートしている——各ステップの実行前に VM の完全な状態スナップショットを保存し、ユーザーがプログラムの実行過程を「逆再生」できる。子どもがコードの流れを理解するのに特に役立つ。</p>
+
+            <h3>第二部：ブロック ↔ コードの双方向同期</h3>
+
+            <p>多くのブロックプログラミングプラットフォームは一方向的で、ブロックがコードを生成するが、コードの変更はブロックに反映されない。つまり子どもがコードモードに切り替えて何か変更すると、二度とブロックモードに戻れなくなる。</p>
+
+            <p>神筆は双方向同期を実現した：</p>
+
+            <h4>ブロック → コード</h4>
+
+            <p>各ブロックタイプ（command、repeat、while、if、関数定義……）に対応するコード生成ルールがあり、同時に <code>LineToBlockMap</code> を維持する——生成された各行がどのブロック ID に対応するかを記録し、実行時に対応するブロックをハイライトするために使用する：</p>
+
+<pre><code>function generateBlockCode(block: Block, indent: number,
+                           lineMap: LineToBlockMap) {
+  const spaces = '    '.repeat(indent);
+
+  switch (block.type) {
+    case 'command':
+      lines.push(`${spaces}${commandName}(${args})`);
+      lineMap.set(currentLine, block.id);
+      break;
+
+    case 'repeat':
+      lines.push(`${spaces}repeat ${block.repeatCount} times:`);
+      lineMap.set(currentLine, block.id);
+      // 子ブロックを再帰的に処理
+      for (const child of block.children) {
+        generateBlockCode(child, indent + 1, lineMap);
+      }
+      break;
+
+    case 'if':
+      lines.push(`${spaces}if ${conditionToCode(block)}:`);
+      // ...
+  }
+}</code></pre>
+
+            <h4>コード → ブロック</h4>
+
+            <p>こちらがより興味深い方向である。コードはまず本物の Lexer/Parser でコンパイルされて AST になり、その後 AST ノードを逆変換してブロックにする：</p>
+
+<pre><code>function parseCodeToBlocks(code: string): Block[] | null {
+  try {
+    const ast = compile(code);  // 本物のコンパイラで解析
+    return ast.body
+      .map(stmt => statementToBlock(stmt))
+      .filter(b => b !== null);
+  } catch {
+    return null;  // 構文エラー、変換不可
+  }
+}</code></pre>
+
+            <p>ここでは MiniPython のコンパイラを再利用している——簡略化した別のパーサーを書くのではなく、本当にコードをコンパイルし、AST を取得してからブロックに変換する。これによりコード→ブロックの変換とブロック→コードの変換が完全に対称であることが保証される。</p>
+
+            <p>難しい点は、中国語の関数名、英語の関数名、レガシーな命名のマッピングを処理する必要があることである。例えば <code>forward</code>、<code>前進</code>、<code>move</code> はすべて同じ <code>command</code> タイプのブロックにマッピングされる：</p>
+
+<pre><code>const COMMAND_MAP: Record&lt;string, CommandId&gt; = {
+  move: 'move', turn: 'turn',
+  移动: 'move', 转向: 'turn',
+  forward: 'move', backward: 'move',  // legacy
+  前进: 'move', 后退: 'move',
+  左转: 'turn', 右转: 'turn',
+  setColor: 'setColor', 设置颜色: 'setColor',
+};</code></pre>
+
+            <p>結果：子どもがブロックモードでロジックを組み立て、コードモードに切り替えると対応する Python コードが表示される。コードモードで数行変更し、ブロックモードに戻ると対応するブロックの変化が表示される。二つのモードは常に同期している。</p>
+
+            <h3>第三部：World モデル</h3>
+
+            <p>これが最もうまく設計できた部分だと思う。神筆は迷路ゲームだけでなく、タートルグラフィックス（Turtle Graphics）もあり、今後さらに多くのゲームタイプに拡張できる。問題は：<strong>同じ言語と VM でまったく異なるタイプのゲームをどう駆動するか？</strong></p>
+
+            <p>答えは <strong>World 抽象</strong>である：</p>
+
+<pre><code>架构模式：
+- World：数据模型（状态 + 命令 + 传感器）
+- VM：代码执行器（把代码映射到 World 的方法）
+- Canvas：渲染器（显示 World 的状态）</code></pre>
+
+            <p>各ゲームタイプはそれぞれの World、VM バインディング、Canvas を実装するが、MiniPython 言語と VM コアは共有する。</p>
+
+            <h4>MazeWorld</h4>
+
+<pre><code>class MazeWorld {
+  // 状态
+  grid: Cell[][];
+  x: number; y: number;
+  direction: 'up' | 'down' | 'left' | 'right';
+  collected: number;
+  steps: number;
+
+  // 命令
+  moveForward(): boolean;
+  turnLeft(): void;
+  turnRight(): void;
+  collect(): boolean;
+
+  // 传感器
+  isFrontBlocked(): boolean;
+  isAtGoal(): boolean;
+  hasStarHere(): boolean;
+
+  // 序列化（给 VM 用）
+  toSharedState(): SharedMazeState;
+  syncFromSharedState(state: SharedMazeState): void;
+}</code></pre>
+
+            <h4>TurtleWorld</h4>
+
+<pre><code>class TurtleWorld {
+  // 状态
+  x: number; y: number;
+  angle: number;
+  penDown: boolean;
+  penColor: string;
+  lines: LineSegment[];
+
+  // 命令
+  forward(distance: number): void;
+  turnLeft(degrees: number): void;
+  penUp(): void;
+  setColor(color: string): void;
+
+  // 序列化
+  toSharedState(): SharedTurtleState;
+  syncFromSharedState(state: SharedTurtleState): void;
+}</code></pre>
+
+            <h4>重要な設計：SharedState ブリッジ</h4>
+
+            <p>World と VM は <code>SharedState</code> で接続される。VM 起動時に World の状態を通常の JavaScript オブジェクトにシリアライズし、MiniPython のグローバルスコープに <code>world</code> として注入する：</p>
+
+<pre><code>// MazeVM.loadWithSource()
+loadWithSource(userCode: string): void {
+  const fullCode = MAZE_STDLIB + '\n' + userCode;
+  const program = compileToIR(compile(fullCode));
+  this.sharedState = this.world.toSharedState();
+  this.vm.load(program);
+  this.vm.setGlobal('world', this.sharedState);
+  //                  ↑ MiniPython コード内で直接 world.x, world.y, ... を読み書きできる
+}</code></pre>
+
+            <p>そして MiniPython の標準ライブラリコードがこの <code>world</code> オブジェクトを直接操作する：</p>
+
+<pre><code># MiniPython 标准库（迷宫）
+def forward():
+    offset = DIRECTION_OFFSETS[world.direction]
+    newX = world.x + offset[0]
+    newY = world.y + offset[1]
+    if getCell(newX, newY) == 'wall':
+        return False
+    _forward()    # ← 唯一の native 呼び出し、Canvas にアニメーション再生を通知
+    return True
+
+def frontBlocked():
+    offset = DIRECTION_OFFSETS[world.direction]
+    newX = world.x + offset[0]
+    newY = world.y + offset[1]
+    return getCell(newX, newY) == 'wall'</code></pre>
+
+            <p>注目すべきは、<code>forward()</code> の衝突検出や座標計算はすべて MiniPython 自身が行っていることである。<code>_forward()</code> だけが native コマンドで、Canvas に「キャラクターが一マス移動した」と通知し、Canvas がアニメーションを再生する。標準ライブラリは<strong>自分自身の言語で書かれている</strong>。</p>
+
+            <p>タートルグラフィックスの標準ライブラリも同じパターンである：</p>
+
+<pre><code># MiniPython 标准库（海龟）
+def forward(distance):
+    radians = world.angle * 3.14159265359 / 180
+    dx = _cos(radians) * distance * world.stepSize
+    dy = _sin(radians) * distance * world.stepSize * -1
+    oldX = world.x
+    oldY = world.y
+    world.x = world.x + dx
+    world.y = world.y + dy
+    if world.penDown:
+        _drawLine(oldX, oldY, world.x, world.y,
+                  world.penColor, world.penWidth)</code></pre>
+
+            <p><code>_cos</code>、<code>_sin</code>、<code>_drawLine</code> だけが native である——三角関数と描画は MiniPython ではできないためだ。残りの座標計算はすべて MiniPython 内で完結している。</p>
+
+            <h4>新しいゲームの追加に必要なもの</h4>
+
+            <p>World モデルにより、新しいゲームの拡張は非常に明確になる：</p>
+
+            <ol>
+                <li>新しい World クラスを定義する（状態 + コマンド + センサー + toSharedState）</li>
+                <li>対応する VM バインディングクラスを書き、少数の native コマンドを登録する</li>
+                <li>MiniPython で標準ライブラリを書く——ゲームロジックの大部分はここに置く</li>
+                <li>World の状態をレンダリングする Canvas コンポーネントを書く</li>
+            </ol>
+
+            <p>言語、コンパイラ、VM コア、ブロックエディタ——すべて再利用、変更ゼロ。</p>
+
+            <h3>ステージシステム：条件も式である</h3>
+
+            <p>各ステージは JSON ファイルで、ASCII アートでマップを定義する：</p>
+
+<pre><code>{
+  "id": "maze-01",
+  "name": "First Steps",
+  "grid": [
+    "########",
+    "#>...*G#",    // > = 玩家朝右, * = 星星, G = 终点
+    "########"
+  ],
+  "availableBlocks": ["command"],
+  "winCondition": "collectedCount() >= 1 and atGoal()",
+  "failCondition": "stepCount() > 10",
+  "hints": [
+    "Use the Forward block to move the robot",
+    "Keep going until you reach the flag!"
+  ]
+}</code></pre>
+
+            <p><code>winCondition</code> と <code>failCondition</code> はハードコードされた列挙ではなく、<strong>MiniPython の式</strong>であり、VM が評価する。つまりステージ設計者（教師）はコードを変更せずに任意の条件を組み合わせられる：</p>
+
+<pre><code>// 各种 win condition
+"atGoal()"                                // 到达终点
+"collectedCount() >= 3 and atGoal()"      // 收集3颗星 + 到达终点
+"stepCount() <= 8 and atGoal()"           // 8步内到达终点
+"collectedCount() == getRemainingStars()" // 收集所有星星</code></pre>
+
+            <h3>まとめ</h3>
+
+            <p>最初の目標に立ち戻ると：</p>
+
+            <ul>
+                <li><strong>十分にシンプル</strong> → ブロックモードで 5 歳の子どもが使え、コードモードの構文は Python と一致する</li>
+                <li><strong>実際の言語と接続</strong> → MiniPython の構文は Python のサブセットそのもので、学び終えたらそのまま Python が書ける</li>
+                <li><strong>中英バイリンガル</strong> → Lexer 層でキーワードマッピングを実現し、後続のパイプラインは完全に無関知</li>
+                <li><strong>ブロックとコードの双方向切替</strong> → コンパイラの AST を再利用してコード→ブロックの逆変換を実現</li>
+            </ul>
+
+            <p>エンジニアリング上最も満足している三つの設計：</p>
+
+            <ol>
+                <li><strong>中英バイリンガルは Lexer 層だけで処理</strong>：一つのキーワードマッピングテーブルで解決し、Parser/Compiler/VM は言語をまったく気にしない。この決定によりシステム全体の複雑さが「バイリンガル」のために倍増しなかった</li>
+                <li><strong>World 抽象</strong>：ゲームワールドは純粋なデータモデルで、VM は SharedState でブリッジし、標準ライブラリは自身の言語で書かれている。新しいゲームを追加しても言語と VM を変更する必要がない</li>
+                <li><strong>VM の step() 設計</strong>：毎回一ステップだけ実行して最後まで走らないので、アニメーション再生、ステップ実行デバッグ、ブレークポイント、巻き戻しデバッグがすべて自然に実現できる</li>
+            </ol>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

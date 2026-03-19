@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema-Driven Forms (Part 2): Expression Engine and Generic UI Rendering - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Schema-Driven Forms (Part 2): Expression Engine and Generic UI Rendering</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/patchwork-quilt.jpg" alt="Patchwork Quilt, 1870-1900, Metropolitan Museum of Art">
+                <figcaption>Patchwork Quilt, 1870-1900 — Each independent fabric piece is joined according to rules, forming a complete pattern. Schema-driven UI works the same way: independent components compose into complete interfaces through structured descriptions</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: The previous article solved the problem of "describing forms with JSON," but forms are only a subset of UI. This article extends Schema capabilities to describe entire interfaces — layout, conditional rendering, expression engine, action system. The end result is a generic SchemaRenderer: give it a JSON, and it can render a complete page with conditional logic and interactive behavior. This approach is suitable for scenarios that need "low-code page configuration."
+            </blockquote>
+
+            <h3>From Forms to Interfaces</h3>
+
+            <p>The <a href="form-builder.html">previous article</a> discussed using JSON Schema to drive form rendering — data model, renderer, validation strategy. But if you think about it, forms are just a subset of UI. A form contains more than just input fields — there are layouts (columns, cards, tab switching), display components (text, images, badges), and interaction logic (clicking a button triggers an action, showing/hiding fields based on selections).</p>
+
+            <p>If we extend the Schema's capability from "describing form fields" to "describing the entire UI tree," we get a more powerful system: <strong>Schema-driven UI</strong>. A JSON document defines not just data input, but also layout, conditional rendering, validation rules, and interaction actions — the frontend needs only a generic <code>SchemaRenderer</code> to render complete pages.</p>
+
+            <h3>Core Type Design</h3>
+
+            <p>The entire system's type definitions:</p>
+
+<pre><code>// Complete description of a component
+interface ComponentSchema {
+  type: string;              // Component type: "Input" | "Card" | "Row" | ...
+  name?: string;             // Field name (only for form components)
+  props?: Record&lt;string, unknown&gt;;  // Props passed to the component
+  validation?: ValidationSchema;     // Validation rules
+  conditional?: ConditionalSchema;   // Conditional rendering
+  actions?: Record&lt;string, ActionSchema&gt;;  // Event handlers
+  children?: ComponentSchema[];      // Child components (for layout containers)
+}
+
+// Top-level Schema
+interface FormSchema {
+  id: string;
+  title?: string;
+  description?: string;
+  form?: {
+    initialValues?: Record&lt;string, unknown&gt;;  // Default values
+    values?: Record&lt;string, unknown&gt;;         // Pre-filled values (highest priority)
+    validateOn?: "change" | "blur" | "submit";
+  };
+  components: ComponentSchema[];  // Component tree
+}</code></pre>
+
+            <p>Key design decision: <strong>ComponentSchema is recursive</strong>. A <code>Card</code>'s <code>children</code> can contain <code>Row</code>, <code>Row</code> can contain <code>Input</code> and <code>Button</code>. This means the Schema can describe UI trees of arbitrary depth, not limited to flat field lists.</p>
+
+            <h3>A Real Schema Example</h3>
+
+<pre><code>{
+  "id": "employee-onboarding",
+  "title": "New Employee Onboarding",
+  "form": {
+    "initialValues": { "accountType": "individual" }
+  },
+  "components": [
+    {
+      "type": "Card",
+      "props": { "title": "Basic Information" },
+      "children": [
+        {
+          "type": "Row",
+          "props": { "gap": 16 },
+          "children": [
+            {
+              "type": "Input",
+              "name": "name",
+              "props": { "label": "Name", "placeholder": "Enter name" },
+              "validation": {
+                "rule": "LEN(@name) >= 2",
+                "message": "Name must be at least 2 characters"
+              }
+            },
+            {
+              "type": "DatePicker",
+              "name": "startDate",
+              "props": { "label": "Start Date" }
+            }
+          ]
+        },
+        {
+          "type": "Selector",
+          "name": "department",
+          "props": {
+            "label": "Department",
+            "options": [
+              { "value": "eng", "label": "Engineering" },
+              { "value": "product", "label": "Product" },
+              { "value": "design", "label": "Design" }
+            ]
+          }
+        },
+        {
+          "type": "RadioGroup",
+          "name": "accountType",
+          "props": {
+            "label": "Account Type",
+            "options": [
+              { "value": "individual", "label": "Individual" },
+              { "value": "business", "label": "Business" }
+            ]
+          }
+        },
+        {
+          "type": "Input",
+          "name": "companyName",
+          "props": { "label": "Company Name" },
+          "conditional": {
+            "when": "@accountType == 'business'"
+          }
+        }
+      ]
+    },
+    {
+      "type": "Button",
+      "props": { "label": "Submit", "type": "submit" },
+      "actions": {
+        "onClick": { "type": "submit" }
+      }
+    }
+  ]
+}</code></pre>
+
+            <p>This JSON describes: layout (Card wrapper, Row columns), form fields (Input, DatePicker, Selector, RadioGroup), validation rules (name length >= 2), conditional rendering (show company name only when "Business" is selected), and interaction actions (button submit). The frontend doesn't need to write any component code, just a generic renderer.</p>
+
+            <h3>Expression Engine</h3>
+
+            <p>The core of conditional rendering and validation rules is an expression engine. String expressions in the Schema (like <code>@accountType == 'business'</code>) need to be evaluated at runtime.</p>
+
+            <p>The <code>@</code> prefix references form field current values. Expressions support comparison, logical operations, and built-in functions:</p>
+
+<pre><code>// Validation rule examples
+"LEN(@name) >= 2"                              // String length
+"@age >= 18 AND @age <= 120"                   // Range validation
+"LEN(@email) > 5 AND FIND(\"@\", @email) > 0" // Email format
+
+// Conditional rendering examples
+"@accountType == 'business'"                    // Equality check
+"@role == 'admin' OR @role == 'super_admin'"   // Multiple conditions
+"@items > 0"                                    // Numeric comparison</code></pre>
+
+            <p>The expression engine implementation doesn't need to be very complex. A simple recursive descent parser is sufficient — tokenize the expression string, parse into an AST, then recursively evaluate. The key is: <strong>the expression evaluation context must stay synchronized with form state</strong>. Every time form values change, the expression engine can access the latest values for re-evaluation.</p>
+
+            <p>The implementation uses React Context to inject form values into the expression engine:</p>
+
+<pre><code>function FormContent({ schema, registry }) {
+  const formContext = useFormSchema();
+  const evalContext = useLibExprEvaluation();
+
+  // Sync to expression engine when form values change
+  useEffect(() => {
+    evalContext.setValues(formContext.values);
+  }, [formContext.values]);
+
+  return (
+    &lt;form&gt;
+      {schema.components.map((comp, i) =&gt; (
+        &lt;SchemaField key={comp.name || i} schema={comp} registry={registry} /&gt;
+      ))}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+            <h3>Conditional Rendering</h3>
+
+            <p>Conditional rendering Schema definition:</p>
+
+<pre><code>interface ConditionalSchema {
+  when: string;                     // Expression, determines visibility
+  then?: Partial&lt;ComponentSchema&gt;;  // Props to merge when condition is true
+  else?: Partial&lt;ComponentSchema&gt;;  // Props to merge when condition is false
+}</code></pre>
+
+            <p>Not just show/hide control — it can also modify component props based on conditions. For example:</p>
+
+<pre><code>{
+  "type": "Input",
+  "name": "budget",
+  "props": { "label": "Budget" },
+  "conditional": {
+    "when": "@role == 'manager'",
+    "then": { "props": { "label": "Department Budget (Admin)" } },
+    "else": { "props": { "disabled": true } }
+  }
+}</code></pre>
+
+            <p>The renderer implementation is straightforward:</p>
+
+<pre><code>function SchemaField({ schema, registry }) {
+  const evalContext = useLibExprEvaluation();
+  const { conditional } = schema;
+
+  const isVisible = useMemo(() =&gt; {
+    if (!conditional?.when) return true;
+    try {
+      return evalContext.validate(conditional.when);
+    } catch {
+      return true;  // Default to showing on expression error
+    }
+  }, [conditional?.when, evalContext]);
+
+  if (!isVisible) return null;
+
+  // ... render component
+}</code></pre>
+
+            <h3>Component Registry</h3>
+
+            <p>How does <code>type: "Input"</code> in the Schema become an actual React component? Through a component registry:</p>
+
+<pre><code>interface ComponentRegistry {
+  [key: string]: React.ComponentType&lt;any&gt;;
+}
+
+const defaultRegistry: ComponentRegistry = {
+  // Form inputs
+  Input: XDSInput,
+  TextArea: XDSTextArea,
+  NumberInput: XDSNumberInput,
+  Checkbox: XDSCheckbox,
+  RadioGroup: XDSRadioGroup,
+  Selector: XDSSelector,
+  Switch: XDSSwitch,
+  DatePicker: XDSDatePicker,
+  TimePicker: XDSTimePicker,
+  FileUpload: XDSFileUpload,
+  Slider: XDSSlider,
+  Rating: XDSRating,
+  ColorPicker: XDSColorPicker,
+
+  // Layout
+  Card: XDSCard,
+  Row: XDSFlexbox,     // direction: row
+  Column: XDSFlexbox,  // direction: column
+  Tabs: XDSTabs,
+  Accordion: XDSAccordion,
+  Divider: XDSDivider,
+
+  // Display
+  Text: XDSText,
+  Badge: XDSBadge,
+  Alert: XDSAlert,
+  Image: XDSImage,
+  Table: XDSTable,
+
+  // Interactive
+  Button: XDSButton,
+  Dropdown: XDSDropdown,
+};</code></pre>
+
+            <p>Users can inject custom components to override defaults or extend with new types:</p>
+
+<pre><code>&lt;SchemaRenderer
+  schema={schema}
+  components={{
+    RichTextEditor: MyRichTextEditor,  // New addition
+    Input: MyCustomInput,              // Override default
+  }}
+/&gt;</code></pre>
+
+            <p>The beauty of this design: <strong>Schema and component implementation are completely decoupled</strong>. The same Schema can be rendered with different component libraries — desktop with Ant Design's registry, mobile with React Native's registry, or even rendered as Flutter Widgets.</p>
+
+            <h3>Action System</h3>
+
+            <p>Forms don't just collect data — they have interactions. Action Schema describes user-triggered behaviors:</p>
+
+<pre><code>type ActionType = "submit" | "setValue" | "navigate" | "toast" | "api" | "custom";
+
+interface ActionSchema {
+  type: ActionType;
+  field?: string;    // setValue: target field
+  value?: unknown;   // setValue: new value
+  to?: string;       // navigate: target path
+  message?: string;  // toast: message content
+  url?: string;      // api: request URL
+  method?: string;   // api: HTTP method
+  handler?: string;  // custom: handler function name
+}</code></pre>
+
+            <p>Used in Schema like this:</p>
+
+<pre><code>// Click button to submit form
+{
+  "type": "Button",
+  "props": { "label": "Submit" },
+  "actions": {
+    "onClick": { "type": "submit" }
+  }
+}
+
+// Click button to set another field's value
+{
+  "type": "Button",
+  "props": { "label": "Fill Default Address" },
+  "actions": {
+    "onClick": {
+      "type": "setValue",
+      "field": "address",
+      "value": "123 Main Street"
+    }
+  }
+}
+
+// Call custom handler function
+{
+  "type": "Button",
+  "props": { "label": "Export PDF" },
+  "actions": {
+    "onClick": {
+      "type": "custom",
+      "handler": "exportPDF"
+    }
+  }
+}</code></pre>
+
+            <p>The renderer dispatches to corresponding handler logic based on Action type:</p>
+
+<pre><code>const buildActionHandler = (action: ActionSchema) =&gt; () =&gt; {
+  switch (action.type) {
+    case "setValue":
+      formContext.setValue(action.field, action.value);
+      break;
+    case "submit":
+      formContext.submit();
+      break;
+    case "custom":
+      actionHandlers?.[action.handler]?.(action);
+      break;
+  }
+};</code></pre>
+
+            <h3>State Management and Persistence</h3>
+
+            <p>Form state management is implemented with React Context, providing a set of hooks:</p>
+
+<pre><code>// Complete form context
+const { values, setValue, reset, isDirty, submit, getSchema } = useFormSchema();
+
+// Single field binding
+const [email, setEmail, { touched, setTouched }] = useFormField&lt;string&gt;("email");
+
+// Read-only values
+const values = useFormValues();
+
+// Watch specific field changes
+const { name, age } = useWatchFields(["name", "age"]);</code></pre>
+
+            <p>State persistence is a clever design: the <code>getSchema()</code> method returns the current Schema with user-filled values embedded in <code>form.values</code>. Save this JSON, and next time the form automatically restores to its previous state:</p>
+
+<pre><code>// Save current progress
+const schemaWithValues = getSchema();
+localStorage.setItem("draft", JSON.stringify(schemaWithValues));
+
+// Restore progress — just render the saved Schema, form auto-fills
+const saved = JSON.parse(localStorage.getItem("draft"));
+&lt;SchemaRenderer schema={saved} /&gt;</code></pre>
+
+            <p>The value priority design is also deliberate: <code>form.values</code> (pre-fill/restore) > <code>props.initialValues</code> (externally provided) > <code>form.initialValues</code> (Schema defaults). This ensures persistence restoration always overrides defaults.</p>
+
+            <h3>Dynamic Expressions in Props</h3>
+
+            <p>Props in the Schema can contain not just static values but also expression interpolation:</p>
+
+<pre><code>{
+  "type": "Text",
+  "props": {
+    "content": "${@name ? 'Hello, ' + @name + '!' : 'Please enter your name'}"
+  }
+}</code></pre>
+
+            <p>The renderer recursively traverses props, calling the expression engine when encountering <code>${...}</code>:</p>
+
+<pre><code>function evaluateProps(props, evaluate) {
+  const result = {};
+  for (const [key, value] of Object.entries(props)) {
+    if (typeof value === "string" && value.includes("${")) {
+      result[key] = safeEvaluate(value, evaluate);
+    } else if (typeof value === "object" && value !== null) {
+      result[key] = evaluateProps(value, evaluate);  // Recursive
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}</code></pre>
+
+            <p>This gives the Schema "data binding" capability — display component content can change in real-time following form input, without writing any JavaScript.</p>
+
+            <h3>The Renderer's Switch Strategy</h3>
+
+            <p>Different component types need different props binding approaches. This is the "dirtiest" but most critical part of the renderer:</p>
+
+<pre><code>// Input uses onValueChange
+case "Input":
+  componentProps.onValueChange = handleChange;
+  break;
+
+// TextArea uses event-based onChange
+case "TextArea":
+  componentProps.onChange = (e) =&gt; handleChange(e.target.value);
+  break;
+
+// Checkbox/Switch uses checked + event
+case "Checkbox":
+case "Switch":
+  componentProps.checked = Boolean(value);
+  componentProps.onChange = (e) =&gt; handleChange(e.target.checked);
+  break;
+
+// DatePicker needs string ↔ Date conversion
+case "DatePicker":
+  componentProps.value = toDate(value);
+  componentProps.onChange = handleChange;
+  break;
+
+// Layout components don't need value/name
+case "Card":
+case "Row":
+case "Divider":
+  delete componentProps.value;
+  delete componentProps.name;
+  break;</code></pre>
+
+            <p>This switch is an unavoidable "adaptation layer." Every UI component library has different onChange conventions — some pass value, some pass event, some pass Date objects. The Schema renderer's job is to smooth over these differences, so Schema authors don't need to worry about underlying component API details.</p>
+
+            <h3>Selection Mode: Paving the Way for Visual Editors</h3>
+
+            <p>If you want to build a drag-and-drop form builder, you need users to be able to click on components in the page to select and edit their properties. This requires a "selection mode":</p>
+
+<pre><code>&lt;SchemaRenderer
+  schema={schema}
+  selectionMode={true}
+  onComponentSelect={(info) =&gt; {
+    console.log(info.path);  // "components[0].children[2]"
+    console.log(info.type);  // "Input"
+    console.log(info.name);  // "email"
+  }}
+/&gt;</code></pre>
+
+            <p>In selection mode, each component is wrapped with a hover overlay. Clicking returns the component's path in the Schema tree. The editor can use this path to locate the Schema JSON, modify props, and re-render.</p>
+
+            <p>This forms a complete loop:</p>
+
+<pre><code>Visual editor
+    ↓ Drag / Configure
+FormSchema (JSON)
+    ↓ SchemaRenderer
+Rendered UI
+    ↓ User interaction
+FormResponse (JSON)
+    ↓ getSchema()
+FormSchema with state (persistable)</code></pre>
+
+            <h3>Boundaries of This Approach</h3>
+
+            <ul>
+                <li><strong>Suitable for</strong>: Configuration-driven forms, survey systems, low-code platforms, approval flow forms, CMS content editors — these scenarios where UI structure is "determined at runtime," not hardcoded at compile time.</li>
+                <li><strong>Not suitable for</strong>: Highly custom interactions (drag-and-drop sorting, canvas editing, complex animations), performance-sensitive scenarios (100+ components with real-time updates), pages requiring extensive custom logic. In these scenarios, Schema abstraction becomes a limitation — you'll constantly add escape hatches to the Schema, until the Schema becomes more complex than writing code directly.</li>
+                <li><strong>Complexity ceiling</strong>: When conditional rendering rules exceed 10 or expression nesting exceeds 3 levels, JSON Schema readability degrades sharply. At this point, a good visual editor is needed for assistance, rather than having people hand-write JSON.</li>
+            </ul>
+
+            <h3>Relationship with Other Approaches</h3>
+
+            <table>
+                <tr>
+                    <th>Approach</th>
+                    <th>Schema Scope</th>
+                    <th>Expression Capability</th>
+                    <th>Layout Capability</th>
+                </tr>
+                <tr>
+                    <td>react-jsonschema-form</td>
+                    <td>Data structure</td>
+                    <td>None</td>
+                    <td>Needs uiSchema supplement</td>
+                </tr>
+                <tr>
+                    <td>Formily</td>
+                    <td>Form fields + layout</td>
+                    <td>JSON Schema + reactions</td>
+                    <td>FormLayout / FormGrid</td>
+                </tr>
+                <tr>
+                    <td>Retool / Appsmith</td>
+                    <td>Entire application</td>
+                    <td>JavaScript</td>
+                    <td>Drag-and-drop canvas</td>
+                </tr>
+                <tr>
+                    <td>This article's approach</td>
+                    <td>UI component tree</td>
+                    <td>Custom expression language</td>
+                    <td>Component nesting (Card/Row/Tabs)</td>
+                </tr>
+            </table>
+
+            <p>This article's approach sits between "form Schema" and "low-code platform." It's more powerful than react-jsonschema-form (supports layout, conditional rendering, actions) but lighter than Retool (doesn't involve data source connections, API orchestration, state machines). This positioning suits scenarios that "need non-developers to configure UI, but don't need a full low-code platform."</p>
+
+            <h3>Summary</h3>
+
+            <p>The core formula of Schema-driven UI:</p>
+
+<pre><code>ComponentSchema (recursive component tree description)
+  + ComponentRegistry (type → component mapping)
+  + Expression Engine (dynamic evaluation)
+  + FormContext (state management + persistence)
+  = SchemaRenderer (generic renderer)</code></pre>
+
+            <p>The four parts are independently modular, and combined they can render UI of arbitrary complexity. Schema is responsible for "what," Registry for "what it looks like," Expression Engine for "when," and FormContext for "what the current state is."</p>
+
+            <p>This isn't a new idea — from WinForms' XML descriptions to SwiftUI's declarative syntax, "describing UI with data" is a recurring theme. JSON Schema-driven UI is just a concrete instance of this idea in web frontend, particularly B2B products. Its value isn't in how technically advanced it is, but in: <strong>it transfers UI creation authority from developers to business users</strong>.</p>
+
+            <p style="margin-top: 30px; padding: 15px; background: #f6f8fa; border-radius: 4px;">
+                <strong>Previous:</strong> <a href="form-builder.html">Schema-Driven Forms (Part 1): Data Model and Renderer</a>
+            </p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

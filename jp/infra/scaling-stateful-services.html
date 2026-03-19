@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ステートフルサービスのスケーリング：方法論から Redis、Memcached、MySQL の実践まで - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>ステートフルサービスのスケーリング：方法論から Redis、Memcached、MySQL の実践まで</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/tempesta-rome-plan.jpg" alt="Plan of the City of Rome, Antonio Tempesta, 1645">
+                <figcaption>Antonio Tempesta,《ローマ市街図》, 1645 — 巨大な都市がいくつかの区域（Regiones）に分割され、各区域には独自の境界と管轄範囲がある。これは分散システムのシャーディングと相通じる：データは異なる Slot に分割され、各 Slot には明確な所属ノードがある。都市を拡張することとステートフルサービスを拡張することは、同じ問題に直面する：稼働を止めずにいかに境界を再分割するか</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：ステートレスサービスのスケーリングは簡単だ――マシンを追加してロードバランサーの後ろに配置すればいい。しかしステートフルサービス（データベース、キャッシュ、メッセージキュー）のスケーリングは分散システムにおける最も難しい問題の一つだ：データはどのマシンにあるのか？どう移動するのか？移動中のリクエストはどうするのか？この記事ではまず再利用可能な 5 ステップの方法論を提示し、次に Redis Cluster、Memcached、MySQL の 3 つの実際のシステムで各ステップがどう実装されているかを説明する。
+            </blockquote>
+
+            <h3>ステートフルサービスのスケーリングが難しい理由</h3>
+
+            <p>ステートレスサービスのスケーリングモデル：</p>
+
+<pre class="diagram"><code>  リクエスト ──► Load Balancer ──┬──► Server A
+                           ├──► Server B    どのサーバーでも処理可能
+                           └──► Server C    マシン追加で拡張</code></pre>
+
+            <p>ステートフルサービスのスケーリングモデル：</p>
+
+<pre class="diagram"><code>  リクエスト (user_id=42)
+    │
+    │  このリクエストは user_id=42 のデータを持つマシンにしか送れない
+    │  任意に送ることはできない
+    ▼
+  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ Node A   │  │ Node B   │  │ Node C   │
+  │ id: 1-100│  │id:101-200│  │id:201-300│
+  └──────────┘  └──────────┘  └──────────┘
+
+  Node D を追加する場合：
+  - 誰のデータを移動するのか？
+  - 移動中の読み書きはどうルーティングするのか？
+  - 移動の途中でクラッシュしたらどうするのか？</code></pre>
+
+            <p>本質的な問題は<strong>データに所有権がある</strong>ことだ。ステートフルサービスのスケーリング = サービスを停止せずにデータの所有権を再分配すること。</p>
+
+            <h3>方法論：5 ステップスケーリングモデル</h3>
+
+            <h4>ステップ 1：シャーディング戦略――Key から Node へのマッピング</h4>
+
+            <p>最も直感的な方法は <code>hash(key) % N</code> で N 台のマシンに直接マッピングすることだ。しかしマシンを 1 台追加すると N が N+1 になり、<strong>ほぼすべての key のマッピングが変わる</strong>――つまり全データの移行が必要になる。</p>
+
+            <p>解法は<strong>論理スロット（Virtual Slot）</strong>という中間層を追加すること：</p>
+
+<pre class="diagram"><code>  悪い設計：Key → Node（直接マッピング）
+  hash(key) % 3 = Node A
+  hash(key) % 4 = Node B  ← マシン 1 台追加で、ほぼ全 key の移動が必要
+
+  良い設計：Key → Slot → Node（2 層マッピング）
+  hash(key) % 16384 = Slot 5742    ← この層は永久に変わらない
+  Slot 5742 → Node A               ← Slot の所属を移動するだけ
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Key Space                                               │
+  │  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐     │
+  │  │Slot │Slot │Slot │Slot │Slot │Slot │Slot │ ... │     │
+  │  │  0  │  1  │  2  │  3  │  4  │  5  │  6  │     │     │
+  │  └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴─────┘     │
+  │     │     │     │     │     │     │                      │
+  │     ▼     ▼     ▼     ▼     ▼     ▼                      │
+  │   Node A        Node B        Node C                     │
+  │  Slot 0,1,2    Slot 3,4      Slot 5,6                   │
+  └─────────────────────────────────────────────────────────┘
+
+  拡張：Slot 2 を Node A から Node D に移動
+  - Key から Slot へのマッピングは変わらない
+  - Slot から Node へのマッピングのみ変更
+  - Slot 2 のデータのみ移動</code></pre>
+
+            <p>Slot 数の選択：通常はマシン数の 100 倍以上。少なすぎると Slot の粒度が粗く均等に分配できない；多すぎるとメタデータのオーバーヘッドが増大する。Redis Cluster は 16384 を選択しており、実践で検証されたバランスポイントである。</p>
+
+            <h4>ステップ 2：コントロールプレーン――メタデータの保存場所</h4>
+
+            <p>「Slot X は Node A 上にある」というルーティングテーブルはどこかに保存する必要があり、すべての参加者が一貫したバージョンを参照できなければならない。</p>
+
+            <table>
+                <thead>
+                    <tr><th>方式</th><th>原理</th><th>利点</th><th>欠点</th><th>代表的システム</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Gossip</strong></td><td>ノード間で相互に伝播、結果整合性</td><td>単一障害点なし、自己修復</td><td>収束が遅い、スプリットブレインのリスク、複雑なスケジューリングが困難</td><td>Redis Cluster</td></tr>
+                    <tr><td><strong>中央集権型ストレージ</strong></td><td>etcd/ZooKeeper に権威あるメタデータを格納</td><td>強一貫性、オーケストレーションが容易</td><td>追加コンポーネントの運用が必要</td><td>TiDB PD、Vitess</td></tr>
+                    <tr><td><strong>設定サービス</strong></td><td>Mcrouter が設定ファイルからルーティングテーブルを読み取り</td><td>極めてシンプル、ランタイム依存なし</td><td>変更にはプッシュが必要、動的スケーリングに不向き</td><td>Memcached + Mcrouter</td></tr>
+                </tbody>
+            </table>
+
+            <p>2026 年のトレンド：<strong>中央集権型コントロールプレーン + K8s Operator</strong> が主流。etcd が強一貫性のメタデータストレージを提供し、Operator がスケーリング、フェイルオーバー、データ移行などの操作を自動化する。Gossip プロトコルは障害検出（ノードダウンの迅速な発見）には引き続き使われるが、ルーティング決定は担わなくなっている。</p>
+
+            <h4>ステップ 3：ルーティング層――リクエストが正しいノードを見つける方法</h4>
+
+<pre class="diagram"><code>  方式 A: Smart Client                方式 B: Proxy
+
+  ┌──────────┐                        ┌──────────┐
+  │  Client   │                        │  Client   │
+  │ 内蔵 Slot │                        │ Proxy の  │
+  │  Map キャッシュ│                    │ アドレスのみ│
+  └─────┬────┘                        └─────┬────┘
+        │ ターゲットノードに直接接続          │
+        │ レイテンシ: 1 hop                  ▼
+        │                             ┌──────────┐
+        │                             │  Proxy    │
+        │                             │ (Mcrouter │
+        │                             │  /Envoy)  │
+        │                             └─────┬────┘
+        │                                   │ 転送
+        ▼                                   ▼
+  ┌────────────────────────────────────────────┐
+  │  Node A    Node B    Node C    Node D      │
+  └────────────────────────────────────────────┘</code></pre>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Smart Client</th><th>Proxy</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>レイテンシ</strong></td><td>最低（直接接続）</td><td>1 ホップ追加</td></tr>
+                    <tr><td><strong>クライアント複雑度</strong></td><td>高（各言語で実装が必要）</td><td>低（Proxy アドレスを知るだけ）</td></tr>
+                    <tr><td><strong>ルーティングロジック更新</strong></td><td>全クライアントのアップグレードが必要</td><td>Proxy のみアップグレード</td></tr>
+                    <tr><td><strong>追加機能</strong></td><td>なし</td><td>レート制限、カナリア、モニタリング、コネクションプール</td></tr>
+                    <tr><td><strong>適用シナリオ</strong></td><td>言語統一、レイテンシ重視</td><td>多言語、運用優先</td></tr>
+                </tbody>
+            </table>
+
+            <p>大規模本番環境では Proxy モデルが好まれる。数十種類のプログラミング言語のクライアントがある場合、各言語に複雑なスマートクライアントを維持することは不可能だ。Proxy がルーティングロジックを集中管理し、クライアントはプロトコルを話せるだけでよい。</p>
+
+            <h4>ステップ 4：レプリカと可用性――データは 1 つだけでは不十分</h4>
+
+            <p>シャーディングは容量の問題を解決するが、各シャードは依然として単一障害点だ。レプリカが可用性を解決する：</p>
+
+<pre class="diagram"><code>  Slot 0-5461              Slot 5462-10922          Slot 10923-16383
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │ Master A     │         │ Master B     │         │ Master C     │
+  │ (読み書き)   │         │ (読み書き)   │         │ (読み書き)   │
+  └──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+         │ 非同期レプリケーション  │ 非同期レプリケーション  │ 非同期レプリケーション
+         ▼                        ▼                        ▼
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │ Replica A'   │         │ Replica B'   │         │ Replica C'   │
+  │ (読み取り専用)│         │ (読み取り専用)│         │ (読み取り専用)│
+  └──────────────┘         └──────────────┘         └──────────────┘</code></pre>
+
+            <p>フェイルオーバーの標準フロー：</p>
+            <ol>
+                <li>Master A のダウンを検出（ハートビートタイムアウト / Gossip 投票 / コントロールプレーン監視）</li>
+                <li>レプリカから新しい Master を選出（レプリケーション進捗が最も近いものを選択）</li>
+                <li><strong>重要なステップ</strong>：コントロールプレーンのメタデータを更新――Slot 0-5461 の Owner を A から A' に変更</li>
+                <li>ルーティング層に通知（Proxy がルーティングテーブルを更新 / Client が Slot Map をリフレッシュ）</li>
+                <li>新 Master A' が読み書きの受け入れを開始</li>
+            </ol>
+
+            <p>レプリケーションモードの選択：</p>
+
+            <table>
+                <thead>
+                    <tr><th>モード</th><th>一貫性</th><th>レイテンシ</th><th>可用性</th><th>代表的システム</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>非同期レプリケーション</strong></td><td>データ損失の可能性あり</td><td>最低</td><td>最高</td><td>Redis、Memcached</td></tr>
+                    <tr><td><strong>半同期レプリケーション</strong></td><td>少なくとも 1 レプリカが確認</td><td>中程度</td><td>高</td><td>MySQL Semi-sync</td></tr>
+                    <tr><td><strong>Raft/Paxos</strong></td><td>多数派確認、強一貫性</td><td>やや高い</td><td>中程度</td><td>TiKV、CockroachDB</td></tr>
+                </tbody>
+            </table>
+
+            <h4>ステップ 5：データ移行――飛行中にエンジンを交換する</h4>
+
+            <p>これが最も難しいステップだ。新しいマシンを追加した後、一部の Slot を旧ノードから新ノードに移動する必要があるが、<strong>同時にオンラインサービスを中断してはならない</strong>。</p>
+
+<pre class="diagram"><code>  Slot 3 を Node A → Node D に移行：
+
+  フェーズ 1: 移行状態のマーク
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Slot 3:  │                    │ Slot 3:  │
+  │ MIGRATING│                    │ IMPORTING│
+  └──────────┘                    └──────────┘
+
+  フェーズ 2: 全量スナップショット転送
+  ┌──────────┐  ══ スナップショットデータ ══►   ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ サービス  │                    │ データ    │
+  │ 継続      │                    │ 受信中    │
+  └──────────┘                    └──────────┘
+
+  フェーズ 3: 増分追い付き
+  ┌──────────┐  ── 増分ログ ──►   ┌──────────┐
+  │ Node A   │  (移行中の新規書込) │ Node D   │
+  │ サービス  │                    │ 追い付き中│
+  │ 継続      │                    │          │
+  └──────────┘                    └──────────┘
+
+  フェーズ 4: アトミック切り替え (重要な瞬間)
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Slot 3 の│  ← 短時間の書込停止 │ 追い付き  │
+  │ 書込を停止│  (通常数ミリ秒)     │ 完了!    │
+  └──────────┘                    └──────────┘
+       │
+       │  コントロールプレーン更新: Slot 3 → Node D
+       │  ルーティング層リフレッシュ
+       ▼
+  ┌──────────┐                    ┌──────────┐
+  │ Node A   │                    │ Node D   │
+  │ Slot 3   │                    │ Slot 3:  │
+  │ データ削除│                    │ 通常サービス│
+  └──────────┘                    └──────────┘</code></pre>
+
+            <p>フェーズ 4 がプロセス全体で最も危険な瞬間である。増分ログが追い付けない場合（書き込みが速すぎる）、ブロック時間が延び、オンラインサービスに影響する。2 つの対処戦略：</p>
+
+            <ul>
+                <li><strong>書き込み制限</strong>：追い付きフェーズで該当 Slot への書き込みを制限し、書き込み速度を下げて増分の追い付きを可能にする</li>
+                <li><strong>デュアルライトモード</strong>：切り替え期間中に両方のノードに同時書き込み、ブロックしないがロジックが複雑になり、競合処理が必要</li>
+            </ul>
+
+            <h3>実践：Redis Cluster のスケーリング</h3>
+
+            <table>
+                <thead>
+                    <tr><th>ステップ</th><th>Redis Cluster の実装</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>シャーディング</strong></td><td>16384 Slot、<code>CRC16(key) % 16384</code></td></tr>
+                    <tr><td><strong>コントロールプレーン</strong></td><td>分散型 Gossip。各ノードが完全な Slot Map を維持し、Gossip プロトコルで同期</td></tr>
+                    <tr><td><strong>ルーティング</strong></td><td>Smart Client。クライアントが Slot Map をキャッシュし、ターゲットノードに直接接続。間違えた場合、ノードが <code>MOVED</code> リダイレクトを返却</td></tr>
+                    <tr><td><strong>レプリカ</strong></td><td>各 Master に 1-N 個の Replica を配置、非同期レプリケーション。フェイルオーバーは Gossip 投票で新 Master を選出</td></tr>
+                    <tr><td><strong>移行</strong></td><td><code>CLUSTER SETSLOT</code> + <code>MIGRATE</code> コマンド、Key ごとに移行</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Redis 移行の詳細</h4>
+
+<pre><code># 1. 移行状態のマーク
+CLUSTER SETSLOT 3 MIGRATING target-node-id   # ソースノードでマーク
+CLUSTER SETSLOT 3 IMPORTING source-node-id   # ターゲットノードでマーク
+
+# 2. Key ごとに移行（Redis にはスナップショット移行がなく、1 つずつ移動）
+CLUSTER GETKEYSINSLOT 3 100                  # Slot 3 の 100 個の Key を取得
+MIGRATE target-host 6379 "" 0 5000 KEYS key1 key2 key3 ...
+
+# 3. 切り替え完了
+CLUSTER SETSLOT 3 NODE target-node-id        # すべてのノードで実行</code></pre>
+
+            <p>Redis 移行の特徴と制限：</p>
+            <ul>
+                <li><strong>Key ごとの移行</strong>であり、スナップショットではない。大きな Key（百万要素の Hash など）の移行時にソースノードがブロックされる</li>
+                <li>移行中、ソースノードは MIGRATING Slot に対して：Key がまだローカルにある → 通常処理；Key がすでに移動済み → <code>ASK</code> リダイレクトをターゲットノードに返却</li>
+                <li>Gossip の収束が遅い――大規模クラスタ（200+ ノード）では、1 回の Slot 変更がすべてのノードに伝播するのに数秒かかる可能性がある</li>
+                <li><strong>増分ログがない</strong>：Key の移行はアトミック（MIGRATE は DEL + RESTORE）で、「移行中に Key が変更される」問題は存在しないが、代償として大きな Key の移行がブロックする</li>
+            </ul>
+
+            <h4>Redis 拡張の実際の操作</h4>
+
+<pre class="diagram"><code>  拡張前: 3 Master、各 ~5461 Slots
+
+  Master A: Slot 0-5460
+  Master B: Slot 5461-10922
+  Master C: Slot 10923-16383
+
+  Master D を追加、A/B/C から各々一部の Slot を移動：
+
+  Master A: Slot 0-4095          (1366 Slot を移出)
+  Master B: Slot 5461-9556       (1366 Slot を移出)
+  Master C: Slot 10923-15017     (1366 Slot を移出)
+  Master D: Slot 4096-5460,      (4098 Slot を受入)
+            9557-10922,
+            15018-16383
+
+  redis-cli --cluster reshard が上記プロセスを自動完了</code></pre>
+
+            <h3>実践：Memcached のスケーリング</h3>
+
+            <table>
+                <thead>
+                    <tr><th>ステップ</th><th>Memcached の実装</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>シャーディング</strong></td><td>クライアント側コンシステントハッシュ（Consistent Hashing）。Slot の概念はなく、ハッシュリング上の仮想ノード</td></tr>
+                    <tr><td><strong>コントロールプレーン</strong></td><td>なし。Memcached サーバー間は完全に通信せず、互いの存在を知らない</td></tr>
+                    <tr><td><strong>ルーティング</strong></td><td>純粋なクライアントルーティング。Mcrouter（Proxy モード）または libmemcached（Smart Client モード）</td></tr>
+                    <tr><td><strong>レプリカ</strong></td><td>デフォルトではなし。Mcrouter で shadow/replica pool を設定して読み取りレプリカを構成可能</td></tr>
+                    <tr><td><strong>移行</strong></td><td>移行しない。キャッシュ miss 後にオリジンから再構築</td></tr>
+                </tbody>
+            </table>
+
+            <p>Memcached のスケーリング哲学は Redis とまったく異なる――自身を<strong>純粋なキャッシュ</strong>として位置づけており、データストレージではない：</p>
+
+            <h4>コンシステントハッシュ：マシン追加時に隣接ノードのみ影響</h4>
+
+<pre class="diagram"><code>  ハッシュリング (0 ~ 2^32)
+
+        Node A                    Node A
+       ╱      ╲                  ╱      ╲
+      ╱   key1  ╲               ╱   key1  ╲
+  Node D ─── Node B    →    Node D ─── Node B
+      ╲        ╱               ╲    ↑   ╱
+       ╲      ╱                 ╲ Node E╱    ← 新規参加
+        Node C                   Node C
+
+  Node E 参加：
+  - Node B と Node E の間の key のみ再マッピングが必要
+  - 他の key はまったく影響を受けない
+  - データ移行は不要――キャッシュ miss 後に自然にオリジンから Node E に書き込まれる</code></pre>
+
+            <h4>Mcrouter：Memcached の「頭脳」</h4>
+
+            <p>Memcached 自体はシンプルで、すべてのインテリジェンスは Mcrouter（Meta がオープンソースにした Proxy）にある：</p>
+
+            <ul>
+                <li><strong>コンシステントハッシュルーティング</strong>：key がどの Memcached に行くべきかを計算</li>
+                <li><strong>障害処理</strong>：ノードダウン時にリングから自動除外し、key が次のノードに自動再マッピング</li>
+                <li><strong>段階的切り替え</strong>：設定ファイルでルーティングルールを更新し、段階的にトラフィックを新クラスタに切り替え可能</li>
+                <li><strong>コネクションプール</strong>：フロントエンドの数千のクライアント接続を、Memcached への少数の長時間接続に多重化</li>
+                <li><strong>コールドスタートウォームアップ</strong>：新クラスタ起動時、読み取り miss を自動的に旧クラスタに問い合わせ、同時に新クラスタに書き込み</li>
+            </ul>
+
+<pre><code>// Mcrouter ルーティング設定例
+{
+  "pools": {
+    "A": { "servers": ["mc1:11211", "mc2:11211", "mc3:11211"] },
+    "B": { "servers": ["mc4:11211", "mc5:11211", "mc6:11211"] }
+  },
+  "route": {
+    "type": "WarmUpRoute",          // コールドスタートウォームアップ
+    "cold": "PoolRoute|B",          // 新クラスタ
+    "warm": "PoolRoute|A",          // 旧クラスタ（miss 時にフォールバック）
+    "exptime": 180
+  }
+}</code></pre>
+
+            <p>Memcached 拡張の核心思想：<strong>データを移動せず、キャッシュの自己修復に頼る</strong>。マシン追加 → Mcrouter 設定を更新 → 新しい key は自動的に新ノードにルーティング → 古い key は miss 後にオリジンから再構築。代償は拡張直後の短期間のキャッシュヒット率低下（コールドスタート）だが、キャッシュシナリオでは許容できる。</p>
+
+            <h3>実践：MySQL のスケーリング</h3>
+
+            <table>
+                <thead>
+                    <tr><th>ステップ</th><th>MySQL の実装</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>シャーディング</strong></td><td>アプリケーション層シャーディング（ShardingSphere）またはミドルウェアシャーディング（Vitess）。user_id や order_id でモジュロ</td></tr>
+                    <tr><td><strong>コントロールプレーン</strong></td><td>Vitess: etcd にトポロジーを格納。ShardingSphere: ZooKeeper/etcd</td></tr>
+                    <tr><td><strong>ルーティング</strong></td><td>Vitess: VTGate (Proxy)。ShardingSphere: Proxy または JDBC Driver (Smart Client) を選択可</td></tr>
+                    <tr><td><strong>レプリカ</strong></td><td>InnoDB 半同期レプリケーション / Group Replication / Raft (TiDB)</td></tr>
+                    <tr><td><strong>移行</strong></td><td>Binlog ベースの増分レプリケーション + アトミック切り替え</td></tr>
+                </tbody>
+            </table>
+
+            <p>MySQL のスケーリングは Redis や Memcached よりはるかに複雑だ。<strong>トランザクション、JOIN、外部キー</strong>などのリレーショナルセマンティクスが関わるからだ。</p>
+
+            <h4>Vitess：YouTube で検証済みの MySQL スケーリングソリューション</h4>
+
+<pre class="diagram"><code>  Application
+      │
+      ▼
+  ┌──────────┐     ┌───────────────┐
+  │ VTGate   │────►│ Topology      │  etcd が格納:
+  │ (Proxy)  │     │ Server (etcd) │  - Keyspace → Shard マッピング
+  └────┬─────┘     └───────────────┘  - Shard → Tablet マッピング
+       │                               - Tablet ロール (Master/Replica)
+       │  SQL ルーティング
+       │
+  ┌────┼──────────────────────────────────────────┐
+  │    │  Keyspace: user_db                        │
+  │    │                                           │
+  │    ├──► Shard -80     ──► vttablet ──► MySQL A │  user_id < 0x80
+  │    │    (Master)                                │
+  │    │    Shard -80     ──► vttablet ──► MySQL A' │  (Replica)
+  │    │                                           │
+  │    └──► Shard 80-     ──► vttablet ──► MySQL B │  user_id >= 0x80
+  │         (Master)                                │
+  │         Shard 80-     ──► vttablet ──► MySQL B' │  (Replica)
+  └────────────────────────────────────────────────┘</code></pre>
+
+            <h4>MySQL シャード移行：Binlog ベース</h4>
+
+            <p>MySQL のデータ移行は本質的に PG のストリーミングレプリケーションと同じパターンだ――<strong>全量スナップショット + 増分ログ追い付き</strong>：</p>
+
+            <ol>
+                <li><strong>全量スナップショット</strong>：ソース Shard に対して <code>mysqldump</code> または Xtrabackup 物理スナップショットを取得し、新ノードに転送</li>
+                <li><strong>増分追い付き</strong>：スナップショット時の Binlog ポジションから Binlog の消費を継続し、新ノードに適用。このステップは PG の WAL replay と同様</li>
+                <li><strong>検証</strong>：ソースとターゲットのデータ一貫性を比較（Vitess の VDiff）</li>
+                <li><strong>アトミック切り替え</strong>：短時間の書き込み停止 → Binlog の追い付き完了を待機 → トポロジー更新 → 書き込み再開</li>
+            </ol>
+
+            <p>Vitess の <code>Reshard</code> コマンドがこのフローを自動化する。鍵は <code>VReplication</code> エンジン――単純に Binlog をリプレイするのではなく、<strong>シャーディングルールでフィルタリング</strong>する：ターゲット Shard に属する行変更のみを適用する。</p>
+
+            <h4>MySQL スケーリングの特殊な課題</h4>
+
+            <ul>
+                <li><strong>クロスシャード JOIN</strong>：<code>SELECT * FROM orders JOIN users ON orders.user_id = users.id</code>、orders と users が異なる Shard にある場合、Proxy が個別にクエリして結果をマージする必要がある。性能が急激に低下</li>
+                <li><strong>クロスシャードトランザクション</strong>：2 フェーズコミット（2PC）が必要で、Vitess は VTGate で調整するが、性能と信頼性は単一シャードトランザクションに及ばない</li>
+                <li><strong>シャードキーの選択</strong>：一度決定したら（例：user_id）、変更はほぼ不可能。間違った選択（例：order_id でシャーディングしたが user_id で頻繁にクエリ）は大量のクロスシャードクエリを引き起こす</li>
+                <li><strong>ホットスポット問題</strong>：一人の大口顧客（user_id=1）のデータ量が他のユーザーをはるかに超える場合、その Shard がホットスポットになる。解法：その Shard をさらに分割するか、アプリケーション層で特別な処理を行う</li>
+            </ul>
+
+            <h3>3 つのシステムの比較</h3>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Redis Cluster</th><th>Memcached + Mcrouter</th><th>MySQL + Vitess</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>位置づけ</strong></td><td>データストレージ + キャッシュ</td><td>純粋なキャッシュ</td><td>永続データストレージ</td></tr>
+                    <tr><td><strong>シャーディング方式</strong></td><td>16384 Slot</td><td>コンシステントハッシュ</td><td>Range または Hash シャーディング</td></tr>
+                    <tr><td><strong>コントロールプレーン</strong></td><td>Gossip (分散型)</td><td>なし (設定駆動)</td><td>etcd (中央集権型)</td></tr>
+                    <tr><td><strong>ルーティング</strong></td><td>Smart Client + MOVED</td><td>Mcrouter (Proxy)</td><td>VTGate (Proxy)</td></tr>
+                    <tr><td><strong>移行方式</strong></td><td>Key ごとに移動</td><td>移行しない、キャッシュ自己修復</td><td>スナップショット + Binlog 増分</td></tr>
+                    <tr><td><strong>移行のビジネス影響</strong></td><td>大 Key のブロック</td><td>短期的な miss 率上昇</td><td>短時間の書き込み停止 (ミリ秒レベル)</td></tr>
+                    <tr><td><strong>拡張の複雑さ</strong></td><td>中程度</td><td>低</td><td>高</td></tr>
+                    <tr><td><strong>データ損失リスク</strong></td><td>非同期レプリケーションで損失の可能性</td><td>もともとキャッシュ</td><td>半同期/Raft で保証</td></tr>
+                </tbody>
+            </table>
+
+            <h3>まとめ</h3>
+
+            <p>ステートフルサービスを拡張する 5 ステップモデル：</p>
+
+            <ol>
+                <li><strong>シャーディング</strong>：Key → Slot → Node の 2 層マッピング、Slot 数 = マシン数 × 100+</li>
+                <li><strong>コントロールプレーン</strong>：ルーティングテーブルの保存場所、権威ある情報源は誰か。トレンドは etcd + Operator</li>
+                <li><strong>ルーティング</strong>：Smart Client（低レイテンシ）vs Proxy（運用しやすい）。多言語環境では Proxy を選択</li>
+                <li><strong>レプリカ</strong>：非同期（高速だが損失の可能性）vs 半同期（バランス）vs Raft（強一貫性だが低速）</li>
+                <li><strong>移行</strong>：全量スナップショット + 増分ログ + アトミック切り替え。鍵は切り替えの瞬間の処理戦略</li>
+            </ol>
+
+            <p>3 つの異なるレベルの実践：</p>
+
+            <ul>
+                <li><strong>Memcached</strong>：最もシンプル――データを移動せず、キャッシュ miss の自己修復に頼る。純粋なキャッシュシナリオに適合</li>
+                <li><strong>Redis</strong>：中程度の複雑さ――Key ごとに移行、Gossip 協調。キャッシュと軽量ストレージの両方に適合</li>
+                <li><strong>MySQL</strong>：最も複雑――スナップショット + Binlog 増分、さらにクロスシャード JOIN とトランザクションの処理が必要。永続化リレーショナルデータに適合</li>
+            </ul>
+
+            <p>具体的なシステムがどう変わっても、5 ステップモデルは普遍的だ。次に新しいステートフルシステムを拡張する必要がある時は、まずこの 5 つの質問をしよう：どうシャーディングするか、メタデータをどこに保存するか、リクエストをどうルーティングするか、レプリカをどうするか、データをどう移動するか。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>从 CPU 到 GPU：LLM 推理引擎的 CUDA 优化之路 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>从 CPU 到 GPU：LLM 推理引擎的 CUDA 优化之路</h2>
+            <time>2026-03-18</time>
+
+            <div class="series-nav">
+                <strong>Series:</strong> LLM Inference Engine<br>
+                <a href="llm-inference-engine.html">Part 1: 从零到生成 &mdash; 纯 C++ 手搓推理引擎</a><br>
+                <span class="current">Part 2: 从 CPU 到 GPU &mdash; CUDA 优化之路 (本篇)</span>
+            </div>
+
+            <figure class="post-cover">
+                <img src="../../images/charlie-chaplin-modern-times.jpg" alt="Charlie Chaplin, Modern Times (1936)">
+                <figcaption>Charlie Chaplin,《摩登时代》, 1936 &mdash; 从手工到机器的加速</figcaption>
+            </figure>
+
+            <h3>引言</h3>
+
+            <p><a href="llm-inference-engine.html">上一篇</a>我们用纯 C++ 从零搭建了一个 LLM 推理引擎，能跑 Qwen2.5-0.5B。当时在 CPU（OpenBLAS + INT8 量化）上跑到了 33 tok/s。</p>
+
+            <p>这篇文章记录接下来的优化过程：把引擎搬上 GPU，一步步从 33 tok/s 做到 <strong>504 tok/s</strong>。每一步优化都有明确的 profiling 数据驱动，不靠猜。</p>
+
+            <p>优化路径总览：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>阶段</th>
+                        <th>Decode 吞吐</th>
+                        <th>提升</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>CPU BLAS + INT8</td>
+                        <td>33 tok/s</td>
+                        <td>baseline</td>
+                    </tr>
+                    <tr>
+                        <td>CUDA + cuBLAS + INT8</td>
+                        <td>110 tok/s</td>
+                        <td>3.3&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ FP16 inference</td>
+                        <td>153 tok/s</td>
+                        <td>4.6&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ Flash Attention</td>
+                        <td>161 tok/s</td>
+                        <td>4.9&times;</td>
+                    </tr>
+                    <tr>
+                        <td>+ GPU-resident sampling</td>
+                        <td>161 tok/s</td>
+                        <td>-</td>
+                    </tr>
+                    <tr>
+                        <td>+ CUDA caching allocator</td>
+                        <td><strong>504 tok/s</strong></td>
+                        <td><strong>15.3&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>最后一步（caching allocator）带来了最大的提升，但如果不是 <code>nsys</code> profiling 揭示了真正的瓶颈，我根本不会想到去优化内存分配。这是这篇文章最想传达的一点：<strong>先 profile，再优化</strong>。</p>
+
+            <h3>Step 1: CUDA 后端 &mdash; 把计算搬上 GPU</h3>
+
+            <p>上一篇的 Backend 抽象在这里发挥了作用。新建一个 <code>BackendCUDA</code> 子类，实现同样的接口，背后换成 CUDA kernel：</p>
+
+<pre><code>class BackendCUDA : public BackendCPU {
+public:
+    void linear(float* out, const float* inp, const float* weight,
+                const float* bias, std::size_t M, std::size_t N,
+                std::size_t K) override;
+    void rms_norm(...) override;
+    void rope(...) override;
+    void causal_attention(...) override;
+    // ... 所有算子都有 GPU 实现
+};</code></pre>
+
+            <p>核心设计：</p>
+
+            <ul>
+                <li><strong>权重缓存</strong>：权重第一次使用时上传到 GPU（<code>cudaMemcpy H2D</code>），之后直接复用 device pointer。一个 <code>unordered_map&lt;host_ptr, device_ptr&gt;</code> 搞定。</li>
+                <li><strong>cuBLAS GEMM</strong>：线性投影用 <code>cublasGemmEx</code>（FP16 输入 &times; FP16 权重 &rarr; FP32 输出），利用 Tensor Core 加速。</li>
+                <li><strong>GPU-resident KV Cache</strong>：KV 缓存直接在 GPU 上分配和增长，attention 读写不过 PCIe。每个 decode step 省了 96 次 memcpy（2 tensor &times; 2 KV &times; 24 层）。</li>
+                <li><strong>INT8 &rarr; FP16 dequant</strong>：INT8 权重上传到 GPU 后，用一个 kernel 解量化到 FP16，然后做 FP16 GEMM。</li>
+            </ul>
+
+            <p>效果：从 CPU BLAS 的 33 tok/s 到 CUDA 的 <strong>110 tok/s</strong>，3.3 倍。</p>
+
+            <h3>Step 2: FP16 全链路推理</h3>
+
+            <p>第一版 CUDA 后端的数据流是：FP32 中间结果 &rarr; 转 FP16 &rarr; cuBLAS GEMM &rarr; FP32 输出。中间有大量 FP32&harr;FP16 转换。</p>
+
+            <p>优化思路：<strong>让所有中间 Tensor 都是 FP16</strong>。embedding 输出转 FP16 后，整个 pipeline（RMSNorm、RoPE、Attention、MLP）都在 FP16 上跑，只在最后输出 logits 时转回 FP32。</p>
+
+            <p>为每个 kernel 写了 FP16 版本。以 RMSNorm 为例，内部用 FP32 做累加避免精度损失：</p>
+
+<pre><code>__global__ void rms_norm_fp16_kernel(half* out, const half* x,
+                                      const half* weight, size_t n,
+                                      float eps) {
+    // 用 FP32 累加，避免精度损失
+    float local_sum = 0.0f;
+    for (size_t i = tid; i &lt; n; i += stride) {
+        float v = __half2float(x[i]);
+        local_sum += v * v;
+    }
+    // ... reduction ...
+    float rms = sqrtf(sdata[0] / n + eps);
+
+    for (size_t i = tid; i &lt; n; i += stride) {
+        out[i] = __float2half(
+            __half2float(x[i]) / rms * __half2float(weight[i]));
+    }
+}</code></pre>
+
+            <p>这里有一个坑：<strong>Sampler 也需要知道 logits 的数据类型</strong>。我们把 logits 从 FP16 转成 FP32 再传给 sampler，但 sampler 内部有一个 <code>fp16</code> 标志位告诉 GPU sampling kernel 用什么精度读取。由于 logits 已经是 FP32 了，这个标志位应该永远是 0&mdash;&mdash;但代码错误地根据 <code>backend.is_fp16()</code> 设置了它。</p>
+
+            <p>结果：FP16 模式下输出全是乱码。INT8 FP32 正常，FP16 乱码&mdash;&mdash;因为 sampling kernel 把 FP32 数据当 FP16 读了，每对字节被错误解释为一个 half float。</p>
+
+            <p>修复一行代码：</p>
+
+<pre><code>// Before (bug):
+int fp16 = backend_.is_fp16() ? 1 : 0;
+return cuda_sample(d_logits_, logits.size(), ..., fp16);
+
+// After (fix):
+// Logits are always FP32 (converted in transformer_forward)
+return cuda_sample(d_logits_, logits.size(), ..., /*fp16=*/0);</code></pre>
+
+            <p>教训：<strong>数据类型在管道中的每一个环节都要对齐</strong>。一个地方转了 FP32，下游如果还按 FP16 读，就是灾难。</p>
+
+            <p>FP16 全链路打通后：110 tok/s &rarr; <strong>153 tok/s</strong>，+39%。带宽减半 + Tensor Core 利用率提升。</p>
+
+            <h3>Step 3: Flash Attention</h3>
+
+            <p>旧的 attention kernel 把完整的 <code>scores[attend_len]</code> 数组存在 shared memory 里。这有两个问题：</p>
+
+            <ol>
+                <li>Shared memory 大小随序列长度线性增长，~12K tokens 就爆了（48KB 限制）</li>
+                <li>必须先算完所有 QK<sup>T</sup> score，才能做 softmax，才能算 V 加权&mdash;&mdash;三步串行</li>
+            </ol>
+
+            <p>Flash Attention 的核心洞察：<strong>softmax 可以增量计算</strong>。每次只处理一小块（128 个 KV position），用两个标量 <code>running_max</code> 和 <code>running_sum</code> 来修正历史累积值：</p>
+
+<pre><code>// 主循环：每次处理 128 个 KV position
+for (tile_start = 0; tile_start &lt; attend_len; tile_start += 128) {
+
+    // 1. 只算这 128 个 score &rarr; shared memory (512 bytes)
+    for (t in tile)
+        scores[t] = dot(q, k[t]) * scale;
+
+    // 2. 找这个 tile 的 max
+    tile_max = reduce_max(scores);
+
+    // 3. 修正历史（Flash Attention 的精华）
+    new_max = max(running_max, tile_max);
+    correction = exp(running_max - new_max);
+    running_sum *= correction;
+    out_acc *= correction;       // 修正之前所有 tile 的累积值
+
+    // 4. 累加当前 tile
+    for (t in tile) {
+        e = exp(scores[t] - new_max);
+        running_sum += e;
+        out_acc += e * v[t];     // 加权 V 累积
+    }
+    running_max = new_max;
+}
+
+// 最终归一化
+out = out_acc / running_sum;</code></pre>
+
+            <p>为什么 <code>correction</code> 能正确修正？数学上：</p>
+
+<pre class="diagram"><code>exp(score - old_max) &times; exp(old_max - new_max) = exp(score - new_max)
+
+所以把所有历史累积值乘以 correction，等价于用 new_max 重新算了一遍。</code></pre>
+
+            <p>Shared memory 从 <code>(attend_len + 256) &times; 4</code> 变成 <strong>常量 1536 字节</strong>，不管序列多长。</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>attend_len</th>
+                        <th>旧 kernel smem/head</th>
+                        <th>Flash Attention smem/head</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td>54</td><td>1.2 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>448</td><td>2.8 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>4096</td><td>17.0 KB</td><td><strong>1.5 KB</strong></td></tr>
+                    <tr><td>12288</td><td>49.0 KB (OOM)</td><td><strong>1.5 KB</strong></td></tr>
+                </tbody>
+            </table>
+
+            <p>短序列性能基本持平（瓶颈不在 attention），但解锁了长上下文能力。Decode 吞吐在 50&ndash;750 token attend_len 范围内保持稳定在 ~161 tok/s。</p>
+
+            <h3>Step 4: GPU-Resident Sampling</h3>
+
+            <p>改完 Flash Attention 之后，我用 <code>nsys</code> 检查数据流，发现了一个不必要的 CPU roundtrip：</p>
+
+<pre class="diagram"><code>GPU: FP16 logits &rarr; fp16_to_fp32 &rarr; FP32 logits
+                                          &darr; cudaMemcpy D2H (593KB)
+CPU: std::vector&lt;float&gt; logits
+                                          &darr; cudaMemcpy H2D (593KB)
+GPU: sample_kernel &rarr; token ID</code></pre>
+
+            <p>Qwen2.5-0.5B 的 vocab_size=151936，每次 decode 搬运 <strong>1.2MB</strong> 来回过 PCIe。</p>
+
+            <p>修复方案：让 <code>forward()</code> 返回 <code>Tensor</code>（GPU-resident）而不是 <code>std::vector&lt;float&gt;</code>。Sampler 直接从 GPU Tensor 采样：</p>
+
+<pre><code>// Before: forward() 下载到 CPU，sampler 再上传回 GPU
+std::vector&lt;float&gt; forward(model, token_ids, pos, kv_cache);
+sampler-&gt;sample(logits, step);  // 内部: H2D upload + sample kernel
+
+// After: logits 留在 GPU，sampler 直接用 device pointer
+Tensor forward(model, token_ids, pos, kv_cache);
+sampler-&gt;sample(logits, step);  // 直接: sample kernel on device ptr</code></pre>
+
+            <p>这个改动本身对 decode 吞吐影响不大（PCIe 传输相对于 kernel 计算时间很短），但代码更干净了&mdash;&mdash;而且为下一步优化铺了路。</p>
+
+            <h3>Step 5: nsys Profile &rarr; 发现真正的瓶颈 &rarr; CUDA Caching Allocator</h3>
+
+            <p>这是整篇文章最重要的一步。<strong>不是优化算法，而是用 profiling 工具发现了一个完全意想不到的瓶颈。</strong></p>
+
+            <p>跑一次 <code>nsys profile</code>：</p>
+
+<pre><code>nsys profile --trace=cuda,osrt --stats=true \
+  bazel-bin/bin/qwen/qwen \
+    --model models/Qwen2.5-0.5B \
+    --prompt "Once upon a time" \
+    --max_tokens 50 \
+    --backend cuda --quantize int8 --fp16</code></pre>
+
+            <p>CUDA API 时间分布：</p>
+
+<pre><code> Time (%)  Total Time (ns)  Num Calls   Name
+ --------  ---------------  ---------   ----
+     36.0%       216913486       1341   cudaFree           &larr; 36%!!
+     33.6%       202353991       2963   cudaMemcpy
+     17.3%       104017852      17773   cudaLaunchKernel   &larr; 实际计算
+      8.2%        49292731       1341   cudaMalloc         &larr; 8%</code></pre>
+
+            <p>看到这个数据我惊了：<strong>cudaMalloc + cudaFree 占了 44% 的 CUDA API 时间（266ms），比实际 GPU kernel 计算（104ms）还多 2.5 倍！</strong></p>
+
+            <p>为什么？因为 <code>cudaMalloc</code> 和 <code>cudaFree</code> 都是<strong>同步操作</strong>&mdash;&mdash;它们会阻塞 CPU 线程，等 GPU 上所有 pending kernel 执行完毕。这意味着每次分配/释放都强制同步了 GPU pipeline。</p>
+
+            <p>1341 次 malloc + 1341 次 free。哪来的？每次 <code>transformer_forward()</code> 创建 ~12 个临时 Tensor：</p>
+
+<pre><code>Tensor x({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor norm_out({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor q({seq_len * num_heads * head_dim}, DType::Float16, Device::CUDA);
+Tensor k_new({seq_len * kv_dim}, DType::Float16, Device::CUDA);
+Tensor v_new({seq_len * kv_dim}, DType::Float16, Device::CUDA);
+Tensor attn_out({seq_len * hidden}, DType::Float16, Device::CUDA);
+Tensor gate_up({seq_len * 2 * intermediate}, DType::Float16, Device::CUDA);
+Tensor gate({seq_len * intermediate}, DType::Float16, Device::CUDA);
+Tensor final_out({hidden}, DType::Float16, Device::CUDA);
+Tensor logits({vocab_size}, DType::Float16, Device::CUDA);
+// ... plus logits_fp32, x_fp32 for conversions</code></pre>
+
+            <p>函数返回时，这些 Tensor 的析构函数调用 <code>cudaFree</code>。54 次 forward &times; ~25 个 alloc/free &asymp; 1350 次。和 nsys 报告的 1341 完全吻合。</p>
+
+            <p>关键洞察：<strong>decode 阶段，每次 forward 的 Tensor shape 完全相同</strong>（seq_len=1）。每次都 malloc 同样大小的 buffer，用完 free，下一次又 malloc 同样大小&mdash;&mdash;这是纯浪费。</p>
+
+            <p><strong>修复：CUDA caching allocator</strong></p>
+
+            <p>核心思想极简：freed 的 GPU buffer 不真正释放，而是放入一个 free list（按 size 索引）。下次申请同样大小的 buffer 时，直接从 free list 取，O(1) 查找，零 GPU 同步：</p>
+
+<pre><code>// Free list: byte_size &rarr; [ptr, ptr, ...] (exact size matching)
+static std::multimap&lt;std::size_t, void*&gt; cuda_free_list_;
+
+// Live allocations: ptr &rarr; byte_size (for returning to correct bucket)
+static std::unordered_map&lt;void*, std::size_t&gt; cuda_alloc_sizes_;
+
+static void* cuda_pool_alloc(std::size_t bytes) {
+    auto it = cuda_free_list_.find(bytes);
+    if (it != cuda_free_list_.end()) {
+        void* ptr = it-&gt;second;
+        cuda_free_list_.erase(it);
+        cuda_alloc_sizes_.emplace(ptr, bytes);
+        return ptr;    // &larr; 命中！零 GPU 同步
+    }
+    void* ptr = cuda_malloc(bytes);  // miss: 真正分配
+    cuda_alloc_sizes_.emplace(ptr, bytes);
+    return ptr;
+}
+
+static void cuda_pool_free(void* ptr) {
+    auto it = cuda_alloc_sizes_.find(ptr);
+    if (it != cuda_alloc_sizes_.end()) {
+        cuda_free_list_.emplace(it-&gt;second, ptr);  // 回收到 free list
+        cuda_alloc_sizes_.erase(it);
+    } else {
+        cuda_free(ptr);  // 不是 pool 管理的 buffer，真正释放
+    }
+}</code></pre>
+
+            <p>30 行代码。插入到 <code>device_allocate()</code> 和 <code>device_deallocate()</code> 中，对上层完全透明。</p>
+
+            <p>第一次 forward 时，所有 Tensor 都 miss（cold start），走 <code>cudaMalloc</code>。函数返回时，buffer 进入 free list。第二次 forward 开始，所有同 size 的 Tensor 都 hit，直接复用&mdash;&mdash;零 cudaMalloc、零 cudaFree、零 GPU 同步。</p>
+
+            <p>修复后再跑一次 <code>nsys</code>：</p>
+
+<pre><code> Time (%)  Total Time (ns)  Num Calls   Name
+ --------  ---------------  ---------   ----
+      7.5%        45833654        751   cudaMalloc    &larr; -44% calls
+      7.3%        44586600        729   cudaFree      &larr; -79% time!
+     16.6%       101269184      17773   cudaLaunchKernel  &larr; 不变</code></pre>
+
+            <p>cudaFree 从 217ms 降到 45ms（-79%）。612 次分配被 pool 命中，完全避免了 GPU 同步。</p>
+
+            <p>性能结果：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>指标</th>
+                        <th>Before (无 pool)</th>
+                        <th>After (caching)</th>
+                        <th>提升</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Decode 吞吐</td>
+                        <td>153 tok/s</td>
+                        <td><strong>504 tok/s</strong></td>
+                        <td><strong>+3.3&times;</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Decode avg 延迟</td>
+                        <td>6.5 ms</td>
+                        <td><strong>2.0 ms</strong></td>
+                        <td>-69%</td>
+                    </tr>
+                    <tr>
+                        <td>Decode P50 延迟</td>
+                        <td>6.0 ms</td>
+                        <td><strong>1.6 ms</strong></td>
+                        <td>-73%</td>
+                    </tr>
+                    <tr>
+                        <td>cudaFree time</td>
+                        <td>217 ms</td>
+                        <td>45 ms</td>
+                        <td>-79%</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p><strong>3.3 倍加速，来自 30 行内存池代码。</strong>这就是 profiling 的价值&mdash;&mdash;不是猜瓶颈在算子上、在 attention 上、在 GEMM 上，而是让数据告诉你：最大的瓶颈竟然是 <code>cudaFree</code>。</p>
+
+            <h3>总结</h3>
+
+            <p>从 CPU 的 33 tok/s 到 GPU 的 504 tok/s，15 倍加速，整个过程的关键经验：</p>
+
+            <p><strong>1. Profile first, optimize second.</strong> 如果不跑 <code>nsys</code>，我可能会花几天优化 CUDA kernel 的 occupancy 或 shared memory 布局&mdash;&mdash;但实际瓶颈是 <code>cudaFree</code> 的 GPU 同步。数据不会骗你。</p>
+
+            <p><strong>2. 最大的提升往往来自最简单的修复。</strong> Flash Attention 实现花了几个小时，效果 +5%。caching allocator 写了 30 行，效果 +230%。复杂度和收益不成正比。</p>
+
+            <p><strong>3. 全链路思维。</strong> FP16 sampler bug 是一个端到端的类型对齐问题。GPU-resident sampling 是一个数据搬运问题。这些不是 kernel 级别的优化，而是系统级别的。要看整条管道，不能只盯着单个算子。</p>
+
+            <p><strong>4. 抽象层的价值不只是代码复用。</strong> Backend 抽象让 CPU/BLAS/CUDA 切换零侵入。Tensor 的 device_allocate/device_deallocate 抽象让 caching allocator 可以透明插入，不改任何上层代码。好的抽象让优化变得局部化。</p>
+
+            <p>整个项目现在是 6200 行 C++/CUDA，跑 Qwen2.5-0.5B 在 RTX 4060 上做到 504 tok/s decode。还有很多可以做的&mdash;&mdash;INT4 量化、prefill Q tiling、多请求 batching&mdash;&mdash;但核心的 profiling-driven optimization loop 已经建立起来了。</p>
+
+            <p><em>"Premature optimization is the root of all evil. But so is premature pessimism &mdash; profile, then decide."</em></p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

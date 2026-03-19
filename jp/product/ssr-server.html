@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSR Server を自作する：GraphQL アプリのためのカスタムサーバーサイドレンダリング - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>SSR Server を自作する：GraphQL アプリのためのカスタムサーバーサイドレンダリング</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/hokusai-great-wave.jpg" alt="The Great Wave off Kanagawa by Katsushika Hokusai">
+                <figcaption>葛飾北斎、《神奈川沖浪裏》、c. 1831 — 押し寄せる波涛は、ストリーミングレンダリングにおけるデータの奔流のようだ</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：Next.js は優れているが、技術スタックが Relay + GraphQL の場合、その SSR モデルは Relay の EntryPoint データプリロード哲学と衝突する。この記事ではゼロから SSR Server を自作した過程を記録する：ルーティングマッチング、データプリロード、ストリーミングレンダリング、Hydration、そして Relay の EntryPoint パターンをサーバーサイドで正しく動作させる方法。SSR 方案を深くカスタマイズする必要があるチームの参考になるだろう。
+            </blockquote>
+
+            <h3>背景</h3>
+
+            <p>Next.js は素晴らしいが、Relay（Meta の GraphQL クライアント）との統合はずっとスムーズとは言えない。Relay には独自のデータプリロード哲学——EntryPoint パターンがあり、ルーティングマッチング時にデータの fetch を開始し、コンポーネントのレンダリング時まで待たないことを望む。これは Next.js の <code>getServerSideProps</code> / Server Components のモデルと微妙に衝突する。</p>
+
+            <p>そこで自分で SSR server を書くことにした。Relay + Fluent UI の技術スタック向けに専用にカスタマイズした。この記事ではその過程の重要なステップと踏んだ落とし穴を記録する。</p>
+
+            <h3>全体アーキテクチャ</h3>
+
+<pre><code>浏览器请求 GET /pages/admin/42?sort=name
+    ↓
+Express Server
+    ↓
+路由匹配 (ssrrouter.lookup)
+    ↓ 返回 entrypoint 名称 + 参数绑定
+EntryPoint 解析
+    ↓ 根据名称找到 EntryPoint 配置
+GraphQL 数据预加载 (Relay loadQuery)
+    ↓
+React renderToPipeableStream (流式 SSR)
+    ↓
+HTML 流式响应 → 浏览器
+    ↓
+hydrateRoot (客户端接管)</code></pre>
+
+            <h3>第一歩：EntryPoint インターフェースの定義</h3>
+
+            <p>EntryPoint はアーキテクチャ全体のコア抽象である。各「ページ」は React コンポーネントではなく EntryPoint オブジェクトであり、何のコンポーネントをレンダリングするか、どのパラメータが必要か、どのデータをプリロードするかを記述する。</p>
+
+<pre><code>// EntryPoint.tsx
+interface EntryPoint&lt;TParams&gt; {
+  root: ComponentType&lt;PreloadedProps&gt;;
+  getParams: (path: string) =&gt; TParams;
+  getPreloadedProps: (params: TParams) =&gt; PreloadedProps;
+}
+
+interface PreloadedProps {
+  queries: {
+    [key: string]: {
+      query: GraphQLTaggedNode;
+      variables: Variables;
+    };
+  };
+}</code></pre>
+
+            <p>具体的な EntryPoint はこのようになる：</p>
+
+<pre><code>// App.entrypoint.tsx
+const AppEntryPoint: EntryPoint&lt;Params&gt; = {
+  root: App,
+  getParams: (path: string): Params =&gt; {
+    return { limit: 10 };
+  },
+  getPreloadedProps: (params: Params): PreloadedProps =&gt; {
+    return {
+      queries: {
+        preloadedQuery: {
+          query: AppQuery,        // Relay GraphQL query
+          variables: {},
+        },
+      },
+    };
+  },
+};</code></pre>
+
+            <p>この設計は Relay チームの EntryPoint pattern に由来する。核心的な考え方は、<strong>データ依存をコンポーネント層ではなくルーティング層で宣言する</strong>こと。ルーティングがマッチした瞬間にどのデータを fetch する必要があるかが分かり、React のレンダリングツリーが構築されるのを待つ必要がない。</p>
+
+            <h3>第二歩：ルーティングマッチング</h3>
+
+            <p>ルーティング設定は URL パターンを EntryPoint にマッピングする：</p>
+
+<pre><code>// routes.ts
+export const ssrRouterConfig = [
+  "route /      AppEntrypoint",
+  "route /admin AdminEntrypoint",
+  "route /admin/:id(int) AppEntrypoint",
+];
+
+export const ssrEntrypointConfig = new Map&lt;string, EntryPoint&lt;any&gt;&gt;([
+  ["AppEntrypoint", AppEntryPoint],
+  ["AdminEntrypoint", AdminEntryPoint],
+]);</code></pre>
+
+            <p>リクエストが来たら、まずルーティングマッチングを行い、対応する EntryPoint を検索する：</p>
+
+<pre><code>const path = req.path.substring(6);  // /pages プレフィックスを除去
+const entrypointRoute = ssrrouter.lookup(path);
+const entrypoint =
+  ssrEntrypointConfig.get(entrypointRoute?.entrypoint ?? "") ??
+  FallbackEntryPoint;</code></pre>
+
+            <h3>第三歩：GraphQL データプリロード</h3>
+
+            <p>これが SSR で最も重要なステップである。EntryPoint を取得したら、<code>getPreloadedProps</code> を呼んで必要なすべての GraphQL query を取得し、Relay の <code>loadQuery</code> でサーバーサイドからリクエストを発行する：</p>
+
+<pre><code>const { root: Root, getPreloadedProps, getParams } = entrypoint;
+const params = getParams(path);
+const { queries } = getPreloadedProps(params);
+
+const preloadedData = Object.keys(queries).reduce((acc, key) =&gt; {
+  acc[key] = loadQuery(
+    RelayEnvironment,    // サーバーサイドの Relay Environment
+    queries[key].query,
+    queries[key].variables
+  );
+  return acc;
+}, {});</code></pre>
+
+            <p><code>loadQuery</code> は即座に fetch を開始し、参照を返す。React がこのデータを必要とするコンポーネントをレンダリングする時、データが既に到着していればそのまま使い、まだなら suspend する（Suspense と連携）。</p>
+
+            <h3>第四歩：ストリーミング SSR レンダリング</h3>
+
+            <p>React 18 は <code>renderToPipeableStream</code> を導入し、ストリーミング HTML 出力をサポートした。従来の <code>renderToString</code> と比べて、二つのコアな利点がある：</p>
+
+            <ul>
+                <li><strong>Time to First Byte が短い</strong>：shell の準備ができたら送信開始、すべてのデータが揃うのを待たない</li>
+                <li><strong>Suspense をサポート</strong>：データが準備できていない部分はまず fallback を送り、データが到着したらストリーミングで補完する</li>
+            </ul>
+
+<pre><code>const { pipe, abort } = renderToPipeableStream(
+  &lt;RelayEnvironmentProvider environment={RelayEnvironment}&gt;
+    &lt;Suspense fallback={&lt;div&gt;...&lt;/div&gt;}&gt;
+      &lt;RendererProvider renderer={renderer}&gt;
+        &lt;SSRProvider&gt;
+          &lt;FluentProvider theme={webLightTheme}&gt;
+            &lt;Root queries={preloadedData} /&gt;
+          &lt;/FluentProvider&gt;
+        &lt;/SSRProvider&gt;
+      &lt;/RendererProvider&gt;
+    &lt;/Suspense&gt;
+  &lt;/RelayEnvironmentProvider&gt;,
+  {
+    bootstrapScripts: ["/entrypoint.client.js"],
+    onShellReady() {
+      res.setHeader("content-type", "text/html");
+      res.write(`&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;...styles...&lt;/head&gt;
+&lt;body&gt;
+  &lt;div id="root"&gt;`);
+      pipe(res);        // React のレンダリングストリームを HTTP レスポンスに接続
+      res.write(`&lt;/div&gt;
+&lt;/body&gt;
+&lt;/html&gt;`);
+    },
+    onShellError(error) {
+      res.statusCode = 500;
+      res.send("Something went wrong");
+    },
+  }
+);</code></pre>
+
+            <p><code>onShellReady</code> コールバックに注目——React が同期部分（shell）のレンダリングを完了した時に発火する。まず HTML のヘッダーを書き出し、<code>pipe(res)</code> でレンダリングストリームを HTTP レスポンスストリームに接続する。Suspense boundary 内の非同期データは、後続の <code>&lt;script&gt;</code> タグの形でストリーミング注入される。</p>
+
+            <h3>第五歩：Fluent UI の SSR スタイル処理</h3>
+
+            <p>Fluent UI（Microsoft の React コンポーネントライブラリ）は CSS-in-JS を使用しており、SSR 時に特別な処理が必要で、さもなければページがちらつく（FOUC）：</p>
+
+<pre><code>const renderer = createDOMRenderer();
+const style = renderToStaticMarkup(
+  &lt;&gt;{renderToStyleElements(renderer)}&lt;/&gt;
+);</code></pre>
+
+            <p>まず DOM renderer を作成し、レンダリング時に使用されたすべてのスタイルを収集し、スタイルを HTML の <code>&lt;head&gt;</code> にインラインで挿入する。クライアントサイドの hydrate 時にこれらのスタイルが再利用され、重複注入を防ぐ。</p>
+
+            <h3>第六歩：クライアントサイド Hydration</h3>
+
+            <p>クライアントサイドではサーバーサイドとまったく同じルーティングマッチングとデータプリロードを行うが、一つ重要な違いがある——<code>fetchPolicy: "store-only"</code>：</p>
+
+<pre><code>// Entrypoint.client.tsx
+ssrrouter.createRouter(ssrRouterConfig);  // 同じルーティング設定
+
+const path = window.location.pathname.substring(6);
+const entrypointRoute = ssrrouter.lookup(path);
+const entrypoint = ssrEntrypointConfig.get(entrypointRoute?.entrypoint ?? "");
+const { root: Root, getPreloadedProps, getParams } = entrypoint;
+const params = getParams(path);
+const { queries } = getPreloadedProps(params);
+
+const preloadedData = Object.keys(queries).reduce((acc, key) =&gt; {
+  acc[key] = loadQuery(
+    RelayEnvironment,
+    queries[key].query,
+    queries[key].variables,
+    { fetchPolicy: "store-only" }  // store からのみ読み取り、再 fetch しない
+  );
+  return acc;
+}, {});
+
+hydrateRoot(
+  document.getElementById("root"),
+  &lt;RelayEnvironmentProvider environment={RelayEnvironment}&gt;
+    &lt;Root queries={preloadedData} /&gt;
+  &lt;/RelayEnvironmentProvider&gt;
+);</code></pre>
+
+            <p><code>store-only</code> はクライアントサイドが GraphQL リクエストを再送しないことを意味し、サーバーサイドで既に取得され HTML を通じて渡されたデータを使用する。これにより hydration 時のリクエスト重複を防ぐ。</p>
+
+            <h3>主な課題</h3>
+
+            <h3>1. Relay Environment のサーバー/クライアント差異</h3>
+
+            <p>Relay の Environment はネットワーク層をカプセル化する。サーバーサイドは GraphQL server を直接呼び出せる（関数の直接呼び出しも可能）が、クライアントサイドは HTTP を経由する必要がある。両側の Environment 設定はまったく異なるが、使う query は同じである。サーバーサイドで fetch したデータをクライアントサイドにシームレスに渡す方法が最大の課題だった。</p>
+
+            <p>解決策：サーバーサイドでデータを fetch した後、Relay の store が HTML にシリアライズされる（React 18 のストリーミング注入メカニズムがこれを処理する）。クライアントサイドの hydrate 時に <code>store-only</code> で読み取る。</p>
+
+            <h3>2. ストリーミングレンダリングと Suspense のタイミング問題</h3>
+
+            <p><code>renderToPipeableStream</code> は非同期である。<code>onShellReady</code> が発火した時、同期部分のみがレンダリング完了している。すべてのデータが Suspense boundary の後ろにある場合、shell はほぼ空になる可能性がある。どの内容を Suspense の外に置くか（即座にレンダリング）、どの内容を Suspense 内に置くか（遅延可能）を慎重に設計する必要がある。</p>
+
+            <h3>3. CSS-in-JS とストリーミングレンダリングの衝突</h3>
+
+            <p>Fluent UI のスタイルはレンダリング過程で動的に生成される。しかしストリーミングレンダリングでは <code>&lt;head&gt;</code> をレンダリング開始前に送信する必要がある。解決策は先に「プリレンダリング」でスタイルを収集し、次に本番のストリーミングレンダリングを行うこと。つまりコンポーネントツリーは実際には二回レンダリングされる——一回はスタイルのため、一回は HTML のため。</p>
+
+            <h3>4. ルーティングロジックの同型性</h3>
+
+            <p>サーバーサイドとクライアントサイドはまったく同じルーティングマッチングロジックを使わなければならず、さもなければ hydration が失敗する（クライアントサイドのレンダリング結果がサーバーサイドと一致しない）。これがルーターを JS にコンパイルした理由——同じコードが両側で実行されることを保証する。</p>
+
+            <h3>5. リクエスト中断の処理</h3>
+
+            <p>ユーザーがページの読み込み完了前に離れる可能性がある。ストリーミングレンダリング時にはリクエストのクローズイベントを監視し、タイムリーにレンダリングを abort する必要がある：</p>
+
+<pre><code>req.on("close", () =&gt; {
+  abort();
+});</code></pre>
+
+            <p>処理しないと、サーバーサイドは誰も必要としないページのレンダリングを続け、リソースを浪費する。</p>
+
+            <h3>振り返って</h3>
+
+            <p>このプロジェクトで SSR のあらゆる工程を深く理解できたが、正直に言って<strong>本番環境でこのアプローチは推奨しない</strong>。理由：</p>
+
+            <ul>
+                <li><strong>保守コストが極めて高い</strong>：React SSR の内部挙動はマイナーバージョンアップデートでも変わる可能性があり、継続的にフォローする必要がある。Next.js チームは React チームと緊密に連携してこれらの詳細の正確性を保証している——一人では追いつけない。</li>
+                <li><strong>欠けている機能が多すぎる</strong>：コード分割、プリフェッチ、ISR、静的生成、ミドルウェア、エラーバウンダリ……本番レベルの SSR フレームワークに必要なものは「コンポーネントを HTML にレンダリングする」だけではない。</li>
+                <li><strong>Relay の SSR サポート自体が不完全</strong>：Relay チームは Meta 内部に独自の SSR インフラを持っており、OSS 版の SSR ドキュメントやサンプルは非常に少ない。ソースコードの中で答えを探すのに大量の時間を費やすことになる。</li>
+            </ul>
+
+            <p>しかし学習プロジェクトとしての価値は大きい：</p>
+
+            <ul>
+                <li><code>renderToPipeableStream</code> が何をしているか、単に「renderToString より速い」以上に本当に理解できる</li>
+                <li>hydration がなぜ mismatch するのか理解できる。両側のレンダリングロジックを自分の手で書いたからだ</li>
+                <li>EntryPoint パターンがなぜ <code>getServerSideProps</code> より大規模アプリに適しているか理解できる——データ依存をルーティング層に引き上げ、データ取得とコンポーネントレンダリングを分離する</li>
+                <li>CSS-in-JS の SSR シーンにおける本当のペインポイントを理解できる</li>
+            </ul>
+
+            <h3>もし試してみたいなら</h3>
+
+            <p>推奨するステップ：</p>
+
+            <ol>
+                <li>まず <code>renderToString</code> + Express で最もシンプルな SSR を組む（GraphQL なし、純粋な静的コンポーネント）</li>
+                <li><code>renderToPipeableStream</code> に切り替え、ストリーミングレンダリングと <code>onShellReady</code> を理解する</li>
+                <li>Suspense を追加し、一部のデータを非同期でロードさせる</li>
+                <li>GraphQL クライアントを接続する（Apollo は Relay より入門しやすい）、サーバーサイドのデータプリロードを処理する</li>
+                <li>クライアントサイドの hydration を実装し、両側のレンダリング結果が一致することを確認する</li>
+                <li>CSS を処理する（まず vanilla CSS から始め、次に CSS-in-JS を試す）</li>
+            </ol>
+
+            <p>各ステップで SSR の理解が一段深まる。一度にすべてを実現しようとしないこと——hydration mismatch のエラーメッセージの中で迷子になるだけだ。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

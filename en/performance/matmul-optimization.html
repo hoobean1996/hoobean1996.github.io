@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>From 0.98 to 267 GFLOPS: A Complete Record of Matrix Multiplication Optimization - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>From 0.98 to 267 GFLOPS: A Complete Record of Matrix Multiplication Optimization</h2>
+            <time>2026-02-16</time>
+
+            <figure class="post-cover">
+                <img src="../../images/escher-relativity.jpg" alt="Relativity by M.C. Escher">
+                <figcaption>M.C. Escher, "Relativity", 1953</figcaption>
+            </figure>
+
+            <h3>Introduction</h3>
+
+            <p>Matrix multiplication (GEMM, General Matrix Multiply) is one of the most fundamental operations in high-performance computing. Neural network fully connected layers, convolutional layers, and attention mechanisms all boil down to matrix multiplication. The <code>sgemm</code> function in BLAS libraries is one of the most aggressively optimized functions in existence, and the core competitive advantage of libraries like Intel MKL, OpenBLAS, and BLIS lies here.</p>
+
+            <p>I wanted to understand what exactly happens between a textbook triple loop and an implementation approaching the theoretical hardware peak. So I started from scratch in C++, optimizing step by step, documenting the reasoning, results, and pitfalls at each stage.</p>
+
+            <h3>Problem Definition</h3>
+
+            <p>Compute C = A &times; B, where A is an M&times;K matrix, B is a K&times;N matrix, and C is an M&times;N matrix. All matrices are row-major float32.</p>
+
+            <p>Hardware:</p>
+            <ul>
+                <li>CPU: Intel i7-14700KF (Raptor Lake, 14 cores / 20 threads)</li>
+                <li>L1d: 48 KB/core, L2: 2 MB/core, L3: 33 MB shared</li>
+                <li>Supports AVX2 + FMA, no AVX-512</li>
+            </ul>
+
+            <p><strong>How is the theoretical peak calculated?</strong></p>
+
+            <p>Let's break this down. The i7-14700KF has a single-core turbo frequency of approximately 5.5 GHz, meaning 5.5 billion clock cycles per second. The key question is: how many floating-point operations can be done per cycle?</p>
+
+            <p>This CPU supports the AVX2 instruction set. AVX2 registers are 256 bits (32 bytes) wide, fitting 8 float32 values simultaneously. It also supports FMA (Fused Multiply-Add) instructions — one instruction completes both a multiply and an add, i.e., <code>a * b + c</code>, counting as 2 floating-point operations. And Raptor Lake has 2 FMA execution units per core, capable of simultaneously executing 2 FMA instructions in the same clock cycle.</p>
+
+            <p>So single-core FLOP per cycle = 2 FMA units &times; 8 floats/FMA &times; 2 FLOP/FMA = <strong>32 FLOP/cycle</strong>. Theoretical single-core peak:</p>
+
+<pre><code>5.5 GHz &times; 32 FLOP/cycle &asymp; 176 GFLOPS (single-precision, single-core)</code></pre>
+
+            <p>Multi-core theoretical peak is higher, but limited by memory bandwidth and shared cache, actual achievable performance depends on computational density. As we'll see, single-thread optimization to 144 GFLOPS (82% of peak) is already an excellent result.</p>
+
+            <p>Benchmark matrix size is N=1024, i.e., 1024&times;1024 square matrix multiplication. The computation formula for matrix multiplication is 2&times;M&times;N&times;K (each output element requires K multiplications and K additions), so total computation is 2&times;1024&sup3; &asymp; 2.15 billion floating-point operations.</p>
+
+            <h3>Overview</h3>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Version</th>
+                        <th>Time (ms)</th>
+                        <th>GFLOPS</th>
+                        <th>vs Baseline</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Baseline (i-j-k)</td>
+                        <td>2205</td>
+                        <td>0.98</td>
+                        <td>1&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Naive (i-k-j)</td>
+                        <td>61.0</td>
+                        <td>35.3</td>
+                        <td>36&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Tiled</td>
+                        <td>73.5</td>
+                        <td>29.3</td>
+                        <td>30&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Tiled + SIMD</td>
+                        <td>72.8</td>
+                        <td>29.3</td>
+                        <td>30&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Register Tiling</td>
+                        <td>16.9</td>
+                        <td>125.8</td>
+                        <td>128&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Packed</td>
+                        <td>14.8</td>
+                        <td>144.4</td>
+                        <td>147&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Parallel (OpenMP)</td>
+                        <td>8.24</td>
+                        <td>267.2</td>
+                        <td>273&times;</td>
+                    </tr>
+                    <tr>
+                        <td>Optimized</td>
+                        <td>8.21</td>
+                        <td>266.3</td>
+                        <td>272&times;</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Step 0: Textbook Version (i-j-k) &mdash; 0.98 GFLOPS</h3>
+
+            <p>The first version everyone writes when learning linear algebra:</p>
+
+<pre><code>void matmul_baseline(const float* A, const float* B, float* C,
+                     size_t M, size_t N, size_t K) {
+  std::memset(C, 0, M * N * sizeof(float));
+  for (size_t i = 0; i &lt; M; ++i) {
+    for (size_t j = 0; j &lt; N; ++j) {
+      for (size_t k = 0; k &lt; K; ++k) {
+        C[i * N + j] += A[i * K + k] * B[k * N + j];
+      }
+    }
+  }
+}</code></pre>
+
+            <p>0.98 GFLOPS, about 1% of theoretical peak. Absurdly slow.</p>
+
+            <p>The problem lies in the inner loop's memory access pattern. Our matrices are stored in row-major order, meaning <code>B[0][0], B[0][1], B[0][2], ...</code> are contiguous in memory. But the inner loop iterates over <code>k</code>, accessing <code>B[k * N + j]</code> each time — every increment of <code>k</code> jumps N floats (4096 bytes) in memory, effectively jumping row by row.</p>
+
+            <p>Modern CPUs have an important design: when you read one piece of data from memory, the CPU doesn't just read that one value — it loads the entire <strong>cache line</strong> (typically 64 bytes) containing it. For float32, one cache line holds 16 consecutive floats. The CPU assumes "if you read this value, you'll probably read its neighbors next" — this is called spatial locality.</p>
+
+            <p>But the i-j-k loop completely violates this assumption. Each cache line load (64 bytes = 16 floats) uses just 1 float before jumping away. Cache line utilization is only 1/16 = 6.25%. Cachegrind measurements show D1 miss rate as high as <strong>32.8%</strong> — one in every 3 memory accesses is a cache miss.</p>
+
+            <h3>Step 1: Loop Reordering (i-k-j) &mdash; 35.3 GFLOPS</h3>
+
+            <p>Move the <code>k</code> loop to the middle, making the inner loop iterate over <code>j</code>:</p>
+
+<pre><code>void matmul_naive(const float* A, const float* B, float* C,
+                  size_t M, size_t N, size_t K) {
+  std::memset(C, 0, M * N * sizeof(float));
+  for (size_t i = 0; i &lt; M; ++i) {
+    for (size_t k = 0; k &lt; K; ++k) {
+      float a_ik = A[i * K + k];
+      for (size_t j = 0; j &lt; N; ++j) {
+        C[i * N + j] += a_ik * B[k * N + j];
+      }
+    }
+  }
+}</code></pre>
+
+            <p><strong>36x speedup</strong>, just by swapping two loop lines.</p>
+
+            <p>Now in the inner loop, both <code>B[k*N+j]</code> and <code>C[i*N+j]</code> are accessed sequentially along the row (stride-1). Each 64-byte cache line loaded has all 16 floats fully utilized, raising cache line utilization from 6.25% to 100%. Meanwhile <code>A[i*K+k]</code> is constant within the inner loop, hoisted into a local variable <code>a_ik</code> — this is called scalar replacement, which the compiler typically does automatically.</p>
+
+            <p>Cachegrind measurements: D1 miss rate drops from 32.8% to <strong>4.8%</strong>.</p>
+
+            <p>This is the single largest improvement in the entire project. The lesson is simple: <strong>memory access patterns matter more than algorithmic complexity</strong>. Both versions perform exactly the same number of arithmetic operations (both 2N&sup3;), but the difference in memory access patterns causes a 36x performance gap.</p>
+
+            <h3>Step 2: Cache Tiling &mdash; 29.3 GFLOPS</h3>
+
+            <p>The classic textbook optimization: divide the large matrix into small blocks (64&times;64&times;64), so each block's data (64&times;64&times;4B = 16KB) fits in the 48KB L1d cache. This way, while processing a block, data can be reused repeatedly without being evicted from cache.</p>
+
+<pre><code>void matmul_tiled(const float* A, const float* B, float* C,
+                  size_t M, size_t N, size_t K) {
+  constexpr size_t BM = 64, BN = 64, BK = 64;
+  std::memset(C, 0, M * N * sizeof(float));
+
+  for (size_t i0 = 0; i0 &lt; M; i0 += BM) {
+    const size_t imax = std::min(i0 + BM, M);
+    for (size_t k0 = 0; k0 &lt; K; k0 += BK) {
+      const size_t kmax = std::min(k0 + BK, K);
+      for (size_t j0 = 0; j0 &lt; N; j0 += BN) {
+        const size_t jmax = std::min(j0 + BN, N);
+        for (size_t i = i0; i &lt; imax; ++i) {
+          for (size_t k = k0; k &lt; kmax; ++k) {
+            float a_ik = A[i * K + k];
+            for (size_t j = j0; j &lt; jmax; ++j) {
+              C[i * N + j] += a_ik * B[k * N + j];
+            }
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>Result: <strong>actually slower</strong>. From 35.3 down to 29.3 GFLOPS.</p>
+
+            <p>The reason is the compiler (GCC/Clang -O3) already optimizes the simple i-k-j loop well. Tiling introduces extra loop control overhead and <code>std::min</code> boundary calculations, which don't pay for themselves. Moreover, i-k-j already has very cache-friendly access patterns — both B and C are stride-1 access, so tiling offers little marginal benefit.</p>
+
+            <p>Lesson: <strong>Tiling's value only shows when combined with register tiling and packing</strong>. Used alone, the modern compiler may do better than you.</p>
+
+            <h3>Step 3: Hand-Written SIMD (AVX2 FMA) &mdash; 29.3 GFLOPS</h3>
+
+            <p>First, let me explain what SIMD is. SIMD (Single Instruction, Multiple Data) is a form of parallel computation — one instruction processes multiple data elements simultaneously. A regular scalar instruction can only add 1 float at a time; AVX2 SIMD instructions can add 8 floats simultaneously (because YMM registers are 256 bits wide, 256 / 32 = 8 floats).</p>
+
+            <p>FMA (Fused Multiply-Add) goes further: one instruction completes <code>a * b + c</code>, doing both multiply and add, with only one rounding error (more precise than separate multiply then add). For matrix multiplication, the core operation is <code>C[i][j] += A[i][k] * B[k][j]</code>, naturally suited for FMA.</p>
+
+            <p>In C/C++, you can call these instructions directly via intrinsics functions, without writing assembly:</p>
+
+<pre><code>// Inner loop core
+__m256 va = _mm256_set1_ps(A[i * K + k]);     // Broadcast 1 float to 8 lanes
+size_t j = j0;
+for (; j + 8 &lt;= jmax; j += 8) {
+  __m256 vb = _mm256_loadu_ps(&amp;B[k * N + j]); // Load 8 consecutive floats
+  __m256 vc = _mm256_loadu_ps(&amp;C[i * N + j]); // Load 8 consecutive floats
+  vc = _mm256_fmadd_ps(va, vb, vc);            // 8-way parallel: C += A * B
+  _mm256_storeu_ps(&amp;C[i * N + j], vc);         // Write back 8 floats
+}</code></pre>
+
+            <p>Each <code>_mm256</code> function corresponds to an AVX2 instruction. <code>_mm256_set1_ps</code> broadcasts a scalar to all 8 positions of a 256-bit register; <code>_mm256_loadu_ps</code> loads 8 consecutive floats from memory to a register; <code>_mm256_fmadd_ps</code> performs FMA on 8 pairs simultaneously.</p>
+
+            <p>Result: <strong>exactly the same as the tiled version</strong>.</p>
+
+            <p>With <code>-O3 -march=native -ffast-math</code>, the compiler already auto-vectorized the inner loop. The compiler recognized the simple <code>for j</code> loop and automatically converted it to SIMD instructions — doing exactly what our hand-written intrinsics do. You can confirm auto-vectorization with <code>-fopt-info-vec</code> (GCC) or <code>-Rpass=loop-vectorize</code> (Clang).</p>
+
+            <p>Lesson: <strong>With modern compilers, hand-written SIMD for simple loops usually can't beat auto-vectorization</strong>. Real gains come from things compilers can't do — like the next step's register tiling, which requires the programmer to precisely plan each register's purpose.</p>
+
+            <h3>Step 4: Register Tiling &mdash; 125.8 GFLOPS (Key Breakthrough)</h3>
+
+            <p>All previous versions share a fundamental problem: <strong>every multiply-add reads and writes C from memory (or cache)</strong>. In the i-k-j inner loop, <code>C[i*N+j] += a_ik * B[k*N+j]</code> means reading C, doing FMA, and writing back C every iteration. Even when C is in L1 cache, read/write latency still exists.</p>
+
+            <p>Register tiling's approach: keep a small sub-block of C entirely in CPU registers. Registers are the fastest storage in the CPU — zero access latency, no cache hierarchy involved. If we can keep C's sub-block in registers throughout the entire k loop, loading once at the start and storing once at the end, we dramatically reduce memory accesses.</p>
+
+            <p>The key question is: how large can the sub-block be? That depends on how many registers the CPU has.</p>
+
+<pre class="diagram"><code>              NR=16 (2 &times; __m256)
+           +----------------------+
+     MR=6  | c00 c01              |  12 YMM registers hold C's 6&times;16 sub-block
+    rows   | c10 c11              |
+     of C  | c20 c21              |  In k loop:
+           | c30 c31              |    Load 2 B vectors (b0, b1)
+           | c40 c41              |    Broadcast 6 A scalars
+           | c50 c51              |    12 FMAs
+           +----------------------+</code></pre>
+
+            <p>AVX2 provides 16 YMM registers (ymm0-ymm15), each 256 bits wide (8 floats). We need to allocate them carefully:</p>
+            <ul>
+                <li>C sub-block: 6 rows &times; 2 __m256 (16 floats per row) = <strong>12 registers</strong></li>
+                <li>B vectors: 2 __m256 per k step = <strong>2 registers</strong></li>
+                <li>A broadcast: broadcast 1 A element per k step = <strong>1 register</strong></li>
+                <li>Temporary: <strong>1 register</strong></li>
+                <li>Total: 12 + 2 + 1 + 1 = <strong>16, exactly full</strong></li>
+            </ul>
+
+            <p>Why MR=6, NR=16 and not other combinations? Because this combination has the highest <strong>computational density</strong>. Each k step does 12 FMAs (6 rows &times; 2 vectors), needing only 3 memory reads (2 B vectors + 1 A scalar), giving a density of 12/3 = 4 FMA/load. With 4&times;24 (also 12 C registers), you'd need 3 B + 1 A = 4 reads, density = 12/4 = 3 FMA/load, which is lower.</p>
+
+            <p>Core implementation (micro-kernel):</p>
+
+<pre><code>// 1. Load C's 6&times;16 sub-block into 12 registers (done once)
+__m256 c00 = _mm256_loadu_ps(&amp;C[0 * N + 0]);
+__m256 c01 = _mm256_loadu_ps(&amp;C[0 * N + 8]);
+__m256 c10 = _mm256_loadu_ps(&amp;C[1 * N + 0]);
+__m256 c11 = _mm256_loadu_ps(&amp;C[1 * N + 8]);
+// ... c20, c21, c30, c31, c40, c41, c50, c51
+
+// 2. Accumulate entirely in registers during k loop
+for (size_t k = 0; k &lt; K; ++k) {
+  __m256 b0 = _mm256_loadu_ps(&amp;B[k * N + 0]);  // Load 16 floats of B
+  __m256 b1 = _mm256_loadu_ps(&amp;B[k * N + 8]);
+
+  __m256 a;
+  a = _mm256_set1_ps(A[0 * lda + k]);  // Broadcast A[0][k]
+  c00 = _mm256_fmadd_ps(a, b0, c00);   // c00 += a * b0
+  c01 = _mm256_fmadd_ps(a, b1, c01);   // c01 += a * b1
+
+  a = _mm256_set1_ps(A[1 * lda + k]);  // Broadcast A[1][k]
+  c10 = _mm256_fmadd_ps(a, b0, c10);
+  c11 = _mm256_fmadd_ps(a, b1, c11);
+
+  // ... same for rows 2-5, 12 FMAs total
+}
+
+// 3. After k loop, write C back to memory (done once)
+_mm256_storeu_ps(&amp;C[0 * N + 0], c00);
+_mm256_storeu_ps(&amp;C[0 * N + 8], c01);
+// ...</code></pre>
+
+            <p>Cachegrind results: D refs (total data accesses) dropped from 177M to <strong>21M</strong> (8.4x reduction). Because C is no longer read/written repeatedly in the k loop — previously each k step read/wrote C's 6&times;16 = 96 floats, now the entire k loop only does it once at the beginning and once at the end.</p>
+
+            <p><strong>4.3x speedup</strong>, from 29 GFLOPS to 126 GFLOPS. This is the most important single-step optimization after loop reordering. The compiler can't do this level of register orchestration — it won't proactively keep a large chunk of C in registers across an entire loop. This requires the programmer to have precise understanding of hardware resources.</p>
+
+            <h3>Step 5: Goto-style Packing &mdash; 144.4 GFLOPS</h3>
+
+            <p>The register tiling micro-kernel still accesses A with stride=K and B with stride=N. With large matrices, between adjacent micro-kernel calls, A and B data is non-contiguous in memory — separated by lots of unneeded data, wasting cache line space.</p>
+
+            <p>The solution comes from Kazushige Goto's classic 2008 paper (the author of GotoBLAS): before executing the micro-kernel, rearrange (pack) A and B data into contiguous memory regions, so every memory read by the micro-kernel is completely sequential.</p>
+
+<pre class="diagram"><code>Original A (stride = K):              After pack_A (stride = MR):
++------------------+              +---------+
+| a00 a01 a02 ...  |  MR=6 rows  | a00     |
+| a10 a11 a12 ...  |  --------&gt;  | a10     |  Every MR values contiguous
+| ...              |              | a20     |  Micro-kernel reads sequentially
+| a50 a51 a52 ...  |              | ...     |
++------------------+              | a01     |
+                                  | a11     |
+                                  +---------+</code></pre>
+
+            <p>But packing alone isn't enough — the loop structure must also be carefully designed so each cache level is fully utilized. This is the Goto-style three-level loop nesting:</p>
+
+<pre><code>for (size_t jc = 0; jc &lt; N; jc += NC) {       // Layer 3: B panel resides in L3
+  for (size_t kc = 0; kc &lt; K; kc += KC) {     // Layer 2: B slice resides in L2
+    pack_B(&amp;B[kc * N + jc], packed_B, kk, nc, N);
+
+    for (size_t ic = 0; ic &lt; M; ic += MC) {   // Layer 1: A slice resides in L1
+      pack_A(&amp;A[ic * K + kc], packed_A, mc, kk, K);
+
+      // Macro-kernel: iterate over MR&times;NR micro-tiles.
+      for (size_t ir = 0; ir &lt; mc; ir += MR) {
+        for (size_t jr = 0; jr &lt; nc; jr += NR) {
+          microkernel_packed_6x16(
+              &amp;packed_A[ir * kk],
+              &amp;packed_B[jr * kk],
+              &amp;C[(ic + ir) * N + (jc + jr)],
+              kk, N);
+        }
+      }
+    }
+  }
+}</code></pre>
+
+            <p>Each tile dimension precisely corresponds to a cache level:</p>
+            <ul>
+                <li><strong>MC&times;KC = 72&times;256 = 72KB</strong>: packed_A size, resides in L1d cache (48KB) + minor spill to L2</li>
+                <li><strong>KC&times;NC = 256&times;4096 = 4MB</strong>: packed_B size, resides in L2 (2MB) + L3</li>
+                <li>MC must be a multiple of MR(6), NC must be a multiple of NR(16), ensuring the micro-kernel doesn't need boundary handling</li>
+            </ul>
+
+            <p>The core design idea: packed_B is packed once in the outermost loop, then shared and reused by all MC-strips. packed_A is packed once per MC-strip, then shared and reused by all NR-strips in the inner loop. This way, packing overhead is amortized across many micro-kernel computations.</p>
+
+            <p>Single-thread from 126 to <strong>144 GFLOPS</strong>, 15% improvement. More significant on larger matrices, since the problem of non-contiguous data in cache is more severe with larger matrices.</p>
+
+            <h3>Step 6: Multi-threaded Parallelism (OpenMP) &mdash; 267.2 GFLOPS</h3>
+
+            <p>All previous optimizations were single-threaded. The i7-14700KF has 14 cores and 20 threads — we were only using one core. Time to put the rest to work.</p>
+
+            <p>OpenMP is the most common shared-memory parallel programming interface for C/C++/Fortran. It uses compiler directives (pragmas) to control parallelization instead of manual thread management. Just add <code>#pragma omp parallel for</code> before a loop, and the compiler automatically distributes loop iterations across multiple threads.</p>
+
+<pre><code>#pragma omp parallel
+{
+  // Per-thread private packed_A buffer
+  float* packed_A = static_cast&lt;float*&gt;(
+      std::aligned_alloc(32, MC * KC * sizeof(float)));
+
+  #pragma omp for schedule(dynamic)
+  for (size_t ic = 0; ic &lt; M; ic += MC) {
+    const size_t mc = std::min(MC, M - ic);
+    pack_A(&amp;A[ic * K + kc], packed_A, mc, kk, K);
+
+    for (size_t ir = 0; ir &lt; mc; ir += MR) {
+      for (size_t jr = 0; jr &lt; nc; jr += NR) {
+        microkernel_packed_6x16(
+            &amp;packed_A[ir * kk],
+            &amp;packed_B[jr * kk],
+            &amp;C[(ic + ir) * N + (jc + jr)],
+            kk, N);
+      }
+    }
+  }
+
+  std::free(packed_A);
+}</code></pre>
+
+            <p>Key parallelization design decisions:</p>
+            <ul>
+                <li><strong>packed_B shared</strong>: B panel is packed once outside the parallel region, read-only shared by all threads, no locking needed</li>
+                <li><strong>packed_A private</strong>: Each thread allocates its own packed_A buffer. If multiple threads shared one buffer, false sharing would occur — different threads writing the same cache line, causing cache lines to bounce between cores (cache ping-pong), severely degrading performance</li>
+                <li><strong>Parallelization granularity</strong>: Parallel at the MC-strip (ic loop) level. Each MC-strip processes 72 independent rows of the C matrix, with no write conflicts between strips, requiring no synchronization</li>
+                <li><strong><code>schedule(dynamic)</code></strong>: Dynamic scheduling means idle threads automatically pick up the next unprocessed strip, suitable for uneven workloads (e.g., when matrix rows aren't evenly divisible by MC, the last strip is smaller)</li>
+            </ul>
+
+            <p>From 144 to <strong>267 GFLOPS</strong>, 1.85x speedup. Didn't achieve ideal linear scaling (14 cores should be 14x), due to: memory bandwidth becoming a bottleneck, L3 cache contention, thread scheduling overhead, and pack_B still executing serially on a single thread. But at the N=1024 scale, 267 GFLOPS is quite good.</p>
+
+            <h3>Step 7: Micro-Optimizations (Unroll + Prefetch + Huge Pages) &mdash; 266.3 GFLOPS</h3>
+
+            <p>Finally tried three micro-optimizations:</p>
+
+            <p><strong>1) k-unroll by 4</strong></p>
+
+            <p>Unroll the micro-kernel's k loop 4 times. Without unrolling, each iteration ends with compare, increment, and jump instructions; after unrolling, each group of 4 iterations only needs one set of control instructions, reducing loop overhead. More importantly, unrolling gives the CPU more instructions to execute simultaneously — modern CPUs execute out-of-order, executing later independent instructions while an earlier one waits for data. Unrolling exposes more such parallelism opportunities.</p>
+
+<pre><code>for (; k + 4 &lt;= kc; k += 4) {
+  _mm_prefetch(packed_A + 4 * MR, _MM_HINT_T0);
+  _mm_prefetch(packed_B + 4 * NR, _MM_HINT_T0);
+
+  MICRO_ITER(packed_A + 0 * MR, packed_B + 0 * NR);
+  MICRO_ITER(packed_A + 1 * MR, packed_B + 1 * NR);
+  MICRO_ITER(packed_A + 2 * MR, packed_B + 2 * NR);
+  MICRO_ITER(packed_A + 3 * MR, packed_B + 3 * NR);
+
+  packed_A += 4 * MR;
+  packed_B += 4 * NR;
+}</code></pre>
+
+            <p><strong>2) Software prefetch</strong></p>
+
+            <p>CPUs have hardware prefetchers that automatically detect sequential memory access patterns and preload data. But hardware prefetchers aren't omniscient — they can only recognize simple linear patterns (e.g., consecutive increments) and may mispredict for strided or post-branch access patterns.</p>
+
+            <p>Software prefetch via <code>_mm_prefetch</code> explicitly tells the CPU: "I'll need this address's data in a few steps, start loading it from memory to cache now." By the time the code actually needs the data, it's already in cache, avoiding memory wait latency (typically 50-100ns).</p>
+
+            <p><code>_MM_HINT_T0</code> means load to L1 cache (closest, fastest), <code>_MM_HINT_T1</code> means load to L2 cache. We use <code>_MM_HINT_T1</code> for the next B panel since it's larger and better suited for L2.</p>
+
+            <p><strong>3) Transparent Huge Pages</strong></p>
+
+            <p>This involves a key component of virtual memory: TLB (Translation Lookaside Buffer).</p>
+
+            <p>Modern OSes use virtual memory — the memory addresses programs see aren't real physical addresses and need translation via page tables. This translation is slow (may require multi-level page table walks), so CPUs use TLB to cache recently used address translations. TLB capacity is very small; a typical L1 dTLB has only 64-128 entries.</p>
+
+            <p>Default memory page size is 4KB. With 128 TLB entries, TLB can only cover 128 &times; 4KB = 512KB of memory. Our packed_B is 4MB — far exceeding TLB coverage. When the micro-kernel traverses packed_B, frequent TLB misses trigger page table walks.</p>
+
+            <p>Huge pages increase page size from 4KB to 2MB. The same 128 TLB entries now cover 128 &times; 2MB = 256MB, easily fitting the 4MB packed_B.</p>
+
+<pre><code>// packed_B (~4MB) uses 2MB huge pages to reduce TLB misses
+void* ptr = std::aligned_alloc(2 * 1024 * 1024, aligned_bytes);
+madvise(ptr, aligned_bytes, MADV_HUGEPAGE);</code></pre>
+
+            <p><code>madvise</code> is a Linux system call, <code>MADV_HUGEPAGE</code> tells the kernel this memory region should use transparent huge pages. Note packed_A (72KB per thread) is too small — using 2MB pages would be wasteful, so only packed_B uses them.</p>
+
+            <p>Actual results: at N=1024, <strong>267 &rarr; 266 GFLOPS</strong>, essentially no improvement. At this scale, the hardware prefetcher already works well, and packed data access patterns are already very regular. These micro-optimizations yield more benefit on larger matrices (N=2048+) — the larger the data, the more TLB misses and prefetch impact become noticeable.</p>
+
+            <h3>Cachegrind Cache Analysis</h3>
+
+            <p>Valgrind is a program analysis tool framework, and its cachegrind module specializes in analyzing a program's cache behavior. It simulates the CPU's cache hierarchy, counting whether each memory access hits L1/L2/L3 cache.</p>
+
+            <p>Usage is simple:</p>
+
+<pre><code># First compile an optimized executable
+bazel build -c opt //bench:cache_profile
+
+# Run under cachegrind, specifying version and matrix size
+valgrind --tool=cachegrind ./bazel-bin/bench/cache_profile naive 512</code></pre>
+
+            <p>Cachegrind outputs detailed cache statistics. Key metrics:</p>
+            <ul>
+                <li><strong>D refs</strong>: Total data access count (reads and writes). Reflects the program's memory access frequency</li>
+                <li><strong>D1 misses</strong>: L1 data cache miss count. Each miss means data isn't in the fastest L1 cache and must be fetched from slower L2/L3 or main memory</li>
+                <li><strong>D1 miss rate</strong>: D1 misses / D refs. Lower is better</li>
+            </ul>
+
+            <p>Note cachegrind slows programs 10-50x (because it simulates the cache), so N=512 is used instead of N=1024:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Version</th>
+                        <th>D refs</th>
+                        <th>D1 misses</th>
+                        <th>D1 miss rate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Baseline (i-j-k)</td>
+                        <td>177M</td>
+                        <td>58.1M</td>
+                        <td><strong>32.8%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Naive (i-k-j)</td>
+                        <td>177M</td>
+                        <td>8.5M</td>
+                        <td><strong>4.8%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Tiled</td>
+                        <td>179M</td>
+                        <td>1.6M</td>
+                        <td><strong>0.9%</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Register Tiling</td>
+                        <td>21M</td>
+                        <td>1.6M</td>
+                        <td><strong>7.8%</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>This table is worth studying carefully, as it precisely explains the mechanism behind each optimization:</p>
+
+            <ul>
+                <li><strong>Baseline &rarr; Naive</strong>: D refs identical (177M), but D1 misses drop from 58.1M to 8.5M. Same number of accesses, but dramatically fewer misses — this is the power of loop reordering. Same computation, different access order, cache hit rate improved from 67% to 95%.</li>
+                <li><strong>Naive &rarr; Tiled</strong>: D refs essentially unchanged (177M &rarr; 179M), but D1 misses drop from 8.5M to 1.6M, miss rate from 4.8% to 0.9%. Tiling lets data in cache be reused more times (data loaded into cache gets used repeatedly before being evicted).</li>
+                <li><strong>Tiled &rarr; Register Tiling</strong>: The key change is D refs — from 179M down to <strong>21M</strong>, an 8.5x reduction! Absolute D1 misses stay the same (1.6M), but because the denominator (D refs) shrinks dramatically, miss rate actually rises to 7.8%. This is the essence of register tiling: not fewer misses, but <strong>fundamentally fewer memory accesses</strong> — C's reads and writes are entirely done in registers.</li>
+            </ul>
+
+            <h3>Summary and Reflections</h3>
+
+            <p>A few things from this project that impressed me most:</p>
+
+            <p><strong>1. Memory access patterns are the #1 performance killer.</strong> Loop reordering alone yielded a 36x speedup. On modern hardware, cache-friendly access patterns matter more than any advanced optimization. Two versions with identical arithmetic operation counts differ in performance by 36x.</p>
+
+            <p><strong>2. Not all "classic optimizations" are effective.</strong> Cache tiling and hand-written SIMD yielded no improvement in this scenario. Modern compilers are very powerful — don't underestimate <code>-O3 -march=native -ffast-math</code>. Before optimizing, check what the compiler has already done.</p>
+
+            <p><strong>3. Register tiling is the key breakthrough.</strong> This is an optimization the compiler can't do — it requires the programmer to precisely understand how many registers the hardware has, what each register should hold, and how to maximize computational density. 12 YMM registers keeping C's sub-block eliminated repeated reads and writes to C in the k loop, reducing D refs by 8.5x.</p>
+
+            <p><strong>4. Packing solves the data layout problem.</strong> Rearranging A and B into micro-kernel-friendly contiguous memory ensures every byte of each cache line is fully utilized. Goto-style three-layer loops precisely correspond to L1/L2/L3 cache levels, a textbook example of combining engineering and theory.</p>
+
+            <p><strong>5. Diminishing marginal returns from micro-optimizations.</strong> Unroll, prefetch, and huge pages had virtually no effect at N=1024. Performance optimization follows the Pareto principle — 80% of gains come from 20% of key optimizations.</p>
+
+            <p>From 0.98 to 267 GFLOPS, <strong>273x speedup</strong>. This journey gave me a true understanding of the first half of Knuth's famous quote (people often only remember the second half):</p>
+
+            <p><em>"We should forget about small efficiencies, say about 97% of the time: premature optimization is the root of all evil. Yet we should not pass up our opportunities in that critical 3%."</em></p>
+
+            <p>The key is finding that 3%.</p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

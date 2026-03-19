@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL Storage Engine Internals (Part 3): WAL, Checkpoint, and Durability - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL Storage Engine Internals (Part 3): WAL, Checkpoint, and Durability</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/durer-jerome-study.jpg" alt="Saint Jerome in His Study, Albrecht Dürer, 1514">
+                <figcaption>Albrecht Dürer, "Saint Jerome in His Study", 1514 — Jerome bends over his desk translating the Bible, every word faithfully recorded, while the hourglass on the wall marks the passage of time. WAL's essence is the same: before any change takes effect, write it to the log first. This record is the foundation of crash recovery and the source of streaming replication</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL Storage Engine Internals</strong><br>
+                <a href="pg-heap-buffer.html">Part 1: Heap Pages and Buffer Pool</a> ·
+                <a href="pg-index-mvcc.html">Part 2: Index Scans and MVCC</a> ·
+                <span class="current">Part 3: WAL, Checkpoint, and Durability</span>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>What you'll learn from this post</strong>: Databases promise you "data won't be lost after a transaction commits." How is this promise kept? The answer is WAL (Write-Ahead Log) — before modifying a data page, first write a change record to the log. This post traces an INSERT statement's complete path from generating a WAL record, to WAL Writer flushing to disk, to Checkpoint creating a recovery point, and explains how this mechanism simultaneously supports crash recovery and streaming replication.
+            </blockquote>
+
+            <h3>The Core Idea of WAL</h3>
+
+            <p>Write-Ahead Logging has just one rule: <strong>before modifying a data page, you must first write a log record describing the modification to persistent storage</strong>.</p>
+
+            <p>Why? Because writing modified data pages to disk is expensive (random I/O, 8KB at a time), while appending log records to the end of a file is cheap (sequential I/O, typically tens to hundreds of bytes). WAL converts random writes to sequential writes while guaranteeing durability.</p>
+
+<pre class="diagram"><code>  World without WAL (direct data page writes):
+
+  Transaction commit → must flush all modified Pages to disk → random I/O → slow
+  Crash → some Pages half-written → data corruption → unrecoverable
+
+  World with WAL:
+
+  Transaction commit → only need to flush WAL records to disk → sequential I/O → fast
+  Data pages can be written lazily later (async)
+  Crash → replay WAL log → data restored to consistent state</code></pre>
+
+            <h3>XLogRecord: The Structure of a WAL Record</h3>
+
+            <p>Every database write operation (INSERT, UPDATE, DELETE, and various internal operations) produces one or more <code>XLogRecord</code>s:</p>
+
+<pre><code>typedef struct XLogRecord {
+    uint32      xl_tot_len;   // Total length of this record
+    TransactionId xl_xid;     // Transaction ID that produced this record
+    XLogRecPtr  xl_prev;      // Position of the previous WAL record (forms a linked list)
+    uint8       xl_info;      // Operation type (e.g., XLOG_HEAP_INSERT)
+    RmgrId      xl_rmid;      // Resource manager ID (which subsystem produced it)
+    pg_crc32c   xl_crc;       // CRC checksum
+} XLogRecord;</code></pre>
+
+            <p>A WAL record produced by an INSERT looks roughly like this:</p>
+
+<pre><code>XLogRecord {
+    xl_tot_len = 156,              // Entire record is 156 bytes
+    xl_xid = 12345,                // Transaction ID
+    xl_prev = 0/1A2B3C4D,          // Previous record's LSN
+    xl_info = XLOG_HEAP_INSERT,    // Heap insert operation
+    xl_rmid = RM_HEAP_ID,          // Heap table resource manager
+    xl_crc = 0x1A2B3C4D            // CRC checksum
+}
+// Followed by: block reference of the modified Page + actual inserted data</code></pre>
+
+            <h4>LSN: WAL's Timeline</h4>
+
+            <p>LSN (Log Sequence Number) is the globally unique position identifier of each WAL record, in the format <code>segment/offset</code> (e.g., <code>0/1A2B3C4D</code>). It's another representation of "time" in PostgreSQL:</p>
+
+            <ul>
+                <li>Each Page's <code>pd_lsn</code> records the LSN of the last WAL record that modified that Page</li>
+                <li>During recovery, if a Page's <code>pd_lsn</code> is already >= the WAL record's LSN, that WAL has already been applied — skip it</li>
+                <li>During replication, the standby tells the primary "I've replayed up to LSN X," and the primary uses this to decide which WAL files can be recycled</li>
+            </ul>
+
+            <h4>Resource Managers: Who Produced This Log Entry</h4>
+
+            <p>Different subsystems produce different types of WAL records. Each subsystem registers a "Resource Manager" providing its own redo and decode functions:</p>
+
+            <table>
+                <thead>
+                    <tr><th>RmgrId</th><th>Subsystem</th><th>Example Operation Types</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>RM_HEAP_ID</td><td>Heap tables</td><td>INSERT, DELETE, UPDATE, HOT_UPDATE</td></tr>
+                    <tr><td>RM_BTREE_ID</td><td>B-Tree indexes</td><td>Index page splits, inserting index entries</td></tr>
+                    <tr><td>RM_XACT_ID</td><td>Transaction management</td><td>COMMIT, ABORT</td></tr>
+                    <tr><td>RM_CLOG_ID</td><td>Transaction commit log</td><td>CLOG page updates</td></tr>
+                    <tr><td>RM_XLOG_ID</td><td>WAL itself</td><td>Checkpoint records</td></tr>
+                </tbody>
+            </table>
+
+            <p>During recovery, each WAL record invokes the corresponding resource manager's <code>rm_redo</code> function. During logical replication, <code>rm_decode</code> converts physical changes to logical changes (e.g., <code>DecodeInsert</code> parses <code>XLOG_HEAP_INSERT</code> into understandable row change events).</p>
+
+            <h3>WAL Write Path: From Memory to Disk</h3>
+
+            <h4>WAL Buffer: Log Staging Area in Shared Memory</h4>
+
+<pre class="diagram"><code>  Backend Process A          Backend Process B          WAL Writer
+  (INSERT INTO ...)          (UPDATE ...)              (background process)
+        │                         │                        │
+        │ XLogInsert()            │ XLogInsert()           │
+        ▼                         ▼                        │
+  ┌───────────────────────────────────────────────────┐    │
+  │              XLogCtl (shared memory)               │    │
+  │                                                    │    │
+  │  WAL buffer (wal_buffers parameter, default 16MB)  │    │
+  │  ┌────────┬────────┬────────┬────────┬────────┐   │    │
+  │  │ Page 0 │ Page 1 │ Page 2 │ Page 3 │  ...   │   │    │
+  │  │ 8KB    │ 8KB    │ 8KB    │ 8KB    │        │   │    │
+  │  └────────┴────────┴────────┴────────┴────────┘   │    │
+  │                                                    │    │
+  │  Control information:                              │    │
+  │  - LogwrtRqst: position requested to write to      │    │
+  │  - LogwrtResult: position already written to       │    │
+  │  - xlblocks[]: end LSN per page                    │    │
+  │  - walwriter_latch: wake up WAL Writer             │    │
+  └─────────────────────────────────┬─────────────────┘    │
+                                    │                       │
+                                    │  XLogWrite()          │
+                                    ▼                       │
+                          ┌──────────────────┐             │
+                          │  WAL files (disk) │ ◄───────────┘
+                          │  16MB each        │  XLogBackgroundFlush()
+                          └──────────────────┘</code></pre>
+
+            <p>Two key inter-process communication mechanisms:</p>
+            <ul>
+                <li><strong>Shared memory</strong>: Backends write WAL records to the shared buffer, WAL Writer reads from the shared buffer and writes to disk</li>
+                <li><strong>Latch</strong>: Backends use <code>SetLatch()</code> to wake up WAL Writer, WAL Writer uses <code>WaitLatch()</code> to wait for wake-up signals. Latch is PG's lightweight synchronization primitive, with much lower overhead than semaphores</li>
+            </ul>
+
+            <h4>Write vs Flush: Two-Phase Write</h4>
+
+            <p>WAL writing to disk has two phases, and understanding this distinction is crucial:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Phase</th><th>Operation</th><th>Data reaches</th><th>Performance</th><th>Durability</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Write</strong></td><td>Memory → OS file cache</td><td>OS kernel buffer</td><td>Fast (memory copy)</td><td>Lost on power failure</td></tr>
+                    <tr><td><strong>Flush</strong></td><td>OS file cache → disk</td><td>Persistent storage</td><td>Slow (real I/O)</td><td>Survives power failure</td></tr>
+                </tbody>
+            </table>
+
+            <p>Transaction COMMIT must ensure WAL Flush is complete — this is the key to the durability guarantee. The <code>synchronous_commit</code> parameter controls this behavior:</p>
+            <ul>
+                <li><code>on</code> (default): COMMIT waits for WAL Flush to complete before returning</li>
+                <li><code>off</code>: COMMIT doesn't wait for Flush, may lose the last few hundred milliseconds of transactions. Better performance but sacrifices durability</li>
+            </ul>
+
+            <h4>WAL Writer: Background Flush Process</h4>
+
+            <p>WAL Writer is <code>B_WAL_WRITER</code> in the <code>child_process_kinds</code> table, with entry function <code>WalWriterMain</code>:</p>
+
+<pre class="diagram"><code>  WalWriterMain main loop:
+
+  ┌────────────────────────────────────────┐
+  │  Set up signal handlers                │
+  │  SIGHUP → reload config               │
+  │  SIGTERM → graceful exit               │
+  └───────────────┬────────────────────────┘
+                  │
+                  ▼
+          ┌───────────────┐
+          │  WaitLatch()  │ ← Wait for wake-up or timeout
+          │  (sleeping)   │
+          └───────┬───────┘
+                  │ Woken up / timed out
+                  ▼
+          ┌───────────────────────┐
+          │ XLogBackgroundFlush() │
+          │                       │
+          │ 1. Get WAL position   │
+          │    that needs writing │
+          │ 2. Acquire exclusive  │
+          │    lock               │
+          │ 3. Wait for concurrent│
+          │    WAL inserts to     │
+          │    complete           │
+          │    (multiple Backends │
+          │     may be writing    │
+          │     WAL concurrently) │
+          │ 4. XLogWrite()        │
+          │    performs actual     │
+          │    disk write         │
+          │ 5. Decide whether to  │
+          │    fsync based on     │
+          │    policy             │
+          └───────┬───────────────┘
+                  │
+                  ▼
+          ┌───────────────┐
+          │  Back to       │
+          │  WaitLatch     │
+          └───────────────┘</code></pre>
+
+            <h4>XLogWrite: The Actual Disk Write</h4>
+
+            <p><code>XLogWrite</code> is the lowest-level write function. Its core logic:</p>
+
+            <ul>
+                <li>Enter critical section (<code>START_CRIT_SECTION</code>) — cannot be interrupted during writing, preventing WAL file corruption from a half-finished write</li>
+                <li>Wait for all in-progress WAL insertions to complete (<code>WaitXLogInsertionsToFinish</code>) — multiple Backends may be concurrently writing to the WAL buffer</li>
+                <li>Calculate the range of Pages to write, batch write via <code>pg_pwrite</code></li>
+                <li>Handle crossing WAL Segment boundaries — when the current file fills 16MB, switch to the next file</li>
+            </ul>
+
+<pre><code>// Core write loop of XLogWrite (simplified)
+do {
+    written = pg_pwrite(openLogFile, from, nleft, startoffset);
+    if (written <= 0) {
+        if (errno == EINTR) continue;  // Interrupted by signal, retry
+        ereport(PANIC, ...);           // Write failed → PANIC, database stops
+    }
+    nleft -= written;
+    from += written;
+    startoffset += written;
+} while (nleft > 0);</code></pre>
+
+            <p>Note that write failure triggers <code>PANIC</code> — WAL write failure means the durability guarantee is broken, and the database must immediately stop and wait for manual intervention.</p>
+
+            <h4>WAL File Organization</h4>
+
+<pre class="diagram"><code>  $PGDATA/pg_wal/
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ 000000010000000000000001  (16MB)                          │
+  │ ┌──────────┬──────────┬──────────┬─────┬──────────┐      │
+  │ │ WAL Page │ WAL Page │ WAL Page │ ... │ WAL Page │      │
+  │ │  0 (8KB) │  1 (8KB) │  2 (8KB) │     │ 2047     │      │
+  │ │ ┌──────┐ │          │          │     │          │      │
+  │ │ │Record│ │          │          │     │          │      │
+  │ │ │Record│ │          │          │     │          │      │
+  │ │ │Record│ │          │          │     │          │      │
+  │ │ └──────┘ │          │          │     │          │      │
+  │ └──────────┴──────────┴──────────┴─────┴──────────┘      │
+  ├──────────────────────────────────────────────────────────┤
+  │ 000000010000000000000002  (16MB)                          │
+  ├──────────────────────────────────────────────────────────┤
+  │ 000000010000000000000003  (16MB)                          │
+  └──────────────────────────────────────────────────────────┘
+
+  2048 x 8KB Pages = 16MB = one WAL Segment
+
+  Filename encoding: {Timeline}{SegmentHigh}{SegmentLow}
+  e.g.: 00000001 00000000 00000001 = Timeline 1, Segment 1
+
+  Lifecycle:
+  1. Create new file
+  2. Fill 16MB → switch to next
+  3. After Checkpoint → old files can be recycled
+  4. Recycle = rename and reuse (avoids create/delete overhead)</code></pre>
+
+            <h3>Checkpoint: Consistent Recovery Points</h3>
+
+            <p>Without Checkpoint, crash recovery would need to replay from the very first WAL record — as runtime grows, recovery time grows without bound. Checkpoint solves this: periodically flush all dirty pages to disk, creating a "consistency point" so recovery only needs to replay from the most recent Checkpoint.</p>
+
+<pre class="diagram"><code>  Time ──────────────────────────────────────────────────────►
+
+  WAL: ═══════════════════════════════════════════════════════
+       │              │                    │          │
+    Checkpoint 1   Checkpoint 2         Checkpoint 3  Crash!
+       │              │                    │          │
+       │              │                    │◄────────►│
+       │              │                    Recovery only
+       │              │                    needs to replay
+       │              │                    this WAL segment
+       │              │
+       │              After Checkpoint 2,
+       │              WAL before Checkpoint 1 can be recycled</code></pre>
+
+            <p>Checkpoint's entry point is <code>CheckpointerMain</code> (<code>B_CHECKPOINTER</code> process), triggered by:</p>
+
+            <ul>
+                <li><strong>Timeout trigger</strong>: <code>checkpoint_timeout</code> parameter (default 5 minutes)</li>
+                <li><strong>WAL volume trigger</strong>: When WAL produced exceeds <code>max_wal_size</code> (default 1GB)</li>
+                <li><strong>Manual trigger</strong>: Executing the <code>CHECKPOINT</code> command</li>
+                <li><strong>Shutdown trigger</strong>: Normal database shutdown</li>
+            </ul>
+
+            <h4>Checkpoint Execution Steps</h4>
+
+<pre class="diagram"><code>  CreateCheckPoint:
+
+  ┌─────────────────────────────────┐
+  │ 1. Get current WAL insert       │
+  │    position (redo LSN)          │
+  │    "WAL from this point needs   │
+  │    to be replayed"              │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 2. Flush all dirty buffers to   │
+  │    disk                         │
+  │    Iterate every dirty buffer   │
+  │    in Buffer Pool, call fsync   │
+  │    (this is the most expensive  │
+  │    step)                        │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 3. Flush WAL to disk            │
+  │    Ensure all WAL records are   │
+  │    persisted                    │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 4. Update control file          │
+  │    $PGDATA/global/pg_control    │
+  │    Write Checkpoint position    │
+  │    info                         │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 5. Recycle old WAL files        │
+  │    WAL before the Checkpoint    │
+  │    is no longer needed for      │
+  │    recovery → can be renamed    │
+  │    and reused                   │
+  └─────────────────────────────────┘</code></pre>
+
+            <p>Key constraint: Dirty page flushing during Checkpoint is gradual (<code>checkpoint_completion_target</code> parameter), avoiding a sudden burst of I/O that would impact normal queries. The default setting evenly distributes the flushing over 90% of the interval between two Checkpoints.</p>
+
+            <h3>Crash Recovery: Replaying WAL</h3>
+
+            <p>After a database crash and restart, <code>StartupProcessMain</code> (<code>B_STARTUP</code> process) handles recovery:</p>
+
+            <ul>
+                <li>Read the <code>pg_control</code> file, find the most recent Checkpoint position</li>
+                <li>Start reading WAL from the Checkpoint's redo LSN</li>
+                <li>For each WAL record, check the corresponding Page's <code>pd_lsn</code>: if <code>pd_lsn >= record_lsn</code>, the modification is already persisted — skip; otherwise call <code>rm_redo</code> to replay</li>
+                <li>After replaying to the end of WAL, recovery is complete and the database begins normal service</li>
+            </ul>
+
+<pre><code>// Core logic of crash recovery (pseudocode)
+checkpoint = ReadControlFile();       // Read pg_control
+lsn = checkpoint.redo;                // Recovery starting point
+
+while (record = ReadWALRecord(lsn)) {
+    page = GetPage(record.target);    // Find target Page
+
+    if (page.pd_lsn >= record.lsn)
+        continue;                     // Already applied, skip
+
+    rmgr = GetRmgr(record.rmid);
+    rmgr.rm_redo(record);             // Replay this WAL record
+    lsn = NextRecordLSN(record);
+}
+// Recovery complete</code></pre>
+
+            <h3>Streaming Replication: Another Consumer of WAL</h3>
+
+            <p>WAL isn't just for crash recovery — it's also the foundation of streaming replication. The <code>B_WAL_SENDER</code> process sends WAL to standbys in real time:</p>
+
+<pre class="diagram"><code>  Primary                                    Standby
+  ┌──────────────────────┐                  ┌──────────────────────┐
+  │                      │                  │                      │
+  │  Backend Process     │                  │  WAL Receiver        │
+  │  INSERT/UPDATE/...   │                  │  (B_WAL_RECEIVER)    │
+  │       │              │                  │       │              │
+  │       ▼              │                  │       ▼              │
+  │  WAL Buffer          │  Streaming       │  Write to WAL files  │
+  │       │              │  replication     │       │              │
+  │       ▼              │  protocol        │       ▼              │
+  │  WAL Sender          │ ◄──────────────► │  Startup Process     │
+  │  (B_WAL_SENDER)      │                  │  Continuously        │
+  │                      │                  │  replays WAL         │
+  │  XLogSendPhysical()  │ ─── WAL data ──► │       │              │
+  │  or                   │                  │       ▼              │
+  │  XLogSendLogical()   │                  │  Data consistent     │
+  │                      │                  │  with Primary        │
+  └──────────────────────┘                  └──────────────────────┘</code></pre>
+
+            <h4>Physical Replication vs Logical Replication</h4>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>Physical Replication</th><th>Logical Replication</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>What's sent</strong></td><td>Raw WAL byte stream</td><td>Decoded logical changes (INSERT row X)</td></tr>
+                    <tr><td><strong>Send function</strong></td><td>XLogSendPhysical</td><td>XLogSendLogical</td></tr>
+                    <tr><td><strong>Standby requirements</strong></td><td>Exact same PG version and platform</td><td>Can be different versions, even different databases</td></tr>
+                    <tr><td><strong>Granularity</strong></td><td>Entire cluster</td><td>Table-level, selectively replicated</td></tr>
+                    <tr><td><strong>Use case</strong></td><td>High availability, read replicas</td><td>Data integration, cross-version migration</td></tr>
+                </tbody>
+            </table>
+
+            <p>The logical replication decoding process: <code>XLogSendLogical</code> → <code>XLogReadRecord</code> reads WAL records → <code>LogicalDecodingProcessRecord</code> calls the corresponding resource manager's <code>rm_decode</code> function. For example, <code>DecodeInsert</code> parses <code>XLOG_HEAP_INSERT</code> type WAL records into row change events that logical replication can understand.</p>
+
+            <h4>Replication Slots and LSN</h4>
+
+            <p>Replication Slots track each subscriber's consumption progress:</p>
+            <ul>
+                <li><code>restart_lsn</code>: The starting position from which this slot needs WAL retained — WAL older than this cannot be recycled</li>
+                <li><code>confirmed_flush_lsn</code>: The position the subscriber has received and processed</li>
+            </ul>
+
+            <p>If a standby is disconnected for too long, <code>restart_lsn</code> will prevent WAL recycling, causing the primary's disk to fill up. This is a common failure scenario in production environments.</p>
+
+            <h4>Timeline: The Database's Branch History</h4>
+
+            <p>Timeline is PG's mechanism for handling database "branches." Each Timeline has a unique numeric ID, and new Timelines are created in these scenarios:</p>
+
+            <ul>
+                <li><strong>PITR</strong> (Point-in-Time Recovery): Recovering from a specific historical point in time</li>
+                <li><strong>Standby Promotion</strong>: A standby is promoted to primary</li>
+                <li><strong>Restoring from backup</strong></li>
+            </ul>
+
+<pre class="diagram"><code>  Timeline 1: ════════════════════════╗
+                                      ║ Standby promotion
+  Timeline 2:                         ╚═══════════════════
+                                            │
+                                    00000002.history file
+                                    Records which LSN TL2 branched from TL1</code></pre>
+
+            <p>Timeline history files (e.g., <code>00000002.history</code>) record branch points, helping the recovery process correctly select WAL files.</p>
+
+            <h3>PG Process Overview</h3>
+
+            <p>Finally, let's summarize all background processes covered in this series:</p>
+
+<pre class="diagram"><code>  postmaster (main process)
+  │
+  ├── Backend (B_BACKEND)           Handles client SQL queries
+  │   └── WAL Sender (B_WAL_SENDER) Upgraded from replication connections
+  │
+  ├── Background Writer (B_BG_WRITER)  Periodically flushes dirty pages, reducing Checkpoint pressure
+  ├── Checkpointer (B_CHECKPOINTER)    Periodically executes Checkpoints
+  ├── WAL Writer (B_WAL_WRITER)        Periodically flushes WAL buffer to disk
+  ├── Autovacuum Launcher              Schedules VACUUM work
+  │   └── Autovacuum Worker            Executes actual VACUUM
+  ├── WAL Receiver (B_WAL_RECEIVER)    Receives WAL on Standby
+  ├── WAL Summarizer                   WAL summaries (for incremental backups)
+  ├── Startup (B_STARTUP)              Crash recovery / Standby continuous replay
+  ├── Archiver (B_ARCHIVER)            Archives old WAL files
+  ├── IO Worker (B_IO_WORKER)          Async I/O worker threads
+  └── Syslogger (B_LOGGER)            Log collection</code></pre>
+
+            <p>PG uses a multi-process architecture where each background process runs independently, communicating through shared memory and Latches. The advantage is good isolation (one process crashing won't bring down others) and debug-friendly; the cost is that inter-process communication is heavier than inter-thread communication.</p>
+
+            <h3>Summary</h3>
+
+            <p>Key intuitions worth remembering:</p>
+
+            <ul>
+                <li><strong>WAL = sequential log writes + deferred data page writes</strong>: Converts expensive random I/O to cheap sequential I/O. Transaction commit only needs to ensure WAL is flushed; data pages can be written asynchronously</li>
+                <li><strong>Write ≠ Flush</strong>: Write only reaches the OS cache, Flush reaches disk. COMMIT needs Flush to guarantee durability</li>
+                <li><strong>WAL Writer and Backends communicate via shared memory + Latch</strong>: Multiple Backends concurrently write to the WAL buffer, WAL Writer handles flushing to disk. Write failure → PANIC</li>
+                <li><strong>Checkpoint = flush all dirty pages + create recovery point</strong>: Crash recovery only needs to replay from the most recent Checkpoint, not from the beginning. WAL before the Checkpoint can be recycled</li>
+                <li><strong>WAL serves both recovery and replication</strong>: The same WAL records are replayed by the Startup process during crash recovery, and sent to Standbys by WAL Sender during streaming replication</li>
+                <li><strong>Physical vs Logical</strong>: Physical replication sends raw byte streams (simple and efficient), logical replication decodes through resource managers into row change events (flexible but more complex)</li>
+            </ul>
+
+            <p>With this, the PostgreSQL storage engine trilogy is complete. From the 8KB internal layout of Heap Pages, to Buffer Pool page cache management, to index scans and MVCC visibility determination, to WAL's durability guarantees and Checkpoint's recovery mechanism — these layers of nested abstractions together form the core skeleton of a relational database.</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

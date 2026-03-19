@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCaml で埋め込み式表現言語を実装する - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>OCaml で埋め込み式表現言語を実装する</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/hours-jeanne-devreux.jpg" alt="The Hours of Jeanne d'Evreux, Jean Pucelle, c. 1324-28, Metropolitan Museum of Art">
+                <figcaption>Jean Pucelle,《ジャンヌ・デヴルーの時祷書》, c. 1324-28 — 中世の写本は精密な規則と記号体系を用いて複雑な情報を伝達した。表現言語を設計することも、一つの記号と規則の体系を定義すること</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：Schema 駆動の UI システムにおいて、条件レンダリング、フィールドバリデーション、動的計算にはすべて表現エンジンが必要である。文字列で JavaScript を組み立てて eval するのは安全でも制御可能でもない。この記事では、OCaml でゼロから安全な埋め込み式表現言語を実装した完全なプロセスを共有する——Lexer、Parser、AST、Pattern Matching、型推論、高階関数——最終的に js_of_ocaml で JavaScript にコンパイルし、フロントエンド UI フレームワークに埋め込む。プロダクトに安全で制御可能な計算エンジンを埋め込む必要があれば、このアプローチを参考にできる。
+            </blockquote>
+
+            <h3>なぜ独自の表現言語が必要か</h3>
+
+            <p><a href="schema-driven-ui.html">Schema 駆動 UI</a> の記事では、JSON でインターフェース全体を記述した。しかし JSON は静的で——「@age > 18 のときにこのフィールドを表示」「@price * @quantity で合計を計算」といった動的ロジックを記述できない。</p>
+
+            <p>最も簡単な方法は JavaScript の <code>eval()</code> や <code>new Function()</code> を使うことだが、2 つの致命的な問題がある：</p>
+
+            <ul>
+                <li><strong>セキュリティ</strong>：<code>eval()</code> は任意のコードを実行できる。表現がユーザー入力（例えば運用担当者がフォームルールを設定する場合）から来る場合、巨大なセキュリティホールになる</li>
+                <li><strong>制御性</strong>：表現ができることを制限できない。DOM にアクセスしたり、ネットワークリクエストを送ったり、グローバル状態を変更したりできる。「設定駆動」のシステムでは、サンドボックス化された計算のみを行うエンジンが必要</li>
+            </ul>
+
+            <p>そこで独自の表現言語を実装することにした。OCaml で書き、js_of_ocaml で JavaScript にコンパイルして、フロントエンドフレームワークに埋め込む。</p>
+
+            <h3>言語の見た目</h3>
+
+            <p>まずいくつかの例を見て、この言語の能力を感じてほしい：</p>
+
+<pre><code>// 基本的な算術と比較
+1 + 2                         // → 3
+@price * @quantity            // → フォームフィールドを参照して計算
+@age >= 18 and @country = "CN"  // → 条件判定
+
+// LET バインディング
+let tax = @price * 0.1 in
+let total = @price + tax in
+total                         // → 変数バインディングとスコープ
+
+// 配列とレコード
+let items = [1, 2, 3] in
+items[0]                      // → 1
+let user = {name: "Alice", age: 30} in
+user.name                     // → "Alice"
+
+// Record Spread
+let base = {x: 1, y: 2} in
+{...base, z: 3}              // → {x: 1, y: 2, z: 3}
+
+// 条件式
+if @score >= 90 then "A"
+else "B"                      // → OCaml スタイルの if-then-else
+
+// Pattern Matching
+match @status with
+| "active" -> "オンライン"
+| "idle" when @lastSeen > 60 -> "離席"
+| "idle" -> "待機"
+| _ -> "オフライン"            // → ガード付きパターンマッチング
+
+// Lambda と Pipe
+[1, 2, 3, 4]
+|> FILTER(fun x -> x > 2)
+|> MAP(fun x -> x * 10)      // → [30, 40]
+
+// 型定義
+type User = {name: string, age: int} in
+let u: User = {name: "Bob", age: 25} in
+u.age                         // → 25</code></pre>
+
+            <p>これはおもちゃではない——LET バインディング、ガード付き Pattern Matching、Lambda、カリー化、Pipe 演算子、Record Spread、型システムを備えている。しかし汎用プログラミング言語でもない——ループなし、副作用なし、IO なし。純粋な計算エンジンである。</p>
+
+            <h3>全体アーキテクチャ</h3>
+
+<pre><code>表現文字列
+    ↓ Lexer (ocamllex)
+Token ストリーム
+    ↓ Parser (menhir)
+AST
+    ↓ Type Inference (types.ml)
+型チェック結果
+    ↓ Evaluator (driver.ml + runtime.ml)
+計算結果
+
+    ↓ js_of_ocaml
+.js にコンパイルし、フロントエンドに埋め込む</code></pre>
+
+            <p>古典的なコンパイラフロントエンドアーキテクチャ。以下、各層を展開する。</p>
+
+            <h3>Lexer：ocamllex</h3>
+
+            <p>Lexer は文字列を token ストリームに分割する。OCaml の <code>ocamllex</code> ツールで生成：</p>
+
+<pre><code>(* lexer.mll *)
+let keyword_table = [
+  ("if", IF); ("then", THEN); ("else", ELSE);
+  ("let", LET); ("in", IN);
+  ("match", MATCH); ("with", WITH); ("when", WHEN);
+  ("fun", FUN); ("type", TYPE);
+  ("and", AND); ("or", OR);
+  ("true", TRUE); ("false", FALSE); ("null", NULL);
+]
+
+rule token = parse
+  | [' ' '\t' '\n']  { token lexbuf }       (* 空白をスキップ *)
+  | "//" [^'\n']* '\n'  { token lexbuf }     (* 単一行コメント *)
+  | "/*"              { comment lexbuf }      (* 複数行コメント *)
+  | '-'? ['0'-'9']+ as i  { NUM (int_of_string i) }
+  | '"'              { read_string (Buffer.create 16) lexbuf }
+  | ['a'-'z''A'-'Z']['a'-'z''A'-'Z''0'-'9''_']* as id {
+      match keyword_of_string id with
+      | Some token -> token
+      | None -> IDENT id
+    }
+  | '@' ['a'-'z''A'-'Z']+ as id {
+      CONTEXT_VAR (String.sub id 1 (String.length id - 1))
+    }
+  | "->"  { ARROW }
+  | "|>"  { PIPE }
+  | "??"  { NULLCOALESCE }
+  | "..." { DOTDOTDOT }
+  | ...</code></pre>
+
+            <p>注目すべきは <code>@</code> プレフィックス変数（<code>CONTEXT_VAR</code>）。表現内で <code>@price</code> と書くと、Lexer はコンテキスト変数として認識する——評価時に外部から渡された context オブジェクトから値を検索する。これが表現言語とホスト環境のインターフェース。</p>
+
+            <p>文字列処理はエスケープ文字と文字列補間（<code>"Hello ${name}"</code>）をサポートし、Lexer は <code>${</code> パターンを検出すると <code>INTERP_STRING</code> とマークし、評価段階で補間表現を再帰的に解析する。</p>
+
+            <h3>AST：データすなわちプログラム</h3>
+
+            <p>AST は言語全体のコアデータ構造。OCaml の代数的データ型（ADT）はこれを表現するのに最適：</p>
+
+<pre><code>(* ast.ml *)
+type pattern =
+  | PInt of int          (* 整数リテラルにマッチ *)
+  | PBool of bool        (* ブール値にマッチ *)
+  | PString of string    (* 文字列にマッチ *)
+  | PVar of string       (* 変数をバインド *)
+  | PArray of pattern list    (* 配列を分解 [x, y, z] *)
+  | PRecord of (string * pattern) list  (* レコードを分解 {name, age} *)
+  | PAny                 (* ワイルドカード _ *)
+
+type expr =
+  | Num of int | Float of float | Bool of bool
+  | String of string | InterpString of string | Null
+  | Var of string
+  (* データ構造 *)
+  | Array of expr list
+  | ArrayAccess of expr * expr
+  | Record of (string * expr) list
+  | RecordAccess of expr * string
+  | RecordSpread of expr * (string * expr) list
+  (* 算術と論理 *)
+  | Add of expr * expr | Sub of expr * expr
+  | Mul of expr * expr | Div of expr * expr
+  | Gt of expr * expr | Lt of expr * expr | ...
+  | And of expr * expr | Or of expr * expr | Eq of expr * expr
+  | NullCoalesce of expr * expr
+  (* 制御フロー *)
+  | If of expr * expr * expr
+  | Let of string * type_expr option * expr * expr
+  | Match of expr * (guarded_pattern * expr) list
+  (* 関数 *)
+  | FuncDef of string * string list * expr
+  | Lambda of string list * expr
+  | App of expr * expr      (* カリー化適用 f x *)
+  | Pipe of expr * expr     (* x |> f *)
+  (* 型システム *)
+  | TypeDef of type_decl * expr
+  | Seq of expr * expr
+
+and guarded_pattern = pattern * expr option</code></pre>
+
+            <p>いくつかの設計上の決定について説明する：</p>
+
+            <ul>
+                <li><strong>Let にオプショナルな型注釈</strong>：<code>Let of string * type_expr option * expr * expr</code>——<code>let x: int = 5 in ...</code> でも <code>let x = 5 in ...</code> でも合法</li>
+                <li><strong>Match の case は <code>guarded_pattern * expr</code></strong>：<code>guarded_pattern = pattern * expr option</code> で、<code>expr option</code> がオプショナルな <code>when</code> ガード</li>
+                <li><strong>App は二項演算</strong>：<code>f x y</code> は <code>App(App(f, x), y)</code> として解析される——標準的なカリー化表現</li>
+            </ul>
+
+            <h3>Parser：menhir</h3>
+
+            <p>Parser は <code>menhir</code>（OCaml の LR パーサージェネレータ）で定義。優先順位は低から高：</p>
+
+<pre><code>(* parser.mly *)
+%nonassoc IN
+%nonassoc ARROW
+%left SEMICOLON
+%left PIPE
+%nonassoc ELSE THEN
+%left BAR
+%left NULLCOALESCE
+%left AND OR
+%left EQ
+%left LT GT LTE GTE
+%left PLUS MINUS
+%left TIMES DIV
+%nonassoc APP           (* カリー化関数適用 *)
+%left DOT
+%nonassoc LBRAKET       (* 配列アクセス *)</code></pre>
+
+            <p>Pattern Matching の構文規則：</p>
+
+<pre><code>match_cases:
+  | guarded_pattern ARROW expr                     { [($1, $3)] }
+  | BAR guarded_pattern ARROW expr                 { [($2, $4)] }
+  | guarded_pattern ARROW expr BAR match_cases     { ($1, $3) :: $5 }
+  | BAR guarded_pattern ARROW expr BAR match_cases { ($2, $4) :: $6 }
+
+guarded_pattern:
+  | pattern                  { ($1, None) }
+  | pattern WHEN expr        { ($1, Some $3) }
+
+pattern:
+  | NUM { PInt $1 }
+  | UNDERSCORE { PAny }
+  | bool_literal { PBool $1 }
+  | STRING { PString $1 }
+  | IDENT { PVar $1 }
+  | LBRAKET array_patterns RBRAKET { PArray $2 }
+  | LBRACE record_pattern_fields RBRACE { PRecord $2 }</code></pre>
+
+            <p>最初の <code>BAR</code>（<code>|</code>）はオプショナルなので、以下のどちらのスタイルでも書ける：</p>
+
+<pre><code>// どちらのスタイルもOK
+match x with
+  1 -> "one"
+| 2 -> "two"
+| _ -> "other"
+
+match x with
+| 1 -> "one"
+| 2 -> "two"
+| _ -> "other"</code></pre>
+
+            <p>Record pattern はショートハンドをサポート：<code>{name}</code> は <code>{name: name}</code> と等価で、JavaScript の分割代入構文と同じ。</p>
+
+            <h3>評価器：Pattern Matching の実装</h3>
+
+            <p>評価器は再帰関数 <code>eval_expr : env -> expr -> value * env</code>。ほとんどのノードの評価は直接的（加算は加算、比較は比較）だが、最も興味深いのは Pattern Matching。</p>
+
+            <p>核心は <code>pattern_matches</code> 関数——値とパターンを受け取り、マッチ成功時の変数バインディング（<code>Some env</code>）または失敗（<code>None</code>）を返す：</p>
+
+<pre><code>let rec pattern_matches value = function
+  | PInt i ->
+      (match value with
+       | VInt i' when i' = i -> Some Env.empty
+       | _ -> None)
+  | PString s ->
+      (match value with
+       | VString s' when s' = s -> Some Env.empty
+       | _ -> None)
+  | PVar name ->
+      (* 変数パターン：常にマッチし、変数名をバインド *)
+      Some (Env.singleton name value)
+  | PArray patterns ->
+      (match value with
+       | VArray elements ->
+           if List.length patterns <> List.length elements then None
+           else
+             (* 各要素を再帰的にマッチ *)
+             let matches = List.mapi
+               (fun i pat -> pattern_matches (List.nth elements i) pat)
+               patterns in
+             if List.exists (fun x -> x = None) matches then None
+             else Some (merge_all_envs matches)
+       | _ -> None)
+  | PRecord pattern_fields ->
+      (match value with
+       | VRecord value_fields ->
+           (* 各パターンフィールドについて、値のレコードから検索し再帰的にマッチ *)
+           let matches = List.map (fun (key, pat) ->
+             match List.assoc_opt key value_fields with
+             | Some field_value -> pattern_matches field_value pat
+             | None -> None
+           ) pattern_fields in
+           if List.exists (fun x -> x = None) matches then None
+           else Some (merge_all_envs matches)
+       | _ -> None)
+  | PAny -> Some Env.empty</code></pre>
+
+            <p>Match 式の評価ロジック——上から順に各 case を試し、マッチ成功かつガード通過時に body を評価する：</p>
+
+<pre><code>| Match (e1, cases) ->
+    let v1, _ = eval_expr env e1 in
+    let rec try_match v = function
+      | [] -> failwith "Match error: no pattern matches"
+      | ((pattern, guard_opt), body) :: rest ->
+          match pattern_matches v pattern with
+          | Some pattern_env ->
+              let merged_env = Env.union ... pattern_env env in
+              (* ガードをチェック *)
+              let guard_passes = match guard_opt with
+                | None -> true
+                | Some guard_expr ->
+                    match eval_expr merged_env guard_expr with
+                    | VBool b, _ -> b
+                    | _ -> failwith "Guard must be boolean"
+              in
+              if guard_passes then eval_expr merged_env body
+              else try_match v rest    (* ガード失敗、次の case へ *)
+          | None -> try_match v rest   (* パターン不一致、次へ *)
+    in
+    try_match v1 cases</code></pre>
+
+            <p>ポイント：pattern_env と現在の env をマージしてガードと body に渡す。つまりガードはパターンでバインドされた変数を参照できる：</p>
+
+<pre><code>match user with
+| {name, age} when age > 18 -> CONCAT(name, " is adult")
+//  ↑ name と age はガード内で使用可能
+| {name} -> CONCAT(name, " is minor")</code></pre>
+
+            <h3>カリー化と Pipe</h3>
+
+            <p>関数適用はカリー化をサポート——引数が足りない場合、新しいクロージャを返す：</p>
+
+<pre><code>| App (func_expr, arg_expr) ->
+    (* すべての引数を収集 *)
+    let func_base, collected_args = collect_args func_expr [arg_val] in
+    match find_closure func_base with
+    | VClosure (params, body, closure_env) ->
+        let n_params = List.length params in
+        let n_args = List.length collected_args in
+        if n_args < n_params then
+          (* 部分適用：新しいクロージャを返す *)
+          let applied = take n_args params in
+          let remaining = drop n_args params in
+          let env' = bind_params closure_env applied collected_args in
+          (VClosure (remaining, body, env'), env)
+        else if n_args = n_params then
+          (* 完全適用：body を評価 *)
+          let env' = bind_params closure_env params collected_args in
+          eval_expr env' body
+        else
+          failwith "Too many arguments"</code></pre>
+
+            <p>Pipe 演算子（<code>|></code>）は左側の値を右側の関数の第一引数として渡す：</p>
+
+<pre><code>// この 2 つは等価
+[1, 2, 3] |> MAP(fun x -> x * 2)
+MAP([1, 2, 3], fun x -> x * 2)
+
+// チェーン呼び出し可能
+[1, 2, 3, 4, 5]
+|> FILTER(fun x -> x > 2)     // → [3, 4, 5]
+|> MAP(fun x -> x * 10)       // → [30, 40, 50]
+|> SUM                         // → 120</code></pre>
+
+            <p>実装上、Pipe は右側の型に応じて異なる処理を行う：関数呼び出し <code>FUNC(args)</code> の場合は左側の値を第一引数として挿入し、変数名の場合は単一引数関数として呼び出し、Lambda の場合は直接適用する。</p>
+
+            <h3>型システム</h3>
+
+            <p>この言語は完全な型推論システムを持つ。型の表現：</p>
+
+<pre><code>type typ =
+  | TInt | TFloat | TBool | TString | TDate | TNull
+  | TArray of typ
+  | TRecord of (string * typ) list
+  | TFunction of typ list * typ
+  | TUnion of typ list        (* int | string *)
+  | TAny                      (* 動的型 *)
+  | TName of string           (* ユーザー定義型の参照 *)</code></pre>
+
+            <p>型推論は双方向：</p>
+
+<pre><code>// 値から型を推論
+let x = 42 in ...              // x : int
+let arr = [1, 2, 3] in ...     // arr : int[]
+let u = {name: "Alice"} in ... // u : {name: string}
+
+// 型注釈からチェック
+let x: int = 42 in ...         // OK
+type User = {name: string, age: int} in
+let u: User = {name: "Bob", age: 25} in ...  // OK</code></pre>
+
+            <p>型システムは構造的部分型（structural subtyping）をサポート——Record 型の部分型関係はフィールドの包含に基づき、名前の一致ではない：</p>
+
+<pre><code>let is_subtype t1 t2 =
+  match (t1, t2) with
+  | _, TAny -> true              (* すべての型は Any の部分型 *)
+  | TInt, TFloat -> true         (* Int は Float の位置で使用可能 *)
+  | TNull, _ -> true             (* Null は任意の型 *)
+  | TRecord f1, TRecord f2 ->
+      (* 構造的部分型：f1 が f2 のすべてのフィールドを含む *)
+      List.for_all (fun (k2, v2) ->
+        match List.assoc_opt k2 f1 with
+        | Some v1 -> is_subtype v1 v2
+        | None -> false
+      ) f2
+  | ...</code></pre>
+
+            <p>If-then-else の型推論は <code>unify</code> を使用——2 つのブランチの型の和集合を取り、互換性がなければ Union 型を返す：</p>
+
+<pre><code>| If (_, then_expr, else_expr) ->
+    let t1 = infer_type env then_expr in
+    let t2 = infer_type env else_expr in
+    simplify_type (unify t1 t2)
+    // if ... then 1 else 2.0  → float（Int が Float に昇格）
+    // if ... then 1 else "a"  → int | string（Union 型）</code></pre>
+
+            <h3>組み込み関数ライブラリ</h3>
+
+            <p>言語自体の機能に加えて、カテゴリ別に整理された豊富な組み込み関数ライブラリがある：</p>
+
+            <table>
+                <thead>
+                    <tr><th>カテゴリ</th><th>関数</th><th>例</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>テキスト</td><td>UPPER, LOWER, TRIM, CONCAT, LEFT, RIGHT, MID, FIND, SUBSTITUTE</td><td><code>UPPER("hello")</code> → <code>"HELLO"</code></td></tr>
+                    <tr><td>数学</td><td>ABS, ROUND, FLOOR, CEIL, POW, SQRT, SUM, MAX, MIN, AVERAGE</td><td><code>ROUND(3.7)</code> → <code>4</code></td></tr>
+                    <tr><td>配列</td><td>LEN, CONTAINS, INDEX, SLICE, SORT, REVERSE, UNIQUE, JOIN</td><td><code>UNIQUE([1,2,2,3])</code> → <code>[1,2,3]</code></td></tr>
+                    <tr><td>高階</td><td>MAP, FILTER, REDUCE, EVERY, SOME, FLATMAP</td><td><code>FILTER([1,2,3], fun x -> x > 1)</code> → <code>[2,3]</code></td></tr>
+                    <tr><td>条件</td><td>IFS, IFNA</td><td><code>IFS(@x > 0, "正", @x < 0, "負", true, "零")</code></td></tr>
+                    <tr><td>日付</td><td>TODAY, YEAR, MONTH, DAY, DATEADD, DATEDIFF</td><td><code>YEAR(TODAY())</code> → <code>2026</code></td></tr>
+                    <tr><td>型</td><td>TYPE_OF, IS_STRING, IS_NUMBER, IS_ARRAY, IS_BOOL</td><td><code>TYPE_OF(42)</code> → <code>"int"</code></td></tr>
+                    <tr><td>フォーマット</td><td>FORMAT_NUMBER, FORMAT_PERCENT</td><td><code>FORMAT_PERCENT(0.85)</code> → <code>"85%"</code></td></tr>
+                </tbody>
+            </table>
+
+            <p>高階関数の実装には特別な処理が必要——組み込み関数がユーザーから渡された Lambda を呼び出す必要がある。ここでは循環依存を解消するために ref を使用した：</p>
+
+<pre><code>(* builtin.ml *)
+(* eval_expr への参照、driver.ml で初期化される *)
+let eval_closure_ref : (value Env.t -> expr -> value) ref =
+  ref (fun _ _ -> failwith "eval_closure not initialized")
+
+let apply_closure closure args =
+  match closure with
+  | VClosure (params, body, closure_env) ->
+      let env' = bind_params closure_env params args in
+      !eval_closure_ref env' body
+  | _ -> failwith "Expected a function"
+
+(* driver.ml で初期化 *)
+let () =
+  Builtin.eval_closure_ref := fun env expr ->
+    let result, _ = eval_expr env expr in
+    result</code></pre>
+
+            <p>これは OCaml でモジュール間の循環依存を処理する古典的パターン——<code>ref</code> で遅延バインディングを行う。</p>
+
+            <h3>JavaScript へのコンパイル</h3>
+
+            <p>OCaml コード全体を <code>js_of_ocaml</code> で JavaScript ファイルにコンパイルし、npm パッケージ <code>@gigaboo/expr</code> として公開：</p>
+
+<pre><code>// JavaScript 側での使用
+import { libexpr } from '@gigaboo/expr';
+
+// 単純な評価
+libexpr.eval('1 + 2');                    // → 3
+libexpr.eval('LET x = 10 IN x * 2');     // → 20
+
+// コンテキスト付き評価（@ 変数はここから取得）
+libexpr.evalInContext('@price * @qty', {
+  price: 99.9,
+  qty: 3
+});                                       // → 299.7
+
+// 型推論
+libexpr.inferType('LET x = [1, 2] IN x'); // → "int[]"</code></pre>
+
+            <p>Schema 駆動 UI での実際の使用法：</p>
+
+<pre><code>// ComponentSchema での条件レンダリング
+{
+  "type": "TextField",
+  "props": { "label": "会社名" },
+  "when": "@employmentType = \"employed\"",
+  "validation": {
+    "rule": "LEN(@companyName) >= 2",
+    "message": "会社名は2文字以上必要です"
+  }
+}
+
+// フロントエンドレンダラーが表現エンジンを呼び出す
+const shouldShow = libexpr.evalInContext(
+  schema.when,
+  formState  // { employmentType: "employed", ... }
+);
+if (shouldShow) {
+  renderComponent(schema);
+}</code></pre>
+
+            <h3>真理値表生成：業務担当者が自分でルールを検証</h3>
+
+            <p>Schema 駆動フォームを作る中で一つの問題に気づいた：業務担当者（プロダクトマネージャー、運用）が条件ルールを設定する際、自分が書いたロジックが正しいか不確かなことが多い。例えば承認フロールール <code>isManager and (amount > 1000 or isUrgent)</code> の場合、すべての状況を頭の中で網羅するのは難しい。</p>
+
+            <p>しかし彼らは Excel を使う。多くの業務担当者がロジックを検証する方法は、Excel で手動で真理値表を作ること——すべての変数の組み合わせを列挙し、各行の結果が期待通りか確認する。</p>
+
+            <p>表現評価器があるので、この作業は自動化できる。ブール式を与えると、完全な真理値表を自動生成する：</p>
+
+<pre><code>libexpr.analyze('a and (b or c)');
+
+// 出力：
+// -------------------
+// | a | b | c | result |
+// -------------------
+// | T | T | T | T      |
+// | T | T | F | T      |
+// | T | F | T | T      |
+// | T | F | F | F      |
+// | F | T | T | F      |
+// | F | T | F | F      |
+// | F | F | T | F      |
+// | F | F | F | F      |
+// -------------------</code></pre>
+
+            <p>実装方法：表現 AST からすべての変数名を再帰的に収集し、2^n 個のブール組み合わせを生成し、それぞれを評価する。</p>
+
+<pre><code>let rec collect_vars = function
+  | Var name -> [name]
+  | And (e1, e2) | Or (e1, e2) -> collect_vars e1 @ collect_vars e2
+  | _ -> []
+
+let rec gen_combinations = function
+  | [] -> [[]]
+  | v :: vs ->
+      let rest = gen_combinations vs in
+      List.map (fun l -> (v, true) :: l) rest
+      @ List.map (fun l -> (v, false) :: l) rest
+
+let analyze_expr expr =
+  let vars = List.sort_uniq String.compare (collect_vars expr) in
+  let combinations = gen_combinations vars in
+  List.map (fun env ->
+    let env_map = (* [(name, bool)] を評価環境に変換 *) in
+    let result = eval_expr env_map expr in
+    (env, result)
+  ) combinations</code></pre>
+
+            <p>プロダクトでは、この機能がフォームルールの設定画面に統合されている：業務担当者が条件式を書き終えた後、「検証」をクリックすると真理値表が表示され、各状況での動作が期待通りか直感的に確認できる。本番デプロイしてからテストする必要も、開発者にロジックのチェックを依頼する必要もない。</p>
+
+            <h3>なぜ OCaml を使うか</h3>
+
+            <p>OCaml で表現エンジンを書くのは、格好いいからではなく、いくつかの特性がこの種の作業を非常にスムーズにするから：</p>
+
+            <ul>
+                <li><strong>代数的データ型 + Pattern Matching</strong>：AST 定義と再帰評価を ADT で書くと極めて自然。<code>match expr with Add(e1, e2) -> ...</code> と書く方が、大量の if-else や visitor pattern よりはるかにすっきりしている</li>
+                <li><strong>ocamllex + menhir</strong>：産業グレードの Lexer/Parser ジェネレーターで、構文定義から直接効率的な解析コードを生成。手書きの再帰下降は不要</li>
+                <li><strong>js_of_ocaml</strong>：JavaScript へのコンパイルの成熟したソリューション。生成された JS ファイルは npm パッケージとしてそのまま公開でき、呼び出し側に対して完全に透過的</li>
+                <li><strong>型安全性</strong>：OCaml の型システムが評価器の網羅性を保証——AST に新しいノードを追加しても処理を忘れると、コンパイラがエラーを報告する</li>
+            </ul>
+
+            <h3>まとめ</h3>
+
+            <p>この表現言語の設計目標は：<strong>設定駆動の UI システムにおいて、安全で制御可能な、十分な表現力を持つ計算エンジンを提供する</strong>こと。</p>
+
+            <p>その能力の境界は明確：</p>
+            <ul>
+                <li><strong>できること</strong>：算術、比較、論理演算、条件分岐、パターンマッチング、配列/レコード操作、高階関数、型チェック</li>
+                <li><strong>できないこと</strong>：ループ、副作用、IO、DOM アクセス、ネットワークリクエスト</li>
+            </ul>
+
+            <p>この「できないこと」こそが価値——運用担当者がフォームルールを設定できるシステムでは、表現エンジンが計算のみを行い、危険なことは一切できないことが望ましい。</p>
+
+            <p>完全な実装は約 1000 行の OCaml コード（lexer + parser + AST + evaluator + type system + builtins）。プロダクトに表現エンジンを埋め込む必要があれば、OCaml + js_of_ocaml は検討に値するアプローチである。</p>
+
+            <p><em>この記事は Schema 駆動シリーズの延長である。シリーズの他の記事：<a href="form-builder.html">Schema 駆動フォーム（上）：データモデルとレンダラー</a>、<a href="schema-driven-ui.html">Schema 駆動フォーム（下）：表現エンジンと汎用 UI レンダリング</a></em></p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

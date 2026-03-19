@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PowerSearch：コンポーザブルなフロントエンド高度検索バーの構築 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PowerSearch：コンポーザブルなフロントエンド高度検索バーの構築</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/emmoser-celestial-globe.jpg" alt="Celestial Globe by Gerhard Emmoser">
+                <figcaption>Gerhard Emmoser、天球儀、1579 — 精密な構造の中で、各星には独自の座標と分類がある。高度検索も同様：構造化された条件で探しているものを正確に定位する</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：ほぼすべての B 向けプロダクトに高度検索が必要だが、ほとんどの実装は入力ボックスを並べた粗末なものか、組み合わせやネストができない半端なものである。ここでは再帰的な条件ツリーに基づくデータモデルを共有し、検索バーが AND/OR の組み合わせと無限のネストを自然にサポートできるようにする——データ構造が正しければ、UI インタラクションもバックエンドマッピングもシンプルになる。
+            </blockquote>
+
+            <h3>問題</h3>
+
+            <p>B 向けプロダクトのリストページにはほぼすべて検索とフィルタリングが必要。最もシンプルなやり方は入力ボックスやドロップダウンを並べることだが、フィールドが増えると見た目が悪くなり、複雑なロジックを表現できない——例えば「ステータスが完了済み <strong>かつ</strong>（作成者が田中 <strong>または</strong> 作成者が佐藤）」。</p>
+
+            <p>Jira、Linear、Notion といったプロダクトの検索バーは、ユーザーが動的にフィルター条件を追加し、フィールド、演算子、値を選択し、さらに AND/OR で条件を組み合わせ、グループをネストできる。このインタラクションを <strong>PowerSearch</strong>（または Advanced Filter、Structured Search）と呼ぶ。</p>
+
+            <p>複雑に見えるが、データ構造は実は非常に明確——本質的に条件式のツリーである。</p>
+
+            <h3>データモデル</h3>
+
+            <p>システム全体の型定義はわずかいくつか：</p>
+
+<pre><code>// フィールド設定——検索可能なフィールドを定義
+type FieldConfig = {
+  id: string;          // "status"
+  label: string;       // "ステータス"
+  type: "text" | "number" | "date" | "select" | "boolean";
+  operators: OperatorOption[];     // そのフィールドがサポートする演算子
+  options?: { value: string; label: string }[];  // select タイプの選択肢
+};
+
+// 演算子
+type OperatorOption = {
+  id: string;      // "eq"
+  label: string;   // "等しい"
+  symbol: string;  // "="
+};
+
+// 単一のフィルター条件
+type FilterCondition = {
+  id: string;
+  type: "condition";
+  fieldId: string;     // どのフィールド
+  operatorId: string;  // どの演算子
+  value: string;       // 比較する値
+};
+
+// 条件グループ（再帰構造、ネスト対応）
+type ConditionGroup = {
+  id: string;
+  type: "group";
+  operator: "AND" | "OR";
+  conditions: (FilterCondition | ConditionGroup)[];  // ネスト可能
+};</code></pre>
+
+            <p>鍵は最後の型：<code>ConditionGroup</code> の <code>conditions</code> 配列が <code>FilterCondition</code>（リーフノード）も <code>ConditionGroup</code>（サブツリー）も含められること。これが再帰的な式ツリーである。</p>
+
+            <p>実際のクエリはこのような形：</p>
+
+<pre><code>// "ステータス = 完了済み AND (作成者 = 田中 OR 作成者 = 佐藤)"
+{
+  id: "root",
+  type: "group",
+  operator: "AND",
+  conditions: [
+    {
+      id: "c1", type: "condition",
+      fieldId: "status", operatorId: "eq", value: "done"
+    },
+    {
+      id: "g1", type: "group",
+      operator: "OR",
+      conditions: [
+        {
+          id: "c2", type: "condition",
+          fieldId: "creator", operatorId: "eq", value: "tanaka"
+        },
+        {
+          id: "c3", type: "condition",
+          fieldId: "creator", operatorId: "eq", value: "sato"
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+            <h3>コンポーネント API 設計</h3>
+
+            <p>利用側が提供する必要があるのは 2 つだけ：フィールド設定と検索コールバック。</p>
+
+<pre><code>const fields: FieldConfig[] = [
+  {
+    id: "name",
+    label: "名前",
+    type: "text",
+    operators: [
+      { id: "contains", label: "含む", symbol: "⊃" },
+      { id: "eq", label: "等しい", symbol: "=" },
+      { id: "starts_with", label: "で始まる", symbol: "^" },
+    ],
+  },
+  {
+    id: "status",
+    label: "ステータス",
+    type: "select",
+    operators: [
+      { id: "eq", label: "等しい", symbol: "=" },
+      { id: "neq", label: "等しくない", symbol: "≠" },
+    ],
+    options: [
+      { value: "active", label: "進行中" },
+      { value: "done", label: "完了済み" },
+      { value: "archived", label: "アーカイブ済み" },
+    ],
+  },
+  {
+    id: "created_at",
+    label: "作成日",
+    type: "date",
+    operators: [
+      { id: "after", label: "以降", symbol: ">" },
+      { id: "before", label: "以前", symbol: "&lt;" },
+    ],
+  },
+  {
+    id: "priority",
+    label: "優先度",
+    type: "number",
+    operators: [
+      { id: "eq", label: "等しい", symbol: "=" },
+      { id: "gt", label: "より大きい", symbol: ">" },
+      { id: "lt", label: "より小さい", symbol: "&lt;" },
+    ],
+  },
+  {
+    id: "enabled",
+    label: "有効かどうか",
+    type: "boolean",
+    operators: [
+      { id: "eq", label: "等しい", symbol: "=" },
+    ],
+  },
+];
+
+function handleSearch(query: ConditionGroup) {
+  // 条件ツリーを API リクエストに変換
+  console.log(JSON.stringify(query, null, 2));
+}
+
+&lt;PowerSearchBar
+  fields={fields}
+  onSearch={handleSearch}
+  placeholder="クリックしてフィルター条件を追加..."
+  defaultOperator="AND"
+/&gt;</code></pre>
+
+            <p>コンポーネント内部は <code>ConditionGroup</code> ツリーを状態として維持する。ユーザーが条件を追加/変更/削除するたびにツリーが更新され、<code>onSearch</code> コールバック経由で外部に渡される。呼び出し側はこのツリーを受け取り、GraphQL の where 句や REST API の query string に変換してバックエンドに送る。</p>
+
+            <h3>インタラクションフロー</h3>
+
+            <p>フィルター条件の追加は 3 ステップのガイドフロー：</p>
+
+<pre><code>1. フィールド選択 → フィールドリストをポップアップ（Field Dropdown）
+                ┌─────────────────┐
+                │ Select Field    │
+                ├─────────────────┤
+                │ 名前      text  │
+                │ ステータス select│
+                │ 作成日    date  │
+                │ 優先度  number  │
+                └─────────────────┘
+
+2. 演算子選択 → フィールドタイプに応じた演算子を表示
+                ┌─────────────────┐
+                │ Select Operator │
+                ├─────────────────┤
+                │ 等しい        = │
+                │ 等しくない    ≠ │
+                └─────────────────┘
+
+3. 値入力 → フィールドタイプに応じた入力方法を表示
+   text   → テキスト入力ボックス
+   number → 数値入力ボックス
+   date   → 日付ピッカー
+   select → 選択肢リスト
+   boolean → true/false 選択</code></pre>
+
+            <p>各ステップ完了後に自動的に次のステップへ進み、3 ステップ完了で自動的に条件が送信される。この段階的なガイドは、3 つのドロップダウンを横に並べて直接表示するより体験が良い——ユーザーは毎回 1 つの判断だけすればよい。</p>
+
+            <h3>状態管理</h3>
+
+            <p>コンポーネント内部には 2 つのコア状態がある：</p>
+
+<pre><code>// 1. 条件ツリー（完全なクエリ構造）
+const [rootGroup, setRootGroup] = useState&lt;ConditionGroup&gt;({
+  id: "root",
+  type: "group",
+  operator: defaultOperator,
+  conditions: [],
+});
+
+// 2. 現在編集中の条件（3 ステップガイドの中間状態）
+const [editingCondition, setEditingCondition] = useState&lt;{
+  condition: Partial&lt;FilterCondition&gt;;  // フィールドのみ選択済みで演算子未選択かもしれない
+  groupId: string;   // どのグループに属するか
+  index?: number;    // 既存条件の編集時のインデックス
+} | null&gt;(null);</code></pre>
+
+            <p>条件ツリーの変更はすべてディープコピーで実装（immutable update）し、React が変更を正しく検出できるようにする：</p>
+
+<pre><code>// 条件ツリーのディープコピー
+const deepCloneGroup = (group: ConditionGroup): ConditionGroup =&gt; ({
+  ...group,
+  conditions: group.conditions.map((c) =&gt;
+    c.type === "group" ? deepCloneGroup(c) : { ...c }
+  ),
+});
+
+// ネストされたツリー内でターゲットグループを見つける
+const findGroupById = (
+  group: ConditionGroup, id: string
+): ConditionGroup | null =&gt; {
+  if (group.id === id) return group;
+  for (const c of group.conditions) {
+    if (c.type === "group") {
+      const found = findGroupById(c, id);
+      if (found) return found;
+    }
+  }
+  return null;
+};</code></pre>
+
+            <p>条件を変更するたびに：ツリーをディープコピー → ターゲットグループを見つける → 変更 → 新しい状態を設定 → <code>onSearch</code> コールバックをトリガー。</p>
+
+            <h3>値入力のタイプ適応</h3>
+
+            <p>第 3 ステップ「値入力」はフィールドタイプに応じて異なる入力コンポーネントをレンダリングする。これは switch の分岐：</p>
+
+<pre><code>const renderValueInput = () =&gt; {
+  const field = getField(editingCondition.condition.fieldId);
+
+  switch (field.type) {
+    case "select":
+      // 選択肢リストをレンダリング、クリックで直接送信
+      return &lt;OptionsList options={field.options} onSelect={handleSubmit} /&gt;;
+
+    case "boolean":
+      // true/false の 2 つの選択肢のみ
+      return &lt;BooleanPicker onSelect={handleSubmit} /&gt;;
+
+    case "date":
+      // 日付ピッカー
+      return &lt;input type="date" onChange={handleValueChange} /&gt;;
+
+    case "number":
+      // 数値入力ボックス
+      return &lt;input type="number" onChange={handleValueChange} /&gt;;
+
+    default:  // text
+      // テキスト入力ボックス、Enter で送信
+      return &lt;input type="text" onChange={handleValueChange}
+                     onKeyDown={e =&gt; e.key === "Enter" && handleSubmit()} /&gt;;
+  }
+};</code></pre>
+
+            <p><code>select</code> と <code>boolean</code> タイプの特別な処理に注目：ユーザーが選択肢をクリックすると直接条件が送信される。追加の「確認」ボタンが不要。クリック 1 回分が減り、インタラクションがよりスムーズになる。</p>
+
+            <h3>AND/OR 切り替えと条件グループ化</h3>
+
+            <p>条件間の論理関係は <code>ConditionGroup.operator</code> で制御する。UI 上ではクリック可能な小さなラベルで、クリックするたびに AND と OR を切り替える：</p>
+
+<pre><code>const handleToggleOperator = (groupId: string) =&gt; {
+  setRootGroup((prev) =&gt; {
+    const updated = deepCloneGroup(prev);
+    const group = findGroupById(updated, groupId);
+    if (group) {
+      group.operator = group.operator === "AND" ? "OR" : "AND";
+    }
+    onSearch(updated);
+    return updated;
+  });
+};</code></pre>
+
+            <p>ネストされたグループによりユーザーはより複雑なロジックを表現できる。例えば「(A AND B) OR (C AND D)」——トップレベルが OR で、2 つのサブグループがそれぞれ AND。実装上、最大ネスト深度を 3 層に制限し、条件ツリーが複雑になりすぎるのを防ぐ：</p>
+
+<pre><code>// 深度 &lt; 3 の場合のみ「グループ追加」ボタンを表示
+{depth &lt; 3 && (
+  &lt;button onClick={() =&gt; handleAddGroup(group.id)}&gt;
+    Add Group
+  &lt;/button&gt;
+)}</code></pre>
+
+            <h3>条件のレンダリング</h3>
+
+            <p>条件ツリーのレンダリングも再帰的。各 <code>ConditionGroup</code> が自身の operator ラベルと conditions リストをレンダリングし、サブグループに出会ったら自身を再帰呼び出しする：</p>
+
+<pre><code>const renderGroup = (group: ConditionGroup, depth = 0) =&gt; (
+  &lt;div className={depth &gt; 0 ? "nested-group" : ""}&gt;
+    {/* AND/OR 切り替えボタン */}
+    {group.conditions.length &gt; 0 && (
+      &lt;button onClick={() =&gt; handleToggleOperator(group.id)}&gt;
+        {group.operator}
+      &lt;/button&gt;
+    )}
+
+    {/* 各条件を順にレンダリング */}
+    {group.conditions.map((condition, index) =&gt; {
+      if (condition.type === "group") {
+        // サブグループを再帰的にレンダリング
+        return renderGroup(condition, depth + 1);
+      } else {
+        // 単一の条件ピルをレンダリング
+        const field = getField(condition.fieldId);
+        const operator = getOperator(condition.fieldId, condition.operatorId);
+        return (
+          &lt;div className="condition-pill"&gt;
+            &lt;span className="field"&gt;{field?.label}&lt;/span&gt;
+            &lt;span className="operator"&gt;{operator?.symbol}&lt;/span&gt;
+            &lt;span className="value"&gt;{condition.value}&lt;/span&gt;
+            &lt;button onClick={() =&gt; handleRemove(group.id, index)}&gt;×&lt;/button&gt;
+          &lt;/div&gt;
+        );
+      }
+    })}
+
+    {/* 条件/グループ追加ボタン */}
+    &lt;button onClick={() =&gt; handleAddCondition(group.id)}&gt;+ Add Filter&lt;/button&gt;
+    {depth &lt; 3 && &lt;button onClick={() =&gt; handleAddGroup(group.id)}&gt;() Add Group&lt;/button&gt;}
+  &lt;/div&gt;
+);</code></pre>
+
+            <p>ネストされたサブグループは左ボーダーとインデント（<code>border-left + padding-left</code>）で表現し、視覚的に階層関係を明確に伝える。</p>
+
+            <h3>バックエンドとの連携</h3>
+
+            <p><code>onSearch</code> コールバックが返すのは <code>ConditionGroup</code> ツリー。バックエンドは通常これをデータベースクエリに変換する必要がある。この変換は再帰的：</p>
+
+<pre><code>// SQL WHERE 句に変換（擬似コード）
+function toSQL(group: ConditionGroup): string {
+  const parts = group.conditions.map((c) =&gt; {
+    if (c.type === "group") {
+      return `(${toSQL(c)})`;
+    }
+    const op = operatorToSQL(c.operatorId);  // "eq" → "=", "contains" → "LIKE"
+    const val = escapeSQL(c.value);
+    return `${c.fieldId} ${op} ${val}`;
+  });
+  return parts.join(` ${group.operator} `);
+}
+
+// 出力: status = 'done' AND (creator = 'tanaka' OR creator = 'sato')</code></pre>
+
+            <p>GraphQL を使う場合、ツリー構造をネストされた <code>where</code> input に直接マッピングできる：</p>
+
+<pre><code>// GraphQL where input
+{
+  and: [
+    { status: { eq: "done" } },
+    {
+      or: [
+        { creator: { eq: "tanaka" } },
+        { creator: { eq: "sato" } }
+      ]
+    }
+  ]
+}</code></pre>
+
+            <p>データ構造は同型——フロントエンドの <code>ConditionGroup</code> と GraphQL の <code>where</code> input は同じツリーの異なる表現に過ぎない。変換はほぼ一対一のマッピング。</p>
+
+            <h3>設計上の考察</h3>
+
+            <ul>
+                <li><strong>なぜフラット配列ではなくツリーか</strong>：フラットな <code>{ field, op, value }[]</code> 配列は全 AND または全 OR の関係しか表現できない。混合ロジック（「A AND (B OR C)」）が必要になった時点でツリーが必要。ツリーは最も汎用的な構造であり、フラット配列はツリーの退化した特殊ケースに過ぎない。</li>
+                <li><strong>なぜ FieldConfig に operators を含めるか</strong>：異なるタイプのフィールドは異なる演算子をサポートする——テキストフィールドは「含む」、数値フィールドは「より大きい/より小さい」、ブールフィールドは「等しい」のみ。operators をフィールドに紐付けることで（グローバル定義ではなく）、「日付フィールドで含むを選択」という無意味な組み合わせを防ぐ。</li>
+                <li><strong>なぜ 3 つのドロップダウンを横に並べるのではなく 3 ステップに分けるか</strong>：段階的ガイドが認知的負荷を減らす。ユーザーは毎回 1 つの選択に集中するだけで、3 つのドロップダウンに同時に面してどこから始めるか迷わない。</li>
+                <li><strong>ネスト深度の制限</strong>：理論上、再帰構造は無限にネストできるが、実際には 3 層を超えるネストの検索条件はほぼ保守不能。深度の制限はユーザーへの保護。</li>
+                <li><strong>条件はデータそのもの</strong>：検索状態全体がシリアライズ可能な JSON ツリー。つまり URL query string に保存（検索結果の共有）、ユーザー設定に永続化（よく使うフィルターの保存）、「ビュー」として保存（Notion の database views のように）できる。</li>
+            </ul>
+
+            <h3>拡張の方向性</h3>
+
+            <ul>
+                <li><strong>ビューとして保存</strong>：<code>ConditionGroup</code> JSON をデータベースに保存し、ユーザーが次回アクセスした際に直接ロード。Notion のフィルタービューのように。</li>
+                <li><strong>URL シリアライズ</strong>：条件ツリーを URL にエンコード（base64 またはカスタム構文）し、検索結果ページを他の人と共有可能に。</li>
+                <li><strong>フィールド間の依存</strong>：「国 = 日本」を選択した後、「都市」フィールドの選択肢が自動的に日本の都市にフィルタリングされる。FieldConfig に <code>dependsOn</code> と動的な options ローディングを追加する必要がある。</li>
+                <li><strong>カスタム演算子</strong>：例えば「リスト内」（IN）、「空」（IS NULL）、「範囲内」（BETWEEN）。FieldConfig.operators に新しい OperatorOption を追加するだけで、レンダラーが自動適応。</li>
+                <li><strong>キーボードナビゲーション</strong>：矢印キーで条件間を移動、Tab でステップ切り替え、Delete で条件削除。高頻度使用ユーザーにとってキーボード操作はマウスより遥かに速い。</li>
+            </ul>
+
+            <h3>まとめ</h3>
+
+            <p>PowerSearch のコアは 2 つだけ：再帰的な条件ツリーデータ構造と、3 ステップの段階的な条件編集インタラクション。データ構造がどれだけ複雑なクエリを表現できるかを決め（任意の AND/OR ネスト）、インタラクション設計が複雑なクエリを構築しやすいかを決める（フィールド → 演算子 → 値のガイドフロー）。</p>
+
+            <p>エンジニアリングの観点から、このコンポーネントのコアコード量は多くない——型定義 30 行、状態管理 50 行、再帰レンダリング 50 行。大部分のコードは UI の詳細（ドロップダウンのスタイル、ホバーエフェクト、キーボードイベント）にある。これはフロントエンドコンポーネントの常態：コアロジックはシンプルだが、良いインタラクション体験にするには大量のディテールの作り込みが必要。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

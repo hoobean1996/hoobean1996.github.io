@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building an Embedded Expression Language in OCaml - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>Building an Embedded Expression Language in OCaml</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/hours-jeanne-devreux.jpg" alt="The Hours of Jeanne d'Evreux, Jean Pucelle, c. 1324-28, Metropolitan Museum of Art">
+                <figcaption>Jean Pucelle, "The Hours of Jeanne d'Evreux", c. 1324-28 — Medieval manuscripts used precise rules and symbol systems to convey complex information. Designing an expression language is similarly about defining a set of symbols and rules</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>The value of this article</strong>: In Schema-driven UI systems, conditional rendering, field validation, and dynamic computation all require an expression engine. Using string-concatenated JavaScript with eval is neither safe nor controllable. This article shares the complete process of building a safe embedded expression language from scratch in OCaml — Lexer, Parser, AST, Pattern Matching, Type Inference, Higher-Order Functions — ultimately compiled to JavaScript via js_of_ocaml and embedded into a frontend UI framework. If you need to embed a safe and controllable computation engine in your product, this approach is worth considering.
+            </blockquote>
+
+            <h3>Why Build Our Own Expression Language</h3>
+
+            <p>In the <a href="schema-driven-ui.html">Schema-Driven UI</a> article, we use JSON to describe entire interfaces. But JSON is static — it can't describe dynamic logic like "show this field when @age > 18" or "calculate total with @price * @quantity."</p>
+
+            <p>The simplest approach would be JavaScript's <code>eval()</code> or <code>new Function()</code>. But this has two fatal problems:</p>
+
+            <ul>
+                <li><strong>Security</strong>: <code>eval()</code> can execute arbitrary code. If expressions come from user input (e.g., operations staff configuring form rules), this is a massive security vulnerability</li>
+                <li><strong>Controllability</strong>: You can't limit what expressions can do. They can access the DOM, make network requests, modify global state. In a "configuration-driven" system, you need a sandboxed engine that can only perform computations</li>
+            </ul>
+
+            <p>So I decided to build my own expression language. Written in OCaml, compiled to JavaScript via js_of_ocaml, and embedded into the frontend framework.</p>
+
+            <h3>What the Language Looks Like</h3>
+
+            <p>Here are some examples to give you a feel for the language's capabilities:</p>
+
+<pre><code>// Basic arithmetic and comparison
+1 + 2                         // → 3
+@price * @quantity            // → Reference form fields for calculation
+@age >= 18 and @country = "CN"  // → Conditional judgment
+
+// LET binding
+let tax = @price * 0.1 in
+let total = @price + tax in
+total                         // → Variable binding and scoping
+
+// Arrays and records
+let items = [1, 2, 3] in
+items[0]                      // → 1
+let user = {name: "Alice", age: 30} in
+user.name                     // → "Alice"
+
+// Record Spread
+let base = {x: 1, y: 2} in
+{...base, z: 3}              // → {x: 1, y: 2, z: 3}
+
+// Conditional expressions
+if @score >= 90 then "A"
+else "B"                      // → OCaml-style if-then-else
+
+// Pattern Matching
+match @status with
+| "active" -> "Online"
+| "idle" when @lastSeen > 60 -> "Away"
+| "idle" -> "Idle"
+| _ -> "Offline"              // → Pattern matching with guards
+
+// Lambda and Pipe
+[1, 2, 3, 4]
+|> FILTER(fun x -> x > 2)
+|> MAP(fun x -> x * 10)      // → [30, 40]
+
+// Type definitions
+type User = {name: string, age: int} in
+let u: User = {name: "Bob", age: 25} in
+u.age                         // → 25</code></pre>
+
+            <p>This is not a toy — it has LET bindings, Pattern Matching with Guards, Lambda, currying, Pipe operator, Record Spread, and a type system. But it's also not a general-purpose programming language — no loops, no side effects, no IO. It's a pure computation engine.</p>
+
+            <h3>Overall Architecture</h3>
+
+<pre><code>Expression string
+    ↓ Lexer (ocamllex)
+Token stream
+    ↓ Parser (menhir)
+AST
+    ↓ Type Inference (types.ml)
+Type checking result
+    ↓ Evaluator (driver.ml + runtime.ml)
+Computation result
+
+    ↓ js_of_ocaml
+Compiled to .js, embedded in frontend</code></pre>
+
+            <p>Classic compiler frontend architecture. Let's go through each layer.</p>
+
+            <h3>Lexer: ocamllex</h3>
+
+            <p>The Lexer splits strings into a token stream. Generated using OCaml's <code>ocamllex</code> tool:</p>
+
+<pre><code>(* lexer.mll *)
+let keyword_table = [
+  ("if", IF); ("then", THEN); ("else", ELSE);
+  ("let", LET); ("in", IN);
+  ("match", MATCH); ("with", WITH); ("when", WHEN);
+  ("fun", FUN); ("type", TYPE);
+  ("and", AND); ("or", OR);
+  ("true", TRUE); ("false", FALSE); ("null", NULL);
+]
+
+rule token = parse
+  | [' ' '\t' '\n']  { token lexbuf }       (* Skip whitespace *)
+  | "//" [^'\n']* '\n'  { token lexbuf }     (* Single-line comment *)
+  | "/*"              { comment lexbuf }      (* Multi-line comment *)
+  | '-'? ['0'-'9']+ as i  { NUM (int_of_string i) }
+  | '"'              { read_string (Buffer.create 16) lexbuf }
+  | ['a'-'z''A'-'Z']['a'-'z''A'-'Z''0'-'9''_']* as id {
+      match keyword_of_string id with
+      | Some token -> token
+      | None -> IDENT id
+    }
+  | '@' ['a'-'z''A'-'Z']+ as id {
+      CONTEXT_VAR (String.sub id 1 (String.length id - 1))
+    }
+  | "->"  { ARROW }
+  | "|>"  { PIPE }
+  | "??"  { NULLCOALESCE }
+  | "..." { DOTDOTDOT }
+  | ...</code></pre>
+
+            <p>Notable is the <code>@</code>-prefixed variable (<code>CONTEXT_VAR</code>). Writing <code>@price</code> in an expression, the Lexer recognizes it as a context variable — during evaluation, it looks up the value from an externally provided context object. This is the interface between the expression language and its host environment.</p>
+
+            <p>String handling supports escape characters and string interpolation (<code>"Hello ${name}"</code>). When the Lexer detects the <code>${</code> pattern, it marks it as <code>INTERP_STRING</code>, and the interpolation expression is recursively parsed during the evaluation phase.</p>
+
+            <h3>AST: Data as Program</h3>
+
+            <p>The AST is the core data structure of the entire language. OCaml's algebraic data types (ADT) are perfectly suited for this:</p>
+
+<pre><code>(* ast.ml *)
+type pattern =
+  | PInt of int          (* Match integer literal *)
+  | PBool of bool        (* Match boolean *)
+  | PString of string    (* Match string *)
+  | PVar of string       (* Bind variable *)
+  | PArray of pattern list    (* Destructure array [x, y, z] *)
+  | PRecord of (string * pattern) list  (* Destructure record {name, age} *)
+  | PAny                 (* Wildcard _ *)
+
+type expr =
+  | Num of int | Float of float | Bool of bool
+  | String of string | InterpString of string | Null
+  | Var of string
+  (* Data structures *)
+  | Array of expr list
+  | ArrayAccess of expr * expr
+  | Record of (string * expr) list
+  | RecordAccess of expr * string
+  | RecordSpread of expr * (string * expr) list
+  (* Arithmetic and logic *)
+  | Add of expr * expr | Sub of expr * expr
+  | Mul of expr * expr | Div of expr * expr
+  | Gt of expr * expr | Lt of expr * expr | ...
+  | And of expr * expr | Or of expr * expr | Eq of expr * expr
+  | NullCoalesce of expr * expr
+  (* Control flow *)
+  | If of expr * expr * expr
+  | Let of string * type_expr option * expr * expr
+  | Match of expr * (guarded_pattern * expr) list
+  (* Functions *)
+  | FuncDef of string * string list * expr
+  | Lambda of string list * expr
+  | App of expr * expr      (* Curried application f x *)
+  | Pipe of expr * expr     (* x |> f *)
+  (* Type system *)
+  | TypeDef of type_decl * expr
+  | Seq of expr * expr
+
+and guarded_pattern = pattern * expr option</code></pre>
+
+            <p>A few design decisions worth explaining:</p>
+
+            <ul>
+                <li><strong>Let with optional type annotation</strong>: <code>Let of string * type_expr option * expr * expr</code> — both <code>let x: int = 5 in ...</code> and <code>let x = 5 in ...</code> are valid</li>
+                <li><strong>Match cases are <code>guarded_pattern * expr</code></strong>: <code>guarded_pattern = pattern * expr option</code>, where <code>expr option</code> is the optional <code>when</code> guard</li>
+                <li><strong>App is binary</strong>: <code>f x y</code> is parsed as <code>App(App(f, x), y)</code> — standard curried representation</li>
+            </ul>
+
+            <h3>Parser: menhir</h3>
+
+            <p>The Parser is defined using <code>menhir</code> (OCaml's LR parser generator). Precedence from low to high:</p>
+
+<pre><code>(* parser.mly *)
+%nonassoc IN
+%nonassoc ARROW
+%left SEMICOLON
+%left PIPE
+%nonassoc ELSE THEN
+%left BAR
+%left NULLCOALESCE
+%left AND OR
+%left EQ
+%left LT GT LTE GTE
+%left PLUS MINUS
+%left TIMES DIV
+%nonassoc APP           (* Curried function application *)
+%left DOT
+%nonassoc LBRAKET       (* Array access *)</code></pre>
+
+            <p>Pattern Matching syntax rules:</p>
+
+<pre><code>match_cases:
+  | guarded_pattern ARROW expr                     { [($1, $3)] }
+  | BAR guarded_pattern ARROW expr                 { [($2, $4)] }
+  | guarded_pattern ARROW expr BAR match_cases     { ($1, $3) :: $5 }
+  | BAR guarded_pattern ARROW expr BAR match_cases { ($2, $4) :: $6 }
+
+guarded_pattern:
+  | pattern                  { ($1, None) }
+  | pattern WHEN expr        { ($1, Some $3) }
+
+pattern:
+  | NUM { PInt $1 }
+  | UNDERSCORE { PAny }
+  | bool_literal { PBool $1 }
+  | STRING { PString $1 }
+  | IDENT { PVar $1 }
+  | LBRAKET array_patterns RBRAKET { PArray $2 }
+  | LBRACE record_pattern_fields RBRACE { PRecord $2 }</code></pre>
+
+            <p>The first <code>BAR</code> (<code>|</code>) is optional, so you can write:</p>
+
+<pre><code>// Both styles work
+match x with
+  1 -> "one"
+| 2 -> "two"
+| _ -> "other"
+
+match x with
+| 1 -> "one"
+| 2 -> "two"
+| _ -> "other"</code></pre>
+
+            <p>Record pattern supports shorthand: <code>{name}</code> is equivalent to <code>{name: name}</code>, consistent with JavaScript destructuring syntax.</p>
+
+            <h3>Evaluator: Pattern Matching Implementation</h3>
+
+            <p>The evaluator is a recursive function <code>eval_expr : env -> expr -> value * env</code>. Most node evaluations are straightforward (addition is addition, comparison is comparison). The most interesting part is Pattern Matching.</p>
+
+            <p>The core is the <code>pattern_matches</code> function — given a value and a pattern, it returns the variable bindings on match success (<code>Some env</code>) or failure (<code>None</code>):</p>
+
+<pre><code>let rec pattern_matches value = function
+  | PInt i ->
+      (match value with
+       | VInt i' when i' = i -> Some Env.empty
+       | _ -> None)
+  | PString s ->
+      (match value with
+       | VString s' when s' = s -> Some Env.empty
+       | _ -> None)
+  | PVar name ->
+      (* Variable pattern: always matches, binds the variable name *)
+      Some (Env.singleton name value)
+  | PArray patterns ->
+      (match value with
+       | VArray elements ->
+           if List.length patterns <> List.length elements then None
+           else
+             (* Recursively match each element *)
+             let matches = List.mapi
+               (fun i pat -> pattern_matches (List.nth elements i) pat)
+               patterns in
+             if List.exists (fun x -> x = None) matches then None
+             else Some (merge_all_envs matches)
+       | _ -> None)
+  | PRecord pattern_fields ->
+      (match value with
+       | VRecord value_fields ->
+           (* For each pattern field, look up in the value's record and recursively match *)
+           let matches = List.map (fun (key, pat) ->
+             match List.assoc_opt key value_fields with
+             | Some field_value -> pattern_matches field_value pat
+             | None -> None
+           ) pattern_fields in
+           if List.exists (fun x -> x = None) matches then None
+           else Some (merge_all_envs matches)
+       | _ -> None)
+  | PAny -> Some Env.empty</code></pre>
+
+            <p>Match expression evaluation logic — try each case from top to bottom, evaluate the body when a match succeeds and the guard passes:</p>
+
+<pre><code>| Match (e1, cases) ->
+    let v1, _ = eval_expr env e1 in
+    let rec try_match v = function
+      | [] -> failwith "Match error: no pattern matches"
+      | ((pattern, guard_opt), body) :: rest ->
+          match pattern_matches v pattern with
+          | Some pattern_env ->
+              let merged_env = Env.union ... pattern_env env in
+              (* Check guard *)
+              let guard_passes = match guard_opt with
+                | None -> true
+                | Some guard_expr ->
+                    match eval_expr merged_env guard_expr with
+                    | VBool b, _ -> b
+                    | _ -> failwith "Guard must be boolean"
+              in
+              if guard_passes then eval_expr merged_env body
+              else try_match v rest    (* Guard failed, try next case *)
+          | None -> try_match v rest   (* Pattern didn't match, continue *)
+    in
+    try_match v1 cases</code></pre>
+
+            <p>Key point: pattern_env is merged with the current env and passed to both guard and body. This means the guard can reference variables bound by the pattern:</p>
+
+<pre><code>match user with
+| {name, age} when age > 18 -> CONCAT(name, " is adult")
+//  ↑ name and age are available in the guard
+| {name} -> CONCAT(name, " is minor")</code></pre>
+
+            <h3>Currying and Pipe</h3>
+
+            <p>Function application supports currying — if there aren't enough arguments, a new closure is returned:</p>
+
+<pre><code>| App (func_expr, arg_expr) ->
+    (* Collect all arguments *)
+    let func_base, collected_args = collect_args func_expr [arg_val] in
+    match find_closure func_base with
+    | VClosure (params, body, closure_env) ->
+        let n_params = List.length params in
+        let n_args = List.length collected_args in
+        if n_args < n_params then
+          (* Partial application: return new closure *)
+          let applied = take n_args params in
+          let remaining = drop n_args params in
+          let env' = bind_params closure_env applied collected_args in
+          (VClosure (remaining, body, env'), env)
+        else if n_args = n_params then
+          (* Full application: evaluate body *)
+          let env' = bind_params closure_env params collected_args in
+          eval_expr env' body
+        else
+          failwith "Too many arguments"</code></pre>
+
+            <p>The Pipe operator (<code>|></code>) passes the left-hand value as the first argument of the right-hand function:</p>
+
+<pre><code>// These two are equivalent
+[1, 2, 3] |> MAP(fun x -> x * 2)
+MAP([1, 2, 3], fun x -> x * 2)
+
+// Can be chained
+[1, 2, 3, 4, 5]
+|> FILTER(fun x -> x > 2)     // → [3, 4, 5]
+|> MAP(fun x -> x * 10)       // → [30, 40, 50]
+|> SUM                         // → 120</code></pre>
+
+            <p>Implementation-wise, Pipe handles different right-hand types differently: if it's a function call <code>FUNC(args)</code>, the left-hand value is inserted as the first argument; if it's a variable name, it's treated as a single-argument function call; if it's a Lambda, it's applied directly.</p>
+
+            <h3>Type System</h3>
+
+            <p>This language has a complete type inference system. Type representation:</p>
+
+<pre><code>type typ =
+  | TInt | TFloat | TBool | TString | TDate | TNull
+  | TArray of typ
+  | TRecord of (string * typ) list
+  | TFunction of typ list * typ
+  | TUnion of typ list        (* int | string *)
+  | TAny                      (* Dynamic type *)
+  | TName of string           (* User-defined type reference *)</code></pre>
+
+            <p>Type inference is bidirectional:</p>
+
+<pre><code>// Infer type from value
+let x = 42 in ...              // x : int
+let arr = [1, 2, 3] in ...     // arr : int[]
+let u = {name: "Alice"} in ... // u : {name: string}
+
+// Check from type annotation
+let x: int = 42 in ...         // OK
+type User = {name: string, age: int} in
+let u: User = {name: "Bob", age: 25} in ...  // OK</code></pre>
+
+            <p>The type system supports structural subtyping — Record type subtype relationships are based on field containment, not name identity:</p>
+
+<pre><code>let is_subtype t1 t2 =
+  match (t1, t2) with
+  | _, TAny -> true              (* All types are subtypes of Any *)
+  | TInt, TFloat -> true         (* Int can be used where Float is expected *)
+  | TNull, _ -> true             (* Null can be any type *)
+  | TRecord f1, TRecord f2 ->
+      (* Structural subtyping: f1 contains all fields of f2 *)
+      List.for_all (fun (k2, v2) ->
+        match List.assoc_opt k2 f1 with
+        | Some v1 -> is_subtype v1 v2
+        | None -> false
+      ) f2
+  | ...</code></pre>
+
+            <p>If-then-else type inference uses <code>unify</code> — the types of both branches are combined. If incompatible, a Union type is returned:</p>
+
+<pre><code>| If (_, then_expr, else_expr) ->
+    let t1 = infer_type env then_expr in
+    let t2 = infer_type env else_expr in
+    simplify_type (unify t1 t2)
+    // if ... then 1 else 2.0  → float (Int promoted to Float)
+    // if ... then 1 else "a"  → int | string (Union type)</code></pre>
+
+            <h3>Built-in Function Library</h3>
+
+            <p>Beyond the language features themselves, there's a rich built-in function library, organized by category:</p>
+
+            <table>
+                <thead>
+                    <tr><th>Category</th><th>Functions</th><th>Example</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Text</td><td>UPPER, LOWER, TRIM, CONCAT, LEFT, RIGHT, MID, FIND, SUBSTITUTE</td><td><code>UPPER("hello")</code> → <code>"HELLO"</code></td></tr>
+                    <tr><td>Math</td><td>ABS, ROUND, FLOOR, CEIL, POW, SQRT, SUM, MAX, MIN, AVERAGE</td><td><code>ROUND(3.7)</code> → <code>4</code></td></tr>
+                    <tr><td>Array</td><td>LEN, CONTAINS, INDEX, SLICE, SORT, REVERSE, UNIQUE, JOIN</td><td><code>UNIQUE([1,2,2,3])</code> → <code>[1,2,3]</code></td></tr>
+                    <tr><td>Higher-order</td><td>MAP, FILTER, REDUCE, EVERY, SOME, FLATMAP</td><td><code>FILTER([1,2,3], fun x -> x > 1)</code> → <code>[2,3]</code></td></tr>
+                    <tr><td>Conditional</td><td>IFS, IFNA</td><td><code>IFS(@x > 0, "positive", @x < 0, "negative", true, "zero")</code></td></tr>
+                    <tr><td>Date</td><td>TODAY, YEAR, MONTH, DAY, DATEADD, DATEDIFF</td><td><code>YEAR(TODAY())</code> → <code>2026</code></td></tr>
+                    <tr><td>Type</td><td>TYPE_OF, IS_STRING, IS_NUMBER, IS_ARRAY, IS_BOOL</td><td><code>TYPE_OF(42)</code> → <code>"int"</code></td></tr>
+                    <tr><td>Formatting</td><td>FORMAT_NUMBER, FORMAT_PERCENT</td><td><code>FORMAT_PERCENT(0.85)</code> → <code>"85%"</code></td></tr>
+                </tbody>
+            </table>
+
+            <p>Higher-order function implementation requires special handling — built-in functions need to call user-provided Lambdas. A reference is used to break the circular dependency:</p>
+
+<pre><code>(* builtin.ml *)
+(* Reference to eval_expr, initialized by driver.ml *)
+let eval_closure_ref : (value Env.t -> expr -> value) ref =
+  ref (fun _ _ -> failwith "eval_closure not initialized")
+
+let apply_closure closure args =
+  match closure with
+  | VClosure (params, body, closure_env) ->
+      let env' = bind_params closure_env params args in
+      !eval_closure_ref env' body
+  | _ -> failwith "Expected a function"
+
+(* driver.ml initialization *)
+let () =
+  Builtin.eval_closure_ref := fun env expr ->
+    let result, _ = eval_expr env expr in
+    result</code></pre>
+
+            <p>This is a classic pattern for handling circular dependencies between modules in OCaml — using <code>ref</code> for deferred binding.</p>
+
+            <h3>Compiling to JavaScript</h3>
+
+            <p>The entire OCaml codebase is compiled into a single JavaScript file via <code>js_of_ocaml</code>, published as npm package <code>@gigaboo/expr</code>:</p>
+
+<pre><code>// JavaScript usage
+import { libexpr } from '@gigaboo/expr';
+
+// Simple evaluation
+libexpr.eval('1 + 2');                    // → 3
+libexpr.eval('LET x = 10 IN x * 2');     // → 20
+
+// Evaluation with context (@ variables are looked up from here)
+libexpr.evalInContext('@price * @qty', {
+  price: 99.9,
+  qty: 3
+});                                       // → 299.7
+
+// Type inference
+libexpr.inferType('LET x = [1, 2] IN x'); // → "int[]"</code></pre>
+
+            <p>Actual usage in Schema-driven UI:</p>
+
+<pre><code>// Conditional rendering in ComponentSchema
+{
+  "type": "TextField",
+  "props": { "label": "Company Name" },
+  "when": "@employmentType = \"employed\"",
+  "validation": {
+    "rule": "LEN(@companyName) >= 2",
+    "message": "Company name must be at least 2 characters"
+  }
+}
+
+// Frontend renderer calls the expression engine
+const shouldShow = libexpr.evalInContext(
+  schema.when,
+  formState  // { employmentType: "employed", ... }
+);
+if (shouldShow) {
+  renderComponent(schema);
+}</code></pre>
+
+            <h3>Truth Table Generation: Letting Business Users Verify Rules Themselves</h3>
+
+            <p>While building Schema-driven forms, we discovered a problem: business users (product managers, operations staff) often weren't sure if their conditional rules were correct. For example, an approval flow rule <code>isManager and (amount > 1000 or isUrgent)</code> — they had difficulty exhaustively checking all cases mentally.</p>
+
+            <p>But they know Excel. Many business users verify logic by manually creating truth tables in Excel — listing all variable combinations and checking results row by row.</p>
+
+            <p>Since we already had an expression evaluator, this could be automated. Given a boolean expression, automatically generate a complete truth table:</p>
+
+<pre><code>libexpr.analyze('a and (b or c)');
+
+// Output:
+// -------------------
+// | a | b | c | result |
+// -------------------
+// | T | T | T | T      |
+// | T | T | F | T      |
+// | T | F | T | T      |
+// | T | F | F | F      |
+// | F | T | T | F      |
+// | F | T | F | F      |
+// | F | F | T | F      |
+// | F | F | F | F      |
+// -------------------</code></pre>
+
+            <p>Implementation: recursively collect all variable names from the expression AST, generate 2^n boolean combinations, evaluate each one.</p>
+
+<pre><code>let rec collect_vars = function
+  | Var name -> [name]
+  | And (e1, e2) | Or (e1, e2) -> collect_vars e1 @ collect_vars e2
+  | _ -> []
+
+let rec gen_combinations = function
+  | [] -> [[]]
+  | v :: vs ->
+      let rest = gen_combinations vs in
+      List.map (fun l -> (v, true) :: l) rest
+      @ List.map (fun l -> (v, false) :: l) rest
+
+let analyze_expr expr =
+  let vars = List.sort_uniq String.compare (collect_vars expr) in
+  let combinations = gen_combinations vars in
+  List.map (fun env ->
+    let env_map = (* Convert [(name, bool)] to evaluation environment *) in
+    let result = eval_expr env_map expr in
+    (env, result)
+  ) combinations</code></pre>
+
+            <p>In the product, this feature is integrated into the form rule configuration interface: after business users write a conditional expression, they can click "Verify" to see the truth table, intuitively confirming whether the behavior matches expectations for each scenario. No need to deploy to production to test, and no need to ask developers to help check the logic.</p>
+
+            <h3>Why OCaml</h3>
+
+            <p>Using OCaml for the expression engine isn't because it's cool, but because several of its features make this kind of work exceptionally smooth:</p>
+
+            <ul>
+                <li><strong>Algebraic Data Types + Pattern Matching</strong>: AST definition and recursive evaluation written with ADT are incredibly natural. Writing <code>match expr with Add(e1, e2) -> ...</code> is far cleaner than a pile of if-else or visitor patterns</li>
+                <li><strong>ocamllex + menhir</strong>: Industrial-grade Lexer/Parser generators that directly generate efficient parsing code from grammar definitions. No need to hand-write recursive descent</li>
+                <li><strong>js_of_ocaml</strong>: A mature solution for compiling to JavaScript. The generated JS file can be directly published as an npm package, completely transparent to consumers</li>
+                <li><strong>Type safety</strong>: OCaml's type system ensures evaluator exhaustiveness — if you add a new node to the AST but forget to handle it, the compiler will error</li>
+            </ul>
+
+            <h3>Summary</h3>
+
+            <p>The design goal of this expression language is: <strong>to provide a safe, controllable, and sufficiently expressive computation engine within a configuration-driven UI system</strong>.</p>
+
+            <p>Its capability boundaries are clear:</p>
+            <ul>
+                <li><strong>Can do</strong>: Arithmetic, comparison, logical operations, conditional branching, pattern matching, array/record operations, higher-order functions, type checking</li>
+                <li><strong>Cannot do</strong>: Loops, side effects, IO, DOM access, network requests</li>
+            </ul>
+
+            <p>This "cannot do" is precisely its value — in a system where operations staff can configure form rules, you want the expression engine to only perform computations and nothing dangerous.</p>
+
+            <p>The complete implementation is about 1000 lines of OCaml code (lexer + parser + AST + evaluator + type system + builtins). If you also need to embed an expression engine in your product, OCaml + js_of_ocaml is an approach worth considering.</p>
+
+            <p><em>This article is an extension of the Schema-driven series. Other articles in the series: <a href="form-builder.html">Schema-Driven Forms (Part 1): Data Model and Renderer</a>, <a href="schema-driven-ui.html">Schema-Driven Forms (Part 2): Expression Engine and Generic UI Rendering</a></em></p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

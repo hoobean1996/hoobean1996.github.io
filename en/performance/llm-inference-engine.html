@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>From Zero to Generation: Building an LLM Inference Engine in Pure C++ - Wanderer Above the Sea of Fog</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wanderer Above the Sea of Fog</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="./">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>From Zero to Generation: Building an LLM Inference Engine in Pure C++</h2>
+            <time>2026-02-19</time>
+
+            <figure class="post-cover">
+                <img src="../../images/davinci-flying-machine.jpg" alt="Flying Machine by Leonardo da Vinci">
+                <figcaption>Leonardo da Vinci, "Flying Machine Design Manuscript", c. 1487</figcaption>
+            </figure>
+
+            <h3>Introduction</h3>
+
+            <p>I use LLMs every day, but how exactly does one turn a sequence of tokens into coherent text, step by step? Frameworks like PyTorch, vLLM, and llama.cpp hide all the details — you call <code>model.generate()</code> and text comes out. But I wanted to understand what actually happens in between.</p>
+
+            <p>So I built an LLM inference engine from scratch in pure C++20, with no ML framework dependencies: <strong>vvllm</strong>. It can run Qwen2.5-0.5B, taking a prompt as input and producing coherent text output. The entire process — from mmap-loading weights, to BPE encoding, to Transformer forward pass, to nucleus sampling — is hand-written.</p>
+
+            <p>This post follows the actual code flow, documenting the construction and optimization of this engine step by step.</p>
+
+            <h3>Problem Definition</h3>
+
+            <p>Goal: Given a text prompt, have the model generate coherent continuation.</p>
+
+            <p>Model: Qwen2.5-0.5B (0.5B parameter version)</p>
+            <ul>
+                <li>hidden_size: 896</li>
+                <li>num_hidden_layers: 24</li>
+                <li>num_attention_heads: 14</li>
+                <li>num_key_value_heads: 2 (GQA, Grouped Query Attention)</li>
+                <li>intermediate_size: 4864</li>
+                <li>vocab_size: 151936</li>
+                <li>Weight format: SafeTensors, BF16 storage, ~1GB file / 1.9GB float32</li>
+            </ul>
+
+            <p>Constraints: Pure C++20, no PyTorch / TensorFlow / ONNX Runtime. The only allowed external libraries are OpenBLAS (optional matrix multiplication acceleration) and nlohmann/json (config file parsing).</p>
+
+            <p>Build system: Bazel 7.4.1, cross-platform support for aarch64 / x86_64.</p>
+
+            <h3>Overview</h3>
+
+            <p>The engine's construction and optimization is divided into 7 steps, in actual development order:</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Step</th>
+                        <th>Content</th>
+                        <th>Key Metric</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Step 0</td>
+                        <td>Infrastructure: Backend + Tensor + SafeTensors</td>
+                        <td>Can load 290 tensors, BF16&rarr;F32</td>
+                    </tr>
+                    <tr>
+                        <td>Step 1</td>
+                        <td>BPE Tokenizer</td>
+                        <td>Text &harr; token ID conversion</td>
+                    </tr>
+                    <tr>
+                        <td>Step 2</td>
+                        <td>Transformer Forward Pass</td>
+                        <td>24-layer complete forward pass</td>
+                    </tr>
+                    <tr>
+                        <td>Step 3</td>
+                        <td>Fix RoPE Rotary Position Encoding</td>
+                        <td>From garbage output to correct generation</td>
+                    </tr>
+                    <tr>
+                        <td>Step 4</td>
+                        <td>KV Cache</td>
+                        <td>Decode phase <strong>56&times; speedup</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Step 5</td>
+                        <td>OpenBLAS for Linear Projections</td>
+                        <td>Linear layers <strong>8.6&times; speedup</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Step 6</td>
+                        <td>Sampler &amp; Autoregressive Generation</td>
+                        <td>Temperature + Top-p sampling</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Step 0: Infrastructure &mdash; Backend + Tensor + SafeTensors</h3>
+
+            <p>Before writing any inference logic, three foundational problems need solving: how to manage memory, how to abstract computation, and how to load model weights.</p>
+
+            <p><strong>Backend Abstraction</strong></p>
+
+            <p>Define an abstract compute backend interface. All operators (matmul, add, softmax, RoPE, etc.) are virtual functions with concrete implementations provided by subclasses. This allows seamlessly switching between naive CPU and OpenBLAS backends later:</p>
+
+<pre><code>class Backend {
+public:
+    virtual void matmul(float* out, const float* A, const float* B,
+                        std::size_t M, std::size_t N, std::size_t K) = 0;
+    virtual void rms_norm(float* out, const float* x, const float* weight,
+                          std::size_t n, float eps) = 0;
+    virtual void softmax(float* out, const float* x, std::size_t n) = 0;
+    virtual void rope(float* q, float* k, std::size_t seq_len,
+                      std::size_t num_heads, std::size_t num_kv_heads,
+                      std::size_t head_dim, std::size_t pos, float theta) = 0;
+    virtual void linear(float* out, const float* inp, const float* weight,
+                        const float* bias, std::size_t M, std::size_t N,
+                        std::size_t K) = 0;
+    // ... add, mul, silu, embedding
+};</code></pre>
+
+            <p>The first implementation is a naive CPU backend — all operations are straightforward for loops. For example, linear projection (the most critical computation in inference):</p>
+
+<pre><code>void BackendCPU::linear(float* out, const float* inp, const float* weight,
+                        const float* bias, std::size_t M, std::size_t N,
+                        std::size_t K) {
+    // out[M, N] = inp[M, K] @ weight^T[K, N] + bias[N]
+    for (std::size_t i = 0; i &lt; M; i++) {
+        for (std::size_t j = 0; j &lt; N; j++) {
+            float sum = bias ? bias[j] : 0.0f;
+            for (std::size_t k = 0; k &lt; K; k++) {
+                sum += inp[i * K + k] * weight[j * K + k];
+            }
+            out[i * N + j] = sum;
+        }
+    }
+}</code></pre>
+
+            <p>Triple loop, O(M&times;N&times;K) scalar multiplications. Slow, but correct. Get it running first, then optimize.</p>
+
+            <p><strong>SafeTensors Loader</strong></p>
+
+            <p>HuggingFace model weights are stored in SafeTensors format. The format is simple:</p>
+
+<pre class="diagram"><code>+------------------+
+| 8 bytes          |  header_size (uint64)
++------------------+
+| JSON header      |  tensor names, shapes, dtypes, offsets
++------------------+
+| raw tensor data  |  binary floating-point data (BF16 or F32)
++------------------+</code></pre>
+
+            <p>The key design decision is using <code>mmap</code> instead of <code>read</code> to load the file. <code>mmap</code> maps the file into virtual address space, and the OS loads data pages from disk on demand — rather than reading the entire file into memory at once. For 1GB+ weight files, this reduces startup time and peak memory usage.</p>
+
+<pre><code>mapped_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);</code></pre>
+
+            <p>Qwen2.5-0.5B weights are stored in BF16 (Brain Float 16) format. BF16 and float32 share the same 8-bit exponent, just truncating the mantissa from 23 bits to 7 bits. Conversion is simple — left shift by 16 bits:</p>
+
+<pre><code>float bf16_to_f32(uint16_t bf16) {
+    uint32_t bits = static_cast&lt;uint32_t&gt;(bf16) &lt;&lt; 16;
+    float result;
+    std::memcpy(&amp;result, &amp;bits, sizeof(float));
+    return result;
+}</code></pre>
+
+            <p>A model has 290 tensors (each layer has attention Q/K/V/O weights, MLP gate/up/down weights, two layernorm weights, plus embedding and final norm), occupying ~1.9GB after loading.</p>
+
+            <h3>Step 1: BPE Tokenizer &mdash; Turning Text into Numbers</h3>
+
+            <p>LLM input isn't raw text, but a token ID sequence. The Tokenizer handles conversion between text and token IDs. Qwen2.5 uses BPE (Byte Pair Encoding) tokenization.</p>
+
+            <p>Encoding has three steps:</p>
+
+<pre class="diagram"><code>"Hello world"
+
+Step 1: Pre-tokenize (split on spaces, spaces become Ġ prefix)
+  &rarr; ["Hello", "Ġworld"]
+
+Step 2: BPE merge (repeatedly merge the highest-priority adjacent pair)
+  "Ġworld" &rarr; ['Ġ', 'w', 'o', 'r', 'l', 'd']
+          &rarr; ['Ġ', 'wo', 'r', 'l', 'd']     // merge('w','o'), rank=300
+          &rarr; ['Ġ', 'wor', 'l', 'd']          // merge('wo','r')
+          &rarr; ['Ġ', 'world']                   // ...
+          &rarr; ['Ġworld']                        // final merge
+
+Step 3: Lookup (vocabulary, token &rarr; ID)
+  ['Hello', 'Ġworld'] &rarr; [9707, 1879]</code></pre>
+
+            <p>BPE's core loop: each round scans all adjacent token pairs, finds the one with the lowest merge rank (highest priority), and merges it into a new token. Repeat until no mergeable pairs remain.</p>
+
+<pre><code>// Step 3: Apply BPE merges
+while (tokens.size() &gt; 1) {
+    int best_rank = -1;
+    size_t best_idx = 0;
+    for (size_t j = 0; j &lt; tokens.size() - 1; j++) {
+        std::string key = tokens[j] + " " + tokens[j + 1];
+        auto it = merge_ranks_.find(key);
+        if (it != merge_ranks_.end()) {
+            if (best_rank &lt; 0 || it-&gt;second &lt; best_rank) {
+                best_rank = it-&gt;second;
+                best_idx = j;
+            }
+        }
+    }
+    if (best_rank &lt; 0) break;
+    tokens[best_idx] = tokens[best_idx] + tokens[best_idx + 1];
+    tokens.erase(tokens.begin() + best_idx + 1);
+}</code></pre>
+
+            <p>Decoding is the reverse: token ID looks up the vocabulary to get the token string, concatenate, and replace <code>Ġ</code> (UTF-8: <code>0xC4 0xA0</code>) back to spaces.</p>
+
+            <p>Qwen2.5's vocabulary has 151,936 tokens — meaning the final logits output is also a 151,936-dimensional vector.</p>
+
+            <h3>Step 2: Transformer Forward Pass &mdash; The Engine's Core</h3>
+
+            <p>This is the most important part of the entire engine. What does a complete forward pass do?</p>
+
+<pre class="diagram"><code>token_ids: [t0, t1, t2, ..., tn]
+                |
+        Embedding Lookup
+                |
+          x: [seq_len, 896]
+                |
+     +----------+----------+
+     |     Transformer      |
+     |      Layer &times; 24       |
+     |                      |
+     |  RMS Norm            |
+     |  Q, K, V Projection  |
+     |  RoPE                |
+     |  Causal Attention    |
+     |  Output Projection   |
+     |  + Residual          |
+     |  RMS Norm            |
+     |  MLP (SwiGLU)        |
+     |  + Residual          |
+     +----------+-----------+
+                |
+          Final RMS Norm
+                |
+        Logits Projection
+                |
+        logits: [151936]</code></pre>
+
+            <p><strong>1. Embedding Lookup</strong></p>
+
+            <p>The simplest step: map a token ID to a 896-dimensional vector. The embedding table is a [151936, 896] matrix, and lookup is just <code>memcpy</code> of one row:</p>
+
+<pre><code>void embedding(float* out, const float* table,
+               std::size_t token_id, std::size_t hidden_size) {
+    std::memcpy(out, table + token_id * hidden_size,
+                hidden_size * sizeof(float));
+}</code></pre>
+
+            <p><strong>2. RMS Norm</strong></p>
+
+            <p>Each layer's input is first RMS-normalized — similar to LayerNorm but without subtracting the mean, only dividing by the RMS (Root Mean Square):</p>
+
+<pre><code>void rms_norm(float* out, const float* x, const float* weight,
+              std::size_t n, float eps) {
+    float sum = std::accumulate(x, x + n, 0.0f,
+        [](float acc, float x) { return acc + x * x; });
+    float rms = sqrt(sum / n + eps);
+    for (size_t i = 0; i &lt; n; i++) {
+        out[i] = x[i] / rms * weight[i];
+    }
+}</code></pre>
+
+            <p>Formula: <code>out[i] = (x[i] / &radic;(mean(x&sup2;) + &epsilon;)) &times; weight[i]</code>. RMS Norm saves one mean calculation and one subtraction compared to Layer Norm, making it faster during inference, and experiments show comparable performance.</p>
+
+            <p><strong>3. Q, K, V Linear Projections</strong></p>
+
+            <p>The first step of the attention mechanism: project the 896-dimensional hidden state into Q, K, V spaces. This is matrix multiplication — the most time-consuming computation in LLM inference.</p>
+
+<pre><code>// For each token, compute Q, K, V
+for (std::size_t s = 0; s &lt; seq_len; s++) {
+    const float* inp = norm_out.data() + s * hidden;
+    linear(q.data() + s * num_heads * head_dim,
+           inp, attn.q_proj_weight, q_bias(attn),
+           num_heads * head_dim, hidden, backend);   // Q: [14&times;64, 896]
+    linear(k_new.data() + s * kv_dim,
+           inp, attn.k_proj_weight, k_bias(attn),
+           kv_dim, hidden, backend);                  // K: [2&times;64, 896]
+    linear(v_new.data() + s * kv_dim,
+           inp, attn.v_proj_weight, v_bias(attn),
+           kv_dim, hidden, backend);                  // V: [2&times;64, 896]
+}</code></pre>
+
+            <p>Note a key detail: Qwen2 uses <strong>Grouped Query Attention (GQA)</strong> — 14 query heads share 2 KV heads. This means K and V dimensions are 2&times;64=128, much smaller than Q's 14&times;64=896. This dramatically reduces KV cache memory usage with minimal impact on model quality.</p>
+
+            <p><strong>4. RoPE (Rotary Position Encoding)</strong></p>
+
+            <p>Transformers are inherently position-invariant — scramble the input order, and the output doesn't change. RoPE applies position-dependent rotations to Q and K, letting the model know each token's position in the sequence.</p>
+
+            <p>Core idea: for each pair of elements (x<sub>i</sub>, x<sub>i+half</sub>) in the head_dim vector, perform a 2D rotation based on position pos and frequency &theta;:</p>
+
+<pre><code>for (std::size_t i = 0; i &lt; half; i++) {
+    float freq = 1.0f / std::pow(theta, (float)(2 * i) / head_dim);
+    float angle = position * freq;
+    float x0 = head[i];
+    float x1 = head[i + half];
+    head[i]        = x0 * cos(angle) - x1 * sin(angle);
+    head[i + half] = x0 * sin(angle) + x1 * cos(angle);
+}</code></pre>
+
+            <p>Frequencies range from low to high: lower dimensions encode high frequencies (local positional relationships), higher dimensions encode low frequencies (long-range dependencies). This is similar in concept to the Fourier transform.</p>
+
+            <p><strong>5. Causal Attention</strong></p>
+
+            <p>This is the Transformer's core. For each query position, compute attention scores with all preceding tokens, then take a weighted sum of values:</p>
+
+<pre><code>void causal_attention(float* out, const float* q, std::size_t q_idx,
+                      const float* k, const float* v,
+                      std::size_t attend_len, std::size_t num_heads,
+                      std::size_t num_kv_heads, std::size_t head_dim,
+                      float scale, Backend&amp; backend) {
+    std::size_t groups = num_heads / num_kv_heads;  // 14/2 = 7
+
+    for (std::size_t h = 0; h &lt; num_heads; h++) {
+        std::size_t kv_h = h / groups;  // GQA: 7 Q heads share 1 KV head
+
+        // 1. scores = Q &middot; K^T / sqrt(head_dim)
+        for (std::size_t t = 0; t &lt; attend_len; t++) {
+            float dot = 0.0f;
+            for (std::size_t d = 0; d &lt; head_dim; d++) {
+                dot += q_head[d] * k_head[d];
+            }
+            scores[t] = dot * scale;  // scale = 1/&radic;64 = 0.125
+        }
+
+        // 2. attention weights = softmax(scores)
+        backend.softmax(scores.data(), scores.data(), attend_len);
+
+        // 3. output = weighted sum of V
+        for (std::size_t t = 0; t &lt; attend_len; t++) {
+            for (std::size_t d = 0; d &lt; head_dim; d++) {
+                head_out[d] += scores[t] * v_head[d];
+            }
+        }
+    }
+}</code></pre>
+
+            <p>"Causal" means: each token can only see itself and preceding tokens, not the future. This is implemented via <code>attend_len = pos + s + 1</code> — the s-th token only attends to s+1 positions.</p>
+
+            <p><strong>6. MLP (SwiGLU)</strong></p>
+
+            <p>After attention comes a two-layer MLP. Qwen2 uses the SwiGLU activation function:</p>
+
+<pre><code>// gate = linear(x, gate_proj)    // [896] &rarr; [4864]
+// up   = linear(x, up_proj)      // [896] &rarr; [4864]
+// gate = silu(gate) * up          // element-wise
+// out  = linear(gate, down_proj)  // [4864] &rarr; [896]
+
+backend.silu(gate.data(), gate.data(), seq_len * intermediate);
+backend.mul(gate.data(), gate.data(), up.data(), seq_len * intermediate);</code></pre>
+
+            <p>SiLU (also called Swish): <code>silu(x) = x &times; &sigma;(x) = x / (1 + e<sup>-x</sup>)</code>. SwiGLU's "gating" mechanism lets the network selectively retain or filter information — the gate path controls the switch, the up path provides content.</p>
+
+            <p><strong>7. Residual Connection</strong></p>
+
+            <p>After each attention block and MLP block is a residual connection: <code>x = x + block_output</code>. It solves the vanishing gradient problem in deep networks — gradients can flow directly along the skip connection without gradually decaying to zero across 24 layers.</p>
+
+            <p><strong>8. Final Prediction</strong></p>
+
+            <p>After processing through 24 Transformer layers, take the last token's hidden state, apply RMS Norm, then project to vocab dimension to get logits:</p>
+
+<pre><code>// Final norm (only last token)
+backend.rms_norm(final_out.data(),
+                 x.data() + (seq_len - 1) * hidden,
+                 final_norm_weight, hidden, eps);
+
+// Logits = final_out @ embed_tokens^T  (tied weights)
+linear(logits.data(), final_out.data(), embed_tokens, nullptr,
+       config.vocab_size, hidden, backend);</code></pre>
+
+            <p>Note <strong>tied weights</strong>: the logits projection matrix and the embedding table are the same matrix. This is a common parameter sharing trick — input (token&rarr;vector) and output (vector&rarr;token probability) use the same parameters, saving 151936&times;896 &asymp; 136 million parameters.</p>
+
+            <h3>Step 3: Bug Fix &mdash; RoPE Rotary Position Encoding Pairing Convention</h3>
+
+            <p>After finishing the forward pass, I ran the model — the output was all garbage. After much debugging, I found the problem was in RoPE's <strong>pairing convention</strong>.</p>
+
+            <p>RoPE needs to pair up elements of the head_dim vector for rotation. But there are two pairing methods:</p>
+
+<pre class="diagram"><code>head_dim = 8 vector: [x0, x1, x2, x3, x4, x5, x6, x7]
+
+Interleaved (GPT-NeoX convention):
+  Pairs (x0,x1), (x2,x3), (x4,x5), (x6,x7)
+  Adjacent elements paired
+
+Split-half (Qwen2 / Llama convention):
+  Pairs (x0,x4), (x1,x5), (x2,x6), (x3,x7)
+  First half paired with second half</code></pre>
+
+            <p>I initially used the interleaved convention (since many early GPT implementations did this), but Qwen2 uses split-half. The two conventions are mathematically identical — both are 2D rotations — but applied to different element pairs, the results are completely different.</p>
+
+            <p>Debug process:</p>
+            <ol>
+                <li>First ran the same input in Python, comparing HuggingFace's logits output</li>
+                <li>Layer-by-layer comparison revealed the first layer's Q projection was correct, but after RoPE it diverged</li>
+                <li>Wrote numpy scripts to compute RoPE with both conventions, comparing against HuggingFace</li>
+                <li>Confirmed split-half matches HuggingFace results, fixed the C++ implementation</li>
+            </ol>
+
+            <p>Lesson: <strong>The hardest bugs to debug in LLM inference aren't algorithm errors, but convention differences</strong>. RoPE pairing method, attention mask implementation, weight layout ([N,K] vs [K,N]) — these details aren't covered in papers, only found by reading source code.</p>
+
+            <h3>Step 4: KV Cache &mdash; 56x Decode Speedup</h3>
+
+            <p>After fixing RoPE, the model could correctly generate text. But the speed was atrocious — generating each token required re-running the complete forward pass.</p>
+
+            <p>The problem lies in the nature of autoregressive generation: generating token N requires the attention context of all N-1 preceding tokens. The naive approach re-feeds all tokens into the model every time — but the K, V for the preceding N-1 tokens were already computed in previous steps!</p>
+
+<pre class="diagram"><code>Naive (no cache):
+  Step 1: forward([t0, t1, t2, t3, t4])        &larr; 5 tokens, compute 5 K,V sets
+  Step 2: forward([t0, t1, t2, t3, t4, t5])     &larr; 6 tokens, recompute 6 K,V sets
+  Step 3: forward([t0, t1, t2, t3, t4, t5, t6]) &larr; 7 tokens, recompute 7 K,V sets
+  &rarr; Complexity O(n&sup2;): recompute all history each step
+
+KV Cache:
+  Prefill:  forward([t0, t1, t2, t3, t4])  &larr; Cache 5 K,V sets
+  Decode 1: forward([t5], pos=5)             &larr; Only compute t5's Q, use cached K,V
+  Decode 2: forward([t6], pos=6)             &larr; Only compute t6's Q, use cached K,V
+  &rarr; Complexity O(n): only compute new token each step</code></pre>
+
+            <p>KV Cache implementation is straightforward — each layer maintains a growing K and V vector:</p>
+
+<pre><code>struct KVCache {
+    std::vector&lt;std::vector&lt;float&gt;&gt; k_cache;  // [num_layers][seq_len * kv_dim]
+    std::vector&lt;std::vector&lt;float&gt;&gt; v_cache;
+    std::size_t seq_len = 0;
+
+    void append(std::size_t layer_idx, const float* new_k,
+                const float* new_v, std::size_t num_new_tokens,
+                std::size_t kv_dim) {
+        std::size_t count = num_new_tokens * kv_dim;
+        auto&amp; kc = k_cache[layer_idx];
+        kc.insert(kc.end(), new_k, new_k + count);
+        auto&amp; vc = v_cache[layer_idx];
+        vc.insert(vc.end(), new_v, new_v + count);
+    }
+};</code></pre>
+
+            <p>In the forward pass, new token K, V are appended to cache, and attention uses the complete cache (not just the current token):</p>
+
+<pre><code>// Append new K/V to cache
+kv_cache.append(layer_idx, k_new.data(), v_new.data(), seq_len, kv_dim);
+
+// Attention uses all K/V from cache
+causal_attention(attn_out, q.data(), s,
+                 kv_cache.k_data(layer_idx),   // All historical K
+                 kv_cache.v_data(layer_idx),   // All historical V
+                 pos + s + 1,                   // Attend length
+                 num_heads, num_kv_heads, head_dim, scale, backend);</code></pre>
+
+            <p>The generation loop becomes two phases:</p>
+
+<pre><code>// Prefill: process entire prompt at once, fill KV Cache
+auto logits = forward(model, token_ids, 0, kv_cache);
+
+// Decode: only feed new token each time
+for (int step = 0; step &lt; max_tokens; step++) {
+    int next_token = sampler.sample(logits);
+    std::size_t pos = token_ids.size() - 1;
+    logits = forward(model, {next_token}, pos, kv_cache);  // Only 1 token
+}</code></pre>
+
+            <p><strong>Benchmark results</strong> (Google Benchmark, synthetic tiny model):</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Method</th>
+                        <th>Context=64</th>
+                        <th>Comparison</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>DecodeNoCache (full recompute each step)</td>
+                        <td>~20 ms</td>
+                        <td>1&times;</td>
+                    </tr>
+                    <tr>
+                        <td>DecodeWithCache (only compute new token)</td>
+                        <td>~362 &mu;s</td>
+                        <td><strong>56&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p><strong>56x speedup</strong>. And the gap grows with context length — without cache, each step recomputes all tokens' K/V projections at O(n) cost; with cache, only 1 token is computed at O(1) cost (attention itself is still O(n), but the projection savings are enormous).</p>
+
+            <p>GQA plays a role here too: each layer only needs to cache 2 KV heads (128 dimensions) instead of 14 (896 dimensions). For a 24-layer model, KV cache memory usage is reduced by 7x.</p>
+
+            <h3>Step 5: OpenBLAS &mdash; 8.6x Speedup for Linear Projections</h3>
+
+            <p>Profiling revealed the vast majority of inference time is spent in <code>linear()</code> — unsurprisingly, a Transformer layer has 7 linear projections (Q, K, V, O, gate, up, down), each being matrix multiplication. For Qwen2.5-0.5B, the largest projection is [896, 4864], i.e., 896&times;4864 &asymp; 4.36 million multiply-add operations. Across 24 layers, that's over 100 million.</p>
+
+            <p>The naive backend's triple-loop matmul is extremely inefficient — same as the baseline in the <a href="matmul-optimization.html">previous matmul optimization post</a>, with no SIMD, no tiling, no cache optimization.</p>
+
+            <p>The most direct solution: swap the linear operation for OpenBLAS's <code>cblas_sgemm</code>:</p>
+
+<pre><code>void BackendBLAS::linear(float* out, const float* inp, const float* weight,
+                         const float* bias, std::size_t M, std::size_t N,
+                         std::size_t K) {
+    // out[M, N] = inp[M, K] @ weight^T[K, N]
+    // weight is [N, K] row-major, so we use CblasTrans on B.
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                M, N, K, 1.0f, inp, K, weight, K, 0.0f, out, N);
+
+    if (bias) {
+        for (std::size_t i = 0; i &lt; M; i++)
+            for (std::size_t j = 0; j &lt; N; j++)
+                out[i * N + j] += bias[j];
+    }
+}</code></pre>
+
+            <p>Note the weight storage format: PyTorch's convention is weight shape [out_features, in_features], i.e., [N, K] row-major. So <code>inp @ weight^T</code> requires transposing the weight, corresponding to the <code>CblasTrans</code> parameter.</p>
+
+            <p>Behind this single <code>cblas_sgemm</code> call is years of OpenBLAS optimization — SIMD vectorization, cache-friendly tile layout, register-level micro-kernels — exactly the optimizations that took 7 steps to achieve in the previous post.</p>
+
+            <p><strong>Benchmark results</strong> (aarch64, <code>-c opt</code>):</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Dimension</th>
+                        <th>CPU (naive)</th>
+                        <th>BLAS (OpenBLAS)</th>
+                        <th>Speedup</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>64</td>
+                        <td>2,227 ns</td>
+                        <td>884 ns</td>
+                        <td>2.5&times;</td>
+                    </tr>
+                    <tr>
+                        <td>128</td>
+                        <td>12,148 ns</td>
+                        <td>3,804 ns</td>
+                        <td>3.2&times;</td>
+                    </tr>
+                    <tr>
+                        <td>256</td>
+                        <td>58,317 ns</td>
+                        <td>16,672 ns</td>
+                        <td>3.5&times;</td>
+                    </tr>
+                    <tr>
+                        <td>576</td>
+                        <td>366,660 ns</td>
+                        <td>42,761 ns</td>
+                        <td><strong>8.6&times;</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>Larger dimensions yield higher speedup ratios. For small matrices (dim=64), OpenBLAS's thread scheduling and packing overhead is relatively large, limiting gains. But at actual model dimensions (hidden_size=896, intermediate_size=4864), the speedup is very significant.</p>
+
+            <p>Switching backends just requires a startup parameter: <code>--backend blas</code>. The Backend abstraction makes this switch zero-invasive — forward pass code needs no changes at all.</p>
+
+            <h3>Step 6: Sampler &mdash; From Logits to Text</h3>
+
+            <p>The forward pass outputs a 151,936-dimensional logits vector — each value represents a token's "likelihood score." How do we select the next token?</p>
+
+            <p><strong>Simplest method: Greedy</strong></p>
+
+            <p>Take the token corresponding to the maximum logit. Deterministic, but prone to repetition.</p>
+
+            <p><strong>Temperature Scaling</strong></p>
+
+            <p>Divide logits by the temperature parameter, then apply softmax to get a probability distribution. Temperature &lt; 1 makes the distribution sharper (more deterministic), temperature &gt; 1 makes it flatter (more random).</p>
+
+            <p><strong>Top-p (Nucleus Sampling)</strong></p>
+
+            <p>Sort tokens by probability from high to low, accumulate probabilities until exceeding the top_p threshold, and only sample from these tokens. This preserves randomness (unlike greedy's rigidity) while excluding low-probability "noise" tokens (unlike pure random's unpredictability).</p>
+
+<pre><code>int Sampler::sample(const std::vector&lt;float&gt;&amp; logits) {
+    if (temperature_ == 0.0f) {
+        return argmax(logits);  // greedy
+    }
+
+    // 1. Temperature scaling + softmax
+    for (std::size_t i = 0; i &lt; n; i++)
+        scaled[i] = logits[i] / temperature_;
+    softmax(scaled);
+
+    // 2. Top-p: sort by probability, keep cumsum &lt;= top_p
+    std::sort(indices.begin(), indices.end(),
+              [&amp;](int a, int b) { return scaled[a] &gt; scaled[b]; });
+
+    float cumsum = 0.0f;
+    for (std::size_t i = 0; i &lt; n; i++) {
+        cumsum += scaled[indices[i]];
+        if (cumsum &gt;= top_p_) { cutoff = i + 1; break; }
+    }
+
+    // 3. Sample from the truncated distribution
+    std::uniform_real_distribution&lt;float&gt; dist(0.0f, kept_sum);
+    float r = dist(rng_);
+    // ... weighted random selection
+}</code></pre>
+
+            <p>Default parameters are temperature=0.7, top_p=0.9 — a balance point between diversity and coherence.</p>
+
+            <h3>Putting It All Together</h3>
+
+            <p>The final inference flow:</p>
+
+<pre><code>// 1. Load config, weights, tokenizer
+auto config = load_config("config.json");
+auto weights = SafeTensorsLoader("model.safetensors").load_all(backend);
+auto model = create_model(config, backend);
+load_weights(model, weights);
+
+// 2. Tokenize prompt
+auto token_ids = tokenizer.encode("The capital of France is");  // [5 tokens]
+
+// 3. Prefill: process entire prompt
+KVCache kv_cache(config.num_hidden_layers);
+auto logits = forward(model, token_ids, 0, kv_cache);
+
+// 4. Decode: generate token by token
+for (int step = 0; step &lt; max_tokens; step++) {
+    int next_token = sampler.sample(logits);
+    if (next_token == config.eos_token_id) break;
+
+    std::cout &lt;&lt; tokenizer.decode({next_token}) &lt;&lt; std::flush;
+
+    std::size_t pos = token_ids.size() - 1;
+    logits = forward(model, {next_token}, pos, kv_cache);
+    token_ids.push_back(next_token);
+}</code></pre>
+
+            <p>Output:</p>
+
+<pre><code>Model: qwen2 (896d, 24 layers)
+Loading weights...
+Loaded 290 tensors
+Model initialized
+Prompt: "The capital of France is" (5 tokens)
+
+The capital of France is Paris, where the most important cultural
+institutions are located. The city is famous for its museums,
+including the Lou</code></pre>
+
+            <p>It's alive.</p>
+
+            <h3>Summary and Reflections</h3>
+
+            <p>Building this inference engine from scratch, a few profound takeaways:</p>
+
+            <p><strong>1. LLM inference = massive matrix multiplication.</strong> One forward pass has 24 layers &times; 7 linear projections = 168 matmuls. This is why GPUs are so important for LLM inference — their core strength is massively parallel matmul. And why a single line of OpenBLAS brought an 8.6x speedup.</p>
+
+            <p><strong>2. KV Cache is the #1 inference optimization priority.</strong> 56x speedup, and simple to implement — essentially an append-only array. But it changes the generation's complexity class: from O(n&sup2;) to O(n). LLM inference without KV Cache is practically unusable.</p>
+
+            <p><strong>3. Convention differences are harder to find than algorithm bugs.</strong> RoPE split-half vs interleaved, weight [N,K] vs [K,N], BPE space prefix — papers gloss over these, but each one can cost you half a day debugging. Comparing intermediate results with a reference implementation (HuggingFace) is the only reliable debugging method.</p>
+
+            <p><strong>4. Abstraction layer design matters.</strong> The Backend interface let me first ensure correctness with naive loops, then swap in OpenBLAS for performance, without changing a single line of forward pass code. This simple strategy avoided simultaneously debugging correctness and performance.</p>
+
+            <p><strong>5. The biggest reward is understanding.</strong> After using so many LLM frameworks, only by hand-writing one did I truly understand: why KV Cache is critical for long contexts, why GQA dramatically reduces memory, why prefill and decode have completely different performance characteristics, and why tied embedding saves memory without sacrificing quality.</p>
+
+            <p>The entire project is about 1500 lines of C++ (excluding tests and benchmarks), running a real 0.5B model.</p>
+
+            <h3>Next Plan</h3>
+
+            <p><strong>Update:</strong> The follow-up CUDA optimization is complete, see <a href="llm-inference-gpu.html">Part 2: From CPU to GPU &mdash; The CUDA Optimization Journey</a>. From 33 tok/s to 504 tok/s.</p>
+
+            <p>The current engine works, but is far from "production-ready." Planned next steps by priority:</p>
+
+            <ol>
+                <li><strong>Instruct model support</strong> &mdash; Currently only supports base model continuation. Instruct models need chat template formatting (<code>&lt;|im_start|&gt;user\n...&lt;|im_end|&gt;</code>) and handling of multiple stop tokens. This is the prerequisite for making the model truly "conversational."</li>
+                <li><strong>Multi-threaded parallelism</strong> &mdash; Currently entirely single-threaded. The most direct optimization is parallelizing linear projections (multiple heads' QKV projections can be computed simultaneously) and the independent computation of multiple heads in attention. Expected 3-5x further improvement on CPU.</li>
+                <li><strong>CUDA GPU backend</strong> &mdash; The CPU inference bottleneck is matmul throughput. GPU Tensor Cores are naturally suited for large-scale matrix multiplication. Goal is to write a minimal CUDA backend, replacing OpenBLAS with cuBLAS, reducing decode latency from milliseconds to microseconds.</li>
+                <li><strong>Quantized inference (INT8/INT4)</strong> &mdash; Currently all weights are float32, and a 0.5B model already takes 1.9GB. INT8 quantization halves memory, INT4 halves it again, while SIMD/GPU integer operation throughput is higher. The key challenge is controlling precision loss after quantization.</li>
+                <li><strong>Continuous Batching</strong> &mdash; Currently can only process a single sequence. Production inference engines (vLLM, TensorRT-LLM) can simultaneously process multiple requests with dynamic KV cache memory scheduling. This involves more complex memory management strategies like PagedAttention.</li>
+            </ol>
+
+            <p><em>"What I cannot create, I do not understand."</em> &mdash; Richard Feynman</p>
+        </article>
+
+        <a href="../index.html">&larr; Back to Home</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

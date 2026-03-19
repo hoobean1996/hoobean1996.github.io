@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ゼロから構築する分散非同期タスクキュー：Shopee での実践経験 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="../infra/">Infra</a></li>
+                <li><a href="./">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>ゼロから構築する分散非同期タスクキュー：Shopee での実践経験</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/clock-watch-astronomical.jpg" alt="Clock Watch with Astronomical Dial, ca. 1605-10, Metropolitan Museum of Art">
+                <figcaption>Jan Jansen Bockeltz,《天文日時計懐中時計》, c. 1605-10 — 精密な歯車機構が時間計測を駆動するように、スケジューリングシステムがタスクの正確な実行を駆動する</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：一定規模に達したすべてのバックエンドシステムは非同期タスクを必要とする——遅延実行、定時スケジューリング、失敗時のリトライ。オープンソースソリューション（Celery、Bull）は往々にして重すぎるか柔軟性に欠ける。この記事では、Shopee でゼロから分散非同期タスクキューを構築した完全な経験を共有する：ストレージモデル、スケジューリング戦略、失敗リトライ、優先度キュー、そして本番環境で踏んだ落とし穴について。
+            </blockquote>
+
+            <h3>なぜどの企業も非同期タスクの車輪を再発明するのか</h3>
+
+            <p>ほぼすべての一定規模に達したバックエンドシステムは同じ問題に直面する：ユーザーリクエスト内で同期的に完了できないことがある。</p>
+
+            <p>ユーザーが注文した後、30 分後に支払い済みかチェックし、未払いならキャンセルする必要がある。ユーザー登録後、非同期でウェルカムメールを送る必要がある。毎日深夜に照合処理を実行する必要がある。毎時間、外部データを同期する必要がある。これらの「後でやる」タスクが、非同期タスクである。</p>
+
+            <p>問題は、「後でやる」は聞こえは簡単だが、実装は全く簡単ではないということ：</p>
+
+            <ul>
+                <li><strong>信頼性</strong>：サービスが再起動したら、タスクはまだあるか？ネットワークが揺れたら、タスクは失われるか？</li>
+                <li><strong>遅延制御</strong>：「30 分後に実行」——誰がタイマーを管理する？精度はどれくらい？</li>
+                <li><strong>並行制御</strong>：10 インスタンスが同時に実行される場合、同一タスクが 2 回実行されないようにするには？</li>
+                <li><strong>失敗処理</strong>：タスク実行が失敗したら、何回リトライする？リトライ間隔は？いつ諦める？</li>
+                <li><strong>可観測性</strong>：現在キューに何個のタスクがある？平均遅延は？どのタスクが失敗した？</li>
+            </ul>
+
+            <p>これが Celery、Sidekiq、Bull、Temporal などのプロジェクトが存在する理由——すべて同じ問題を解決している。しかし大企業では、汎用ソリューションは往々にして不十分：社内 RPC フレームワークとの統合、会社のデプロイプラットフォームへの適応、既存の監視体系との連携が必要。だからほぼすべての一定規模の企業が自前で作ることになる。</p>
+
+            <h3>Shopee の状況</h3>
+
+            <p>2019 年に Shopee のプラットフォームチームに加わり、業務開発チーム向けのミドルウェアサービスを担当した。当時、各事業部門はそれぞれの「非同期タスク」ソリューションを持っていた——crontab + スクリプトを使う人、無限ループでデータベースをポーリングする人、ビジネスコード内で goroutine を起動して失われないよう祈る人。</p>
+
+            <p>問題は明白：統一的なタスク管理なし、監視なし、リトライなし、タスクが失われても誰も気づかない。さらに致命的なことに、各チームが同じ落とし穴を繰り返し踏んでいた——リトライに冪等性がなく二重課金、crontab マシンがダウンしても誰も気づかず照合が 1 週間中断。プラットフォームチームはゼロから分散非同期タスクキューシステムを構築し、標準化された非同期タスク機能を提供することを決定した。</p>
+
+            <p>この記事ではこのシステムの設計から本番投入までの完全なプロセスを記録する。3 年間で 0 から 10 以上の事業部門が接続、QPS は 2K から 25K 以上に成長、ダブルイレブンのピーク時は 50K に達した。</p>
+
+            <h3>要件分析</h3>
+
+            <p>各事業チームとの議論の結果、非同期タスクの要件は大きく 3 つに分類される：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>タイプ</th>
+                        <th>シナリオ例</th>
+                        <th>遅延要件</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>短遅延タスク</td>
+                        <td>注文タイムアウトキャンセル、クーポン期限切れ、プッシュ通知</td>
+                        <td>秒レベル～分レベル</td>
+                    </tr>
+                    <tr>
+                        <td>長遅延タスク</td>
+                        <td>T+1 照合、週次レポート生成、データアーカイブ</td>
+                        <td>時間レベル～日レベル</td>
+                    </tr>
+                    <tr>
+                        <td>Cron 定時タスク</td>
+                        <td>毎日深夜のバッチ処理、毎時間のデータ同期、ヘルスチェック</td>
+                        <td>cron 式に従う</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>機能要件に加えて、いくつかの必須制約がある：</p>
+
+            <ul>
+                <li><strong>少なくとも 1 回の配信</strong>：タスクは重複実行可能（業務側で冪等性を担保）だが、絶対に失われてはならない</li>
+                <li><strong>多言語対応</strong>：事業チームは Go と Python を使用しており、2 つの SDK を提供する必要がある</li>
+                <li><strong>社内 RPC プラットフォームとの統合</strong>：タスクトリガーは社内 RPC フレームワークを通じて業務サービスを呼び出し、追加のネットワークプロトコルを導入しない</li>
+                <li><strong>可観測性</strong>：各タスクのステータス、所要時間、リトライ回数がすべて確認可能であること</li>
+            </ul>
+
+            <h3>システムアーキテクチャ</h3>
+
+<pre class="diagram"><code>
+  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+  │  Order Svc   │   │  Payment Svc │   │  Report Svc  │    業務サービス
+  │  (Go SDK)    │   │  (Go SDK)    │   │ (Python SDK) │
+  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+         │                  │                   │
+         └──────────────────┼───────────────────┘
+                            │ Submit (RPC)
+                            ▼
+               ┌───────────────────────────┐
+               │        API Server         │
+               │  ┌─────────┐ ┌─────────┐ │
+               │  │パラメータ│ │遅延     │ │
+               │  │検証     │ │ルーティング│ │
+               │  └─────────┘ └─────────┘ │
+               └─────┬─────────────┬───────┘
+                     │             │
+        delay ≤ 10m  │             │  delay > 10m / Cron
+                     ▼             ▼
+            ┌──────────────┐ ┌──────────────┐
+            │    Kafka     │ │    MySQL     │
+            │              │ │              │
+            │ topic-order  │ │ async_tasks  │    永続化層
+            │ topic-pay    │ │ cron_registry│
+            │ topic-report │ │              │
+            └──────┬───────┘ └──────┬───────┘
+                   │                │
+                   ▼                ▼
+            ┌─────────────────────────────────────────┐
+            │            Dispatcher (N インスタンス)     │
+            │                                          │
+            │  ┌────────────┐  ┌───────────────────┐  │
+            │  │   Kafka    │  │   MySQL Poller     │  │
+            │  │  Consumer  │  │   (秒単位スキャン)   │  │
+            │  └─────┬──────┘  └────────┬──────────┘  │
+            │        │                  │              │
+            │        ▼                  ▼              │
+            │  ┌──────────────────────────────────┐   │
+            │  │    ETA Priority Queue (Heap)      │   │    スケジューリング層
+            │  │    トリガー時刻でソート、到期で dispatch │   │
+            │  └───────────────┬──────────────────┘   │
+            │                  │                       │
+            └──────────────────┼───────────────────────┘
+                               │ Dispatch (RPC)
+                               ▼
+            ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+            │  Order Svc   │ │ Payment Svc  │ │  Report Svc  │    エグゼキュータ
+            │  (Executor)  │ │  (Executor)  │ │  (Executor)  │
+            └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+                   │                │                 │
+                   └────────────────┼─────────────────┘
+                                    │ 結果コールバック (RPC)
+                                    ▼
+            ┌─────────────────────────────────────────┐
+            │           Prometheus + Grafana           │    可観測性
+            │  遅延 · スループット · 成功率 · キュー深度 · リトライ │
+            └─────────────────────────────────────────┘
+</code></pre>
+
+            <h3>なぜ Kafka + MySQL であって、純粋な Kafka や純粋な Redis ではないのか</h3>
+
+            <p>これは設計段階で最も議論された決定である。</p>
+
+            <p><strong>純粋な Kafka 方式</strong>の問題：Kafka は任意の遅延配信をサポートしない。複数の topic で異なる遅延レベルを模擬できる（1s/5s/30s/1min/...）が、粒度が粗く、topic 数が爆発する。「3 日後にトリガー」のような長遅延には Kafka は全く適さない——メッセージが broker に蓄積され、リソースの無駄であり rebalance 時のリスクがある。</p>
+
+            <p><strong>純粋な Redis 方式</strong>（Sorted Set + ZRANGEBYSCORE）：遅延タスクの score にトリガー時刻を格納し、定期的に到期タスクをスキャン。問題は Redis の永続化が十分に信頼できないこと——RDB には時間窓があり、AOF は高 QPS 時にパフォーマンスが低下する。「少なくとも 1 回の配信」という必須要件に対して、Redis を唯一のストレージとするのはリスクが高すぎる。</p>
+
+            <p><strong>最終方式</strong>：Kafka が即時および短遅延タスク（10 分以内）を処理し、MySQL が長遅延と Cron タスクを処理する。</p>
+
+            <ul>
+                <li><strong>Kafka</strong>：高スループットで、コンシューマーグループと partition レベルの並列処理を自然にサポート。短遅延タスクは消費後にメモリ内の ETA 優先キュー（最小ヒープ）に入れ、到期後にトリガーする。</li>
+                <li><strong>MySQL</strong>：ACID がタスクの紛失を防ぐ。長遅延タスクはトリガー時刻を付けて書き込み、Dispatcher が毎秒到期タスクをスキャン。Cron タスクは Scheduler が事前に次回トリガー時刻を計算して書き込む。</li>
+            </ul>
+
+            <h3>短遅延タスク：ETA Priority Queue</h3>
+
+            <p>短遅延タスクは Kafka から消費後、直接 sleep で待つのではなく、最小ヒープベースの優先キューに入れ、ETA（Expected Time of Arrival、予定トリガー時刻）でソートする：</p>
+
+<pre><code>// ETA Priority Queue —— container/heap ベース
+type Task struct {
+    ID        string
+    Type      string
+    Payload   string
+    ETA       time.Time  // 予定トリガー時刻
+    Priority  int        // 業務優先度（同一 ETA の tiebreak に使用）
+    index     int        // heap 内部インデックス
+}
+
+type ETAQueue []*Task
+
+func (q ETAQueue) Len() int { return len(q) }
+func (q ETAQueue) Less(i, j int) bool {
+    if q[i].ETA.Equal(q[j].ETA) {
+        return q[i].Priority > q[j].Priority  // 同一 ETA なら高優先度が先
+    }
+    return q[i].ETA.Before(q[j].ETA)
+}
+func (q ETAQueue) Swap(i, j int) {
+    q[i], q[j] = q[j], q[i]
+    q[i].index = i
+    q[j].index = j
+}
+func (q *ETAQueue) Push(x any) {
+    t := x.(*Task)
+    t.index = len(*q)
+    *q = append(*q, t)
+}
+func (q *ETAQueue) Pop() any {
+    old := *q
+    n := len(old)
+    t := old[n-1]
+    old[n-1] = nil
+    t.index = -1
+    *q = old[:n-1]
+    return t
+}</code></pre>
+
+            <p>Dispatcher のスケジューリングループ：</p>
+
+<pre><code>func (d *Dispatcher) Run() {
+    pq := &ETAQueue{}
+    heap.Init(pq)
+
+    for {
+        // 1. Kafka から新しいタスクを消費し、ヒープに追加
+        for _, task := range d.consumeBatch() {
+            heap.Push(pq, task)
+        }
+
+        // 2. 到期したすべてのタスクをポップ
+        now := time.Now()
+        for pq.Len() > 0 && (*pq)[0].ETA.Before(now) {
+            task := heap.Pop(pq).(*Task)
+            go d.dispatch(task)  // 非同期実行
+        }
+
+        // 3. 次の起動時刻を計算：ヒープ先頭の ETA またはフォールバック 100ms
+        var sleepUntil time.Duration
+        if pq.Len() > 0 {
+            sleepUntil = time.Until((*pq)[0].ETA)
+            if sleepUntil < 0 {
+                sleepUntil = 0
+            }
+        } else {
+            sleepUntil = 100 * time.Millisecond
+        }
+        time.Sleep(sleepUntil)
+    }
+}</code></pre>
+
+            <p>なぜ Timer Wheel ではなくヒープを選んだか：</p>
+
+            <ul>
+                <li><strong>意味が直感的</strong>：各タスクに ETA があり、ヒープの先頭は常に最も近くトリガーされるタスク。コードロジックが明確で、cascade や tick の概念を理解する必要がない。</li>
+                <li><strong>精度が柔軟</strong>：Timer Wheel の精度は tick 粒度（例えば 100ms 1 目盛り）に制限されるが、ヒープにはその制限がない——ETA はナノ秒精度。</li>
+                <li><strong>優先度を自然にサポート</strong>：<code>Less</code> 関数で ETA と業務優先度を同時に比較できる。同じ秒内に到期するタスクは、高優先度のものが先に実行される。</li>
+                <li><strong>O(log n) で十分</strong>：ヒープの挿入と取り出しは O(log n) で、我々のシナリオ（ヒープ内には通常数千～数万のタスク）ではパフォーマンスは全くボトルネックにならない。Timer Wheel の O(1) の優位性は百万レベルのタスクでのみ現れる。</li>
+                <li><strong>Go 標準ライブラリに含まれる</strong>：<code>container/heap</code> が完全なインターフェースを提供しており、追加の依存関係は不要。</li>
+            </ul>
+
+            <h3>長遅延タスク：MySQL Poller</h3>
+
+            <p>長遅延タスクは MySQL に保存される。コアテーブル構造：</p>
+
+<pre><code>CREATE TABLE async_tasks (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_type   VARCHAR(128) NOT NULL,
+    payload     TEXT NOT NULL,
+    trigger_at  DATETIME NOT NULL,    -- トリガー時刻
+    status      TINYINT DEFAULT 0,    -- 0=pending, 1=dispatched, 2=success, 3=failed
+    retry_count INT DEFAULT 0,
+    max_retries INT DEFAULT 3,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_trigger (status, trigger_at)
+);</code></pre>
+
+            <p>Dispatcher の poller は毎秒実行する：</p>
+
+<pre><code>SELECT id, task_type, payload
+FROM async_tasks
+WHERE status = 0 AND trigger_at &lt;= NOW()
+ORDER BY trigger_at
+LIMIT 1000
+FOR UPDATE SKIP LOCKED;</code></pre>
+
+            <p><code>FOR UPDATE SKIP LOCKED</code> がポイント——複数の Dispatcher インスタンスが並行してスキャンする際、他のインスタンスがロック中の行はスキップされ、分散ロックの複雑さを回避する。これは MySQL 8.0 で導入された機能で、このシナリオに完璧に適合する。</p>
+
+            <p>スキャンされたタスクは直ちにステータスを <code>dispatched</code> に更新し、RPC 経由で業務サービスのエグゼキュータを呼び出す。RPC が失敗またはタイムアウトした場合、タスクステータスは <code>pending</code> に戻り、<code>retry_count</code> が 1 増加し、<code>trigger_at</code> は現在時刻にバックオフ遅延（指数バックオフ + ジッター）を加えた値に設定される。</p>
+
+            <h3>Cron 定時タスク</h3>
+
+            <p>Cron タスクの実装は 2 層に分かれる：</p>
+
+            <ol>
+                <li><strong>Cron Scheduler</strong>：cron 式を解析し、次のトリガー時刻を計算し、MySQL の <code>async_tasks</code> テーブルに書き込む。本質的には Cron タスクを長遅延タスクに変換する。</li>
+                <li><strong>Cron Registry</strong>：cron ルールのメタ情報（cron 式、関連する task_type、担当者など）を保存する。</li>
+            </ol>
+
+<pre><code>// Cron Scheduler コアループ
+func (s *CronScheduler) Run() {
+    for {
+        rules := s.loadActiveRules()  // cron_registry から読み込み
+        for _, rule := range rules {
+            next := rule.NextTriggerTime()
+            if !s.taskExistsForTime(rule.TaskType, next) {
+                s.createTask(rule.TaskType, rule.Payload, next)
+            }
+        }
+        time.Sleep(10 * time.Second)  // 10 秒ごとにチェック
+    }
+}</code></pre>
+
+            <p>この設計の利点は Cron Scheduler がステートレスであること——「次のトリガーのタスクが MySQL に存在すること」を保証するだけ。Scheduler がダウンして再起動しても、冪等であるため（存在チェック後に作成）、タスクが失われることはない。</p>
+
+            <h3>SDK 設計</h3>
+
+            <p>Go SDK と Python SDK は事業チームが直接使用するインターフェース。設計原則：可能な限りシンプルに、内部の複雑さを隠す。</p>
+
+<pre><code>// Go SDK - タスク送信
+client := asyncd.NewClient(asyncd.WithServiceName("order-service"))
+
+// 即時タスク
+err := client.Submit(ctx, &asyncd.Task{
+    Type:    "cancel_expired_order",
+    Payload: `{"order_id": 12345}`,
+})
+
+// 遅延タスク
+err := client.SubmitDelayed(ctx, &asyncd.Task{
+    Type:    "send_review_reminder",
+    Payload: `{"user_id": 67890}`,
+}, 3 * 24 * time.Hour)  // 3 日後
+
+// エグゼキュータ登録
+client.RegisterExecutor("cancel_expired_order", func(ctx context.Context, payload string) error {
+    var req CancelOrderRequest
+    json.Unmarshal([]byte(payload), &req)
+    return orderService.Cancel(ctx, req.OrderID)
+})</code></pre>
+
+            <p>SDK 内部で行っていること：</p>
+
+            <ul>
+                <li><strong>シリアライズ</strong>：payload は統一的に JSON 文字列を使用し、クロス言語のシリアライズ互換性問題を回避</li>
+                <li><strong>RPC 統合</strong>：社内 RPC フレームワーク経由でサービスを登録し、Dispatcher がエグゼキュータを呼び出す際は標準 RPC パス（サービスディスカバリ、ロードバランシング、タイムアウト制御はすべてフレームワークが処理）を通る</li>
+                <li><strong>冪等性の注意喚起</strong>：SDK ドキュメントとコードレビューで繰り返し強調——エグゼキュータは冪等でなければならない。「少なくとも 1 回の配信」は同じタスクが複数回実行される可能性があることを意味する</li>
+            </ul>
+
+            <h3>Kubernetes Operator</h3>
+
+            <p>システムは Kubernetes 上にデプロイされている。最初は標準的な Deployment + ConfigMap を使用したが、運用上の痛みがすぐに露呈した：</p>
+
+            <ul>
+                <li>新しい事業の接続には手動で Kafka topic を作成し、ルーティング設定を更新し、consumer 数を調整する必要がある</li>
+                <li>Dispatcher の partition 割り当てと MySQL poller の並行度は QPS に応じて動的に調整する必要がある</li>
+                <li>Cron ルールの変更には Scheduler の再起動が必要</li>
+            </ul>
+
+            <p>そこで Custom Operator を開発し、CRD を導入した：</p>
+
+<pre><code>apiVersion: asyncd.example.io/v1
+kind: AsyncJobConfig
+metadata:
+  name: order-cancel-job
+spec:
+  taskType: cancel_expired_order
+  executor:
+    service: order-service
+    method: CancelExpiredOrder
+    timeout: 30s
+  retry:
+    maxRetries: 3
+    backoff: exponential
+  kafka:
+    topic: asyncd-order-cancel
+    partitions: 6
+    consumerGroup: asyncd-order-cancel-cg</code></pre>
+
+            <p>Operator は CRD の変更を監視し、自動的に以下を完了する：</p>
+
+            <ul>
+                <li>Kafka topic と consumer group の作成/更新</li>
+                <li>Dispatcher のルーティングテーブルの更新（ConfigMap のホットアップデート経由）</li>
+                <li>QPS メトリクスに基づく consumer レプリカ数の自動調整（HPA 連携）</li>
+            </ul>
+
+            <p>これにより事業接続のハードルが大幅に下がった——「チケットを出してプラットフォームチームに設定を依頼」から「YAML を提出」に変わった。</p>
+
+            <h3>監視とアラート</h3>
+
+            <p>各段階で Prometheus metrics を公開している：</p>
+
+<pre><code>// タスク送信
+asyncd_task_submitted_total{task_type, source_service}
+asyncd_task_submit_latency_seconds{task_type}
+
+// タスクスケジューリング
+asyncd_task_dispatched_total{task_type}
+asyncd_task_dispatch_delay_seconds{task_type}  // 実際のトリガー時刻 - 予定トリガー時刻
+
+// タスク実行
+asyncd_task_executed_total{task_type, status}   // status: success/failed/timeout
+asyncd_task_execution_duration_seconds{task_type}
+asyncd_task_retry_total{task_type}
+
+// キューヘルス
+asyncd_kafka_consumer_lag{topic, partition}
+asyncd_mysql_pending_tasks{task_type}
+asyncd_mysql_poll_duration_seconds</code></pre>
+
+            <p>最も重要なアラートルール：</p>
+
+            <ul>
+                <li><strong>dispatch_delay > 5s</strong>：タスクスケジューリング遅延が 5 秒を超えている。消費能力が不足しているか MySQL poller が詰まっている</li>
+                <li><strong>kafka_consumer_lag が継続的に増加</strong>：コンシューマーがプロデューサーに追いつけていない。スケールアウトが必要</li>
+                <li><strong>mysql_pending_tasks が継続的に増加</strong>：到期タスクが蓄積している。poller に問題がある可能性</li>
+                <li><strong>タスクリトライ率 > 10%</strong>：下流サービスに問題がある可能性</li>
+            </ul>
+
+            <h3>ダブルイレブン：25K から 50K QPS へ</h3>
+
+            <p>2021 年のダブルイレブンはこのシステム最大の試練だった。日常の QPS は約 25K で、ピーク時は 50K 以上をサポートする見積もりだった。</p>
+
+            <p>事前に行った対策：</p>
+
+            <ul>
+                <li><strong>Kafka partition の拡張</strong>：コア topic を 12 partition から 24 に拡張し、consumer も相応に拡張</li>
+                <li><strong>MySQL の読み書き分離</strong>：poller クエリはレプリカを使用し、ステータス更新はマスターを使用して、スキャンクエリが書き込みに影響しないようにした</li>
+                <li><strong>バッチ送信の最適化</strong>：SDK に <code>SubmitBatch</code> インターフェースを追加し、1 回の RPC で複数タスクを送信してネットワークの往復を削減</li>
+                <li><strong>ウォームアップ</strong>：ダブルイレブンの前日に、すべての Cron タスクの次回トリガーレコードを事前に作成し、深夜の書き込みスパイクを回避</li>
+            </ul>
+
+            <p>実際のピークは約 48K QPS に達し、システムは耐え抜き、タスクの紛失はなかった。主要指標：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>指標</th>
+                        <th>日常</th>
+                        <th>ダブルイレブンピーク</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>QPS</td>
+                        <td>~25K</td>
+                        <td>~48K</td>
+                    </tr>
+                    <tr>
+                        <td>P99 スケジューリング遅延</td>
+                        <td>180ms</td>
+                        <td>520ms</td>
+                    </tr>
+                    <tr>
+                        <td>タスク紛失</td>
+                        <td>0</td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td>リトライ率</td>
+                        <td>0.3%</td>
+                        <td>1.2%</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>踏んだ落とし穴</h3>
+
+            <h3>1. MySQL の datetime 精度</h3>
+
+            <p>MySQL の <code>DATETIME</code> はデフォルト精度が秒。複数のタスクの <code>trigger_at</code> が同一秒内の場合、<code>ORDER BY trigger_at</code> の順序が不定。秒レベルの遅延タスクでは、タスクが順序通りに実行されない原因となった。解決策：<code>DATETIME(3)</code>（ミリ秒精度）に変更し、<code>ORDER BY</code> に <code>id</code> を tiebreaker として追加。</p>
+
+            <h3>2. Kafka rebalance ストーム</h3>
+
+            <p>初期の consumer は <code>session.timeout.ms</code> と <code>heartbeat.interval.ms</code> を適切に設定しておらず、業務エグゼキュータの偶発的な遅延リクエストにより consumer がダウンと判定され、rebalance がトリガーされた。rebalance 中はすべての consumer が消費を停止し、遅延が急上昇した。最終的に <code>session.timeout=30s</code>、<code>heartbeat.interval=10s</code>、<code>max.poll.interval=5min</code> に調整し、同時にエグゼキュータ呼び出しを非同期化——メッセージ消費後に即座に commit し、実行結果はコールバックで報告するようにした。</p>
+
+            <h3>3. Poller のサンダリングハード効果</h3>
+
+            <p>複数の Dispatcher インスタンスが同時に MySQL をスキャンすると、<code>FOR UPDATE SKIP LOCKED</code> で重複実行は回避されるが、大量のロック競合により MySQL の CPU が急上昇した。解決策：各 Dispatcher インスタンスが特定の <code>task_type</code> 範囲を担当し（コンシステントハッシュで割り当て）、すべてのインスタンスが同じデータをスキャンすることを回避。</p>
+
+            <h3>4. タイムゾーンの問題</h3>
+
+            <p>Shopee の事業は東南アジアの複数の国をカバーしており、各国のタイムゾーンが異なる。cron 式 <code>0 0 * * *</code>（毎日零時）はどの零時なのか？最終方針：すべての内部時刻は UTC で保存・計算し、Cron ルールは明示的にタイムゾーンを指定する必要がある <code>CRON_TZ=Asia/Singapore 0 0 * * *</code>。SDK は cron 式にタイムゾーン情報が含まれているかチェックし、含まれていなければ拒否する。</p>
+
+            <h3>5. 冪等性の普及の難しさ</h3>
+
+            <p>技術的には最もシンプルだが普及が最も難しい問題。「少なくとも 1 回の配信」は業務エグゼキュータが冪等でなければならないことを要求するが、多くの業務開発者は理解していないか重視していなかった。本番稼働後に「二重課金」「二重クーポン発行」の事故が何度か発生したが、すべてエグゼキュータが冪等性を実装していなかったため。最終的に SDK レベルで <code>idempotency_key</code> の入力を必須とし、Redis ベースの重複排除ヘルパーを提供して、ツールレベルでエラーの確率を下げた。</p>
+
+            <h3>振り返りと反省</h3>
+
+            <p>このシステムは 2019 年半ばに設計を開始し、2020 年初めに最初の事業が接続し、2021 年のダブルイレブンで 50K QPS に耐えた。3 年間の感想：</p>
+
+            <ul>
+                <li><strong>ストレージ選定がシステムの上限を決める</strong>：Kafka + MySQL の組み合わせは華やかではないが、成熟度と信頼性が勝る。ミドルウェアシステムにおいて「データを失わない」ことは「低遅延」よりはるかに重要。Kafka の永続化と at-least-once セマンティクスがこのシステムの礎石であり、いかなる代替案もまずこの関門を通過しなければならない。</li>
+                <li><strong>SDK の使いやすさがシステムの普及速度を決める</strong>：どんなに良いシステムでも、SDK が使いにくければ事業チームは使わない。SDK 設計に費やした時間は決して無駄にならない。</li>
+                <li><strong>Kubernetes Operator はミドルウェアチームのレバレッジ</strong>：運用操作を CRD + Controller としてコード化し、事業チームがセルフサービスで接続でき、プラットフォームチームがボトルネックでなくなる。このパターンは後に他のミドルウェア（設定センター、メッセージキュー）でも再利用された。</li>
+                <li><strong>監視は後付けではなく、初日から必要</strong>：システム稼働初日から完全な Prometheus + Grafana ダッシュボードがあった。初期の多くの問題はメトリクスによって事前に発見され、事業からの障害報告を待つのではなかった。</li>
+                <li><strong>冪等性は社会的問題であり、技術的問題ではない</strong>：ツールは提供できるが、最終的には業務開発者が理解し重視する必要がある。ドキュメント、トレーニング、コードレビュー、事故の振り返り、どれも欠かせない。</li>
+            </ul>
+
+            <h3>もう一度やるとしたら</h3>
+
+            <p>最大の教訓は：<strong>まずユースケースを明確にモデリングし、それから技術選定を行う</strong>。</p>
+
+            <p>当時、「非同期タスク」を統一的な概念としてシステムを設計したが、実際には異なるタスクは重要な属性において差異が大きい。もう一度やるなら、十分な時間をかけて事業チームと一緒に各タスクの核心属性を整理する：</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>属性</th>
+                        <th>取りうる値</th>
+                        <th>影響する設計上の決定</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>遅延タイプ</strong></td>
+                        <td>即時 / 短遅延 / 長遅延 / Cron</td>
+                        <td>ストレージ選定（Kafka vs MySQL）、スケジューリング戦略</td>
+                    </tr>
+                    <tr>
+                        <td><strong>優先度</strong></td>
+                        <td>高（注文キャンセル）/ 中 / 低（レポート）</td>
+                        <td>キュー分離戦略、リソース割り当て</td>
+                    </tr>
+                    <tr>
+                        <td><strong>一意性</strong></td>
+                        <td>重複許可 / 同一時刻で一意 / グローバルに一意</td>
+                        <td>重複排除メカニズム、冪等性要件</td>
+                    </tr>
+                    <tr>
+                        <td><strong>配信セマンティクス</strong></td>
+                        <td>少なくとも 1 回 / 多くとも 1 回 / 正確に 1 回</td>
+                        <td>確認メカニズム、リトライ戦略、メッセージ永続化</td>
+                    </tr>
+                    <tr>
+                        <td><strong>実行時間</strong></td>
+                        <td>ミリ秒レベル / 秒レベル / 分レベル以上</td>
+                        <td>タイムアウト設定、ハートビート検出、リソース分離</td>
+                    </tr>
+                    <tr>
+                        <td><strong>失敗処理</strong></td>
+                        <td>リトライ / 破棄 / 手動介入</td>
+                        <td>リトライ戦略、デッドレターキュー、アラートルール</td>
+                    </tr>
+                    <tr>
+                        <td><strong>依存関係</strong></td>
+                        <td>独立 / 前提依存あり / DAG</td>
+                        <td>タスクオーケストレーション、ステートマシン</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>これらの属性の異なる組み合わせは、全く異なる設計上のトレードオフを意味する。いくつかの例：</p>
+
+            <ul>
+                <li><strong>注文タイムアウトキャンセル</strong>（短遅延 + 高優先度 + グローバルに一意 + 少なくとも 1 回）：独立した高優先度キューが必要で、重複排除メカニズムが信頼できなければならず、メッセージは絶対に失われてはならない——Kafka が正しい選択で、Redis は不可。</li>
+                <li><strong>統計レポート生成</strong>（Cron + 低優先度 + 重複許可 + 多くとも 1 回）：2 回実行しても問題ないが、高優先度タスクをブロックしてはならない——キュー分離が必要で、注文タスクとの共有は不可。</li>
+                <li><strong>データエクスポート</strong>（即時 + 実行時間が長い + 前提依存あり）：タイムアウトと誤判定されないようハートビート検出が必要で、手動直列ではなく DAG オーケストレーションが必要。</li>
+            </ul>
+
+            <p>当時犯した過ちは、これらの差異の大きいタスクを同一のモデルに押し込めたこと。結果として：高優先度タスクが低優先度タスクにブロックされ（キュー分離なし）、一意性が必要なタスクが重複実行され（重複排除メカニズムなし）、オーケストレーションが必要なタスクが業務側の手動直列に依存した（DAG サポートなし）。</p>
+
+            <p>その他の具体的な改善：</p>
+
+            <ul>
+                <li><strong>デッドレターキューの導入</strong>：リトライ回数を使い果たしたタスクは failed とマークするだけでなく、デッドレターキューに入れるべき。当時このメカニズムがなく、一部の失敗タスクが忘れ去られた。</li>
+                <li><strong>優先度によるキュー分離</strong>：高優先度タスクに独立した Kafka topic と consumer group を使用し、低優先度タスクの蓄積による速度低下を回避。これは後から補ったが、最初からユースケースモデリング段階で識別していれば、実装はもっとクリーンだっただろう。</li>
+                <li><strong>タスク一意性制約</strong>：宣言的な一意性設定（例：<code>unique_key = "order:{order_id}"</code>）を提供し、同じ key のタスクが重複実行されないことをシステムレベルで保証する。業務側の冪等性に完全に依存するのではなく。</li>
+                <li><strong>DAG 式タスクオーケストレーション</strong>：業務では頻繁に「タスク A 完了後にタスク B をトリガー」が必要。当時は業務側がエグゼキュータ内で手動で次のタスクを送信しており、エラーが起きやすかった。宣言的な DAG オーケストレーション機能を提供すべき。</li>
+            </ul>
+
+            <p>一言でまとめると：<strong>技術選定はユースケースに奉仕するものであり、その逆ではない</strong>。まず時間をかけてタスクの属性マトリクスを明確にし、各組み合わせがどんなトレードオフに対応するかを考え抜いてから、コードを書き始める。「Kafka を使うか Redis を使うか」で悩むことから始めるより、はるかに価値がある。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>

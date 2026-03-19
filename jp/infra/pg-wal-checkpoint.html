@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL ストレージエンジンの内部構造（下）：WAL、Checkpoint と永続性 - 霧の海の旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>霧の海の旅人</h1>
+            <ul>
+                <li><a href="../index.html">ホーム</a></li>
+                <li><a href="../career.html">キャリア</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>PostgreSQL ストレージエンジンの内部構造（下）：WAL、Checkpoint と永続性</h2>
+            <time>2026-03-08</time>
+
+            <figure class="post-cover">
+                <img src="../../images/durer-jerome-study.jpg" alt="Saint Jerome in His Study, Albrecht Dürer, 1514">
+                <figcaption>Albrecht Dürer,《書斎の聖ヒエロニムス》, 1514 — ヒエロニムスは机に向かって聖書を翻訳し、一字一句が忠実に記録される。壁の砂時計は時の流れを刻んでいる。WAL の本質はこれと同じである：いかなる変更が起きる前に、まずそれをログに書く。この記録がクラッシュリカバリの基盤であり、ストリーミングレプリケーションの源泉でもある</figcaption>
+            </figure>
+
+            <div class="series-nav">
+                <strong>PostgreSQL ストレージエンジンの内部構造</strong><br>
+                <a href="pg-heap-buffer.html">上：Heap Page と Buffer Pool</a> ·
+                <a href="pg-index-mvcc.html">中：インデックススキャンと MVCC</a> ·
+                <span class="current">下：WAL、Checkpoint と永続性</span>
+            </div>
+
+            <blockquote class="value-prop">
+            <strong>この記事の価値</strong>：データベースは「トランザクションがコミットされたらデータは失われない」と約束する。この約束はどう実現されるのか？答えは WAL（Write-Ahead Log）――データページを変更する前に、まず変更の記録をログに書き込む。この記事では INSERT 文が WAL レコードを生成し、WAL Writer がディスクにフラッシュし、Checkpoint がリカバリポイントを作成するまでの完全なパスを追跡し、この仕組みがクラッシュリカバリとストリーミングレプリケーションを同時にどう支えるかを説明する。
+            </blockquote>
+
+            <h3>WAL の核心思想</h3>
+
+            <p>Write-Ahead Logging のルールはただ一つ：<strong>データページを変更する前に、その変更を記述するログレコードを永続ストレージに書き込まなければならない</strong>。</p>
+
+            <p>なぜか？変更されたデータページをディスクに書き込むコストは高い（ランダム I/O、一度に 8KB）が、ログレコードをファイル末尾に追加するのは安価（シーケンシャル I/O、通常数十〜数百バイト）だからだ。WAL はランダム書き込みをシーケンシャル書き込みに変換しつつ、永続性を保証する。</p>
+
+<pre class="diagram"><code>  WAL がない世界（データページを直接書き込み）：
+
+  トランザクションコミット → すべての変更 Page をディスクにフラッシュ → ランダム I/O → 遅い
+  クラッシュ → 一部の Page が中途半端に書かれた → データ破損 → リカバリ不能
+
+  WAL がある世界：
+
+  トランザクションコミット → WAL レコードのみディスクにフラッシュ → シーケンシャル I/O → 速い
+  データページは後でゆっくり書ける（非同期）
+  クラッシュ → WAL ログをリプレイ → データが一貫した状態にリカバリ</code></pre>
+
+            <h3>XLogRecord：WAL レコードの構造</h3>
+
+            <p>各データベース書き込み操作（INSERT、UPDATE、DELETE、および各種内部操作）は 1 つまたは複数の <code>XLogRecord</code> を生成する：</p>
+
+<pre><code>typedef struct XLogRecord {
+    uint32      xl_tot_len;   // レコード全体の長さ
+    TransactionId xl_xid;     // このレコードを生成したトランザクション ID
+    XLogRecPtr  xl_prev;      // 前の WAL レコードの位置（リンクリストを形成）
+    uint8       xl_info;      // 操作タイプ（例：XLOG_HEAP_INSERT）
+    RmgrId      xl_rmid;      // リソースマネージャ ID（どのサブシステムが生成したか）
+    pg_crc32c   xl_crc;       // CRC チェック
+} XLogRecord;</code></pre>
+
+            <p>INSERT が生成する WAL レコードはおおよそこのようになる：</p>
+
+<pre><code>XLogRecord {
+    xl_tot_len = 156,              // レコード全体で 156 バイト
+    xl_xid = 12345,                // トランザクション ID
+    xl_prev = 0/1A2B3C4D,          // 前のレコードの LSN
+    xl_info = XLOG_HEAP_INSERT,    // ヒープ挿入操作
+    xl_rmid = RM_HEAP_ID,          // ヒープテーブルリソースマネージャ
+    xl_crc = 0x1A2B3C4D            // CRC チェック
+}
+// 後続に：変更された Page の block reference + 実際に挿入されたデータ</code></pre>
+
+            <h4>LSN：WAL のタイムライン</h4>
+
+            <p>LSN（Log Sequence Number）は WAL 内の各レコードのグローバルに一意な位置識別子で、フォーマットは <code>セグメント番号/セグメント内オフセット</code>（例：<code>0/1A2B3C4D</code>）。これは PostgreSQL における「時間」のもう一つの表現である：</p>
+
+            <ul>
+                <li>各 Page の <code>pd_lsn</code> は、その Page を最後に変更した WAL レコードの LSN を記録する</li>
+                <li>リカバリ時、Page の <code>pd_lsn</code> が WAL レコードの LSN 以上であれば、その WAL はすでに適用済みなのでスキップ</li>
+                <li>レプリケーション時、standby は primary に「LSN X まで再生済み」と通知し、primary はどの WAL が回収可能かを判断する</li>
+            </ul>
+
+            <h4>リソースマネージャ：このログを生成したのは誰か</h4>
+
+            <p>異なるサブシステムが異なるタイプの WAL レコードを生成し、各サブシステムが「リソースマネージャ」（Resource Manager）を登録して独自の redo およびデコード関数を提供する：</p>
+
+            <table>
+                <thead>
+                    <tr><th>RmgrId</th><th>サブシステム</th><th>操作タイプ例</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>RM_HEAP_ID</td><td>ヒープテーブル</td><td>INSERT、DELETE、UPDATE、HOT_UPDATE</td></tr>
+                    <tr><td>RM_BTREE_ID</td><td>B-Tree インデックス</td><td>インデックスページ分割、インデックスエントリ挿入</td></tr>
+                    <tr><td>RM_XACT_ID</td><td>トランザクション管理</td><td>COMMIT、ABORT</td></tr>
+                    <tr><td>RM_CLOG_ID</td><td>トランザクションコミットログ</td><td>CLOG ページ更新</td></tr>
+                    <tr><td>RM_XLOG_ID</td><td>WAL 自体</td><td>Checkpoint レコード</td></tr>
+                </tbody>
+            </table>
+
+            <p>リカバリ時、各 WAL レコードに対して対応するリソースマネージャの <code>rm_redo</code> 関数が呼ばれる。ロジカルレプリケーション時は <code>rm_decode</code> 関数で物理的な変更を論理的な変更に変換する（例：<code>DecodeInsert</code> が <code>XLOG_HEAP_INSERT</code> を理解可能な行変更イベントに解析する）。</p>
+
+            <h3>WAL の書き込みパス：メモリからディスクへ</h3>
+
+            <h4>WAL バッファ：共有メモリ内のログステージングエリア</h4>
+
+<pre class="diagram"><code>  Backend Process A          Backend Process B          WAL Writer
+  (INSERT INTO ...)          (UPDATE ...)              (バックグラウンドプロセス)
+        │                         │                        │
+        │ XLogInsert()            │ XLogInsert()           │
+        ▼                         ▼                        │
+  ┌───────────────────────────────────────────────────┐    │
+  │              XLogCtl (共有メモリ)                   │    │
+  │                                                    │    │
+  │  WAL バッファ (wal_buffers パラメータ、デフォルト 16MB) │   │
+  │  ┌────────┬────────┬────────┬────────┬────────┐   │    │
+  │  │ Page 0 │ Page 1 │ Page 2 │ Page 3 │  ...   │   │    │
+  │  │ 8KB    │ 8KB    │ 8KB    │ 8KB    │        │   │    │
+  │  └────────┴────────┴────────┴────────┴────────┘   │    │
+  │                                                    │    │
+  │  制御情報：                                         │    │
+  │  - LogwrtRqst: 書き込み要求位置                     │    │
+  │  - LogwrtResult: 書き込み完了位置                   │    │
+  │  - xlblocks[]: 各ページの終了 LSN                   │    │
+  │  - walwriter_latch: WAL Writer を起動               │    │
+  └─────────────────────────────────┬─────────────────┘    │
+                                    │                       │
+                                    │  XLogWrite()          │
+                                    ▼                       │
+                          ┌──────────────────┐             │
+                          │  WAL ファイル (ディスク) │ ◄──────┘
+                          │  各 16MB           │  XLogBackgroundFlush()
+                          └──────────────────┘</code></pre>
+
+            <p>2 つの重要なプロセス間通信メカニズム：</p>
+            <ul>
+                <li><strong>共有メモリ</strong>：Backend が WAL レコードを共有バッファに書き込み、WAL Writer が共有バッファから読み取ってディスクに書き込む</li>
+                <li><strong>Latch</strong>：Backend が <code>SetLatch()</code> で WAL Writer を起動し、WAL Writer が <code>WaitLatch()</code> で起動シグナルを待つ。Latch は PG の軽量同期プリミティブで、セマフォよりオーバーヘッドが低い</li>
+            </ul>
+
+            <h4>Write vs Flush：2 段階書き込み</h4>
+
+            <p>WAL のディスク書き込みは 2 つの段階に分かれており、この違いを理解することは極めて重要である：</p>
+
+            <table>
+                <thead>
+                    <tr><th>段階</th><th>操作</th><th>データ到達先</th><th>性能</th><th>永続性</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>Write</strong></td><td>メモリ → OS ファイルキャッシュ</td><td>OS カーネルバッファ</td><td>高速（メモリコピー）</td><td>停電で消失</td></tr>
+                    <tr><td><strong>Flush</strong></td><td>OS ファイルキャッシュ → ディスク</td><td>永続ストレージ</td><td>低速（実際の I/O）</td><td>停電でも保持</td></tr>
+                </tbody>
+            </table>
+
+            <p>トランザクション COMMIT 時には WAL Flush の完了を確認しなければならない――これが永続性保証の鍵である。<code>synchronous_commit</code> パラメータでこの動作を制御する：</p>
+            <ul>
+                <li><code>on</code>（デフォルト）：COMMIT は WAL Flush 完了まで待ってから返却</li>
+                <li><code>off</code>：COMMIT は Flush を待たない。直近数百ミリ秒のトランザクションを失う可能性がある。性能は良いが永続性を犠牲にする</li>
+            </ul>
+
+            <h4>WAL Writer：バックグラウンドフラッシュプロセス</h4>
+
+            <p>WAL Writer は <code>child_process_kinds</code> テーブルの <code>B_WAL_WRITER</code> で、エントリ関数は <code>WalWriterMain</code>：</p>
+
+<pre class="diagram"><code>  WalWriterMain メインループ：
+
+  ┌────────────────────────────────────────┐
+  │  シグナルハンドラ設定                    │
+  │  SIGHUP → 設定再読み込み                │
+  │  SIGTERM → グレースフル終了              │
+  └───────────────┬────────────────────────┘
+                  │
+                  ▼
+          ┌───────────────┐
+          │  WaitLatch()  │ ← 起動またはタイムアウト待ち
+          │  (スリープ)    │
+          └───────┬───────┘
+                  │ 起動 / タイムアウト
+                  ▼
+          ┌───────────────────────┐
+          │ XLogBackgroundFlush() │
+          │                       │
+          │ 1. write が必要な WAL  │
+          │    位置を取得          │
+          │ 2. 排他ロックを取得    │
+          │ 3. 並行する WAL 挿入   │
+          │    の完了を待機        │
+          │    (複数の Backend が  │
+          │     同時に WAL を書込  │
+          │     中の可能性)        │
+          │ 4. XLogWrite() で     │
+          │    実際のディスク書込   │
+          │ 5. ポリシーに基づき    │
+          │    fsync を実行するか  │
+          │    決定                │
+          └───────┬───────────────┘
+                  │
+                  ▼
+          ┌───────────────┐
+          │  WaitLatch に │
+          │  戻る         │
+          └───────────────┘</code></pre>
+
+            <h4>XLogWrite：実際のディスク書き込み</h4>
+
+            <p><code>XLogWrite</code> は最下層の書き込み関数である。そのコアロジック：</p>
+
+            <ul>
+                <li>クリティカルセクションに入る（<code>START_CRIT_SECTION</code>）――書き込み中は割り込み不可、途中でキャンセルされて WAL ファイルが破損することを防止</li>
+                <li>すべての進行中の WAL 挿入の完了を待機（<code>WaitXLogInsertionsToFinish</code>）――複数の Backend が同時に WAL バッファに書き込んでいる可能性がある</li>
+                <li>書き込む Page 範囲を計算し、<code>pg_pwrite</code> でバッチ書き込み</li>
+                <li>WAL Segment をまたぐ場合の処理――現在のファイルが 16MB 書き終わったら次のファイルに切り替え</li>
+            </ul>
+
+<pre><code>// XLogWrite のコア書き込みループ（簡略化）
+do {
+    written = pg_pwrite(openLogFile, from, nleft, startoffset);
+    if (written <= 0) {
+        if (errno == EINTR) continue;  // シグナル割り込み、リトライ
+        ereport(PANIC, ...);           // 書き込み失敗 → PANIC、データベース停止
+    }
+    nleft -= written;
+    from += written;
+    startoffset += written;
+} while (nleft > 0);</code></pre>
+
+            <p>書き込み失敗時は <code>PANIC</code> であることに注意――WAL 書き込みの失敗は永続性保証が破壊されたことを意味し、データベースは即座に停止して人手の介入を待たなければならない。</p>
+
+            <h4>WAL ファイルの構成</h4>
+
+<pre class="diagram"><code>  $PGDATA/pg_wal/
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ 000000010000000000000001  (16MB)                          │
+  │ ┌──────────┬──────────┬──────────┬─────┬──────────┐      │
+  │ │ WAL Page │ WAL Page │ WAL Page │ ... │ WAL Page │      │
+  │ │  0 (8KB) │  1 (8KB) │  2 (8KB) │     │ 2047     │      │
+  │ │ ┌──────┐ │          │          │     │          │      │
+  │ │ │Record│ │          │          │     │          │      │
+  │ │ │Record│ │          │          │     │          │      │
+  │ │ │Record│ │          │          │     │          │      │
+  │ │ └──────┘ │          │          │     │          │      │
+  │ └──────────┴──────────┴──────────┴─────┴──────────┘      │
+  ├──────────────────────────────────────────────────────────┤
+  │ 000000010000000000000002  (16MB)                          │
+  ├──────────────────────────────────────────────────────────┤
+  │ 000000010000000000000003  (16MB)                          │
+  └──────────────────────────────────────────────────────────┘
+
+  2048 個の 8KB Page = 16MB = 1 つの WAL Segment
+
+  ファイル名エンコーディング: {Timeline}{SegmentHigh}{SegmentLow}
+  例: 00000001 00000000 00000001 = Timeline 1, Segment 1
+
+  ライフサイクル:
+  1. 新しいファイルを作成
+  2. 16MB 書き終わったら → 次のファイルに切り替え
+  3. Checkpoint 後 → 古いファイルは回収可能
+  4. 回収 = リネームして再利用（create/delete のオーバーヘッドを回避）</code></pre>
+
+            <h3>Checkpoint：一貫性リカバリポイント</h3>
+
+            <p>Checkpoint がなければ、クラッシュリカバリは最初の WAL レコードからリプレイを開始する必要がある――運用時間が伸びるにつれて、リカバリ時間が無限に増大する。Checkpoint はこの問題を解決する：定期的にすべてのダーティページをディスクにフラッシュし、「一貫性ポイント」を作成する。リカバリは直近の Checkpoint からのリプレイのみで済む。</p>
+
+<pre class="diagram"><code>  時間 ──────────────────────────────────────────────────────►
+
+  WAL: ═══════════════════════════════════════════════════════
+       │              │                    │          │
+    Checkpoint 1   Checkpoint 2         Checkpoint 3  クラッシュ!
+       │              │                    │          │
+       │              │                    │◄────────►│
+       │              │                    リカバリはこの
+       │              │                    区間の WAL のみ
+       │              │                    リプレイが必要
+       │              │
+       │              Checkpoint 2 以降
+       │              Checkpoint 1 以前の WAL は回収可能</code></pre>
+
+            <p>Checkpoint のエントリは <code>CheckpointerMain</code>（<code>B_CHECKPOINTER</code> プロセス）で、トリガータイミング：</p>
+
+            <ul>
+                <li><strong>タイムアウトトリガー</strong>：<code>checkpoint_timeout</code> パラメータ（デフォルト 5 分）</li>
+                <li><strong>WAL 量トリガー</strong>：WAL 生成量が <code>max_wal_size</code>（デフォルト 1GB）を超えた場合</li>
+                <li><strong>手動トリガー</strong>：<code>CHECKPOINT</code> コマンドの実行</li>
+                <li><strong>シャットダウントリガー</strong>：データベースの正常シャットダウン時</li>
+            </ul>
+
+            <h4>Checkpoint の実行ステップ</h4>
+
+<pre class="diagram"><code>  CreateCheckPoint:
+
+  ┌─────────────────────────────────┐
+  │ 1. 現在の WAL 挿入位置を取得     │
+  │    (redo LSN)                    │
+  │    「このポイント以降の WAL は    │
+  │     リプレイが必要」              │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 2. すべてのダーティバッファを     │
+  │    ディスクにフラッシュ           │
+  │    Buffer Pool 内の各 dirty     │
+  │    buffer を走査し fsync を呼出  │
+  │    （最も時間がかかるステップ）   │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 3. WAL をディスクにフラッシュ     │
+  │    すべての WAL レコードが        │
+  │    永続化されたことを確認         │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 4. 制御ファイルを更新             │
+  │    $PGDATA/global/pg_control    │
+  │    Checkpoint 位置情報を書き込み  │
+  └──────────────┬──────────────────┘
+                 ▼
+  ┌─────────────────────────────────┐
+  │ 5. 古い WAL ファイルを回収        │
+  │    Checkpoint 以前の WAL は      │
+  │    リカバリに不要 → リネームして  │
+  │    再利用                         │
+  └─────────────────────────────────┘</code></pre>
+
+            <p>重要な制約：Checkpoint 中のダーティページフラッシュは漸進的に行われ（<code>checkpoint_completion_target</code> パラメータ）、瞬間的な大量 I/O が通常のクエリに影響することを回避する。デフォルト設定では、2 回の Checkpoint 間隔の 90% の時間をかけて均等にフラッシュを完了する。</p>
+
+            <h3>クラッシュリカバリ：WAL のリプレイ</h3>
+
+            <p>データベースがクラッシュ後に再起動すると、<code>StartupProcessMain</code>（<code>B_STARTUP</code> プロセス）がリカバリを担当する：</p>
+
+            <ul>
+                <li><code>pg_control</code> ファイルを読み取り、直近の Checkpoint 位置を特定</li>
+                <li>Checkpoint の redo LSN から WAL の読み取りを開始</li>
+                <li>各 WAL レコードについて、対応する Page の <code>pd_lsn</code> を確認：<code>pd_lsn >= record_lsn</code> であれば、その変更はすでに永続化されているのでスキップ；そうでなければ <code>rm_redo</code> を呼んでリプレイ</li>
+                <li>WAL 末尾まで再生したらリカバリ完了、データベースは通常サービスを開始</li>
+            </ul>
+
+<pre><code>// クラッシュリカバリのコアロジック（疑似コード）
+checkpoint = ReadControlFile();       // pg_control を読み取り
+lsn = checkpoint.redo;                // リカバリ開始ポイント
+
+while (record = ReadWALRecord(lsn)) {
+    page = GetPage(record.target);    // ターゲット Page を取得
+
+    if (page.pd_lsn >= record.lsn)
+        continue;                     // すでに適用済み、スキップ
+
+    rmgr = GetRmgr(record.rmid);
+    rmgr.rm_redo(record);             // この WAL をリプレイ
+    lsn = NextRecordLSN(record);
+}
+// リカバリ完了</code></pre>
+
+            <h3>ストリーミングレプリケーション：WAL のもう一つの消費者</h3>
+
+            <p>WAL はクラッシュリカバリだけに使われるのではない――ストリーミングレプリケーションの基盤でもある。<code>B_WAL_SENDER</code> プロセスが WAL を standby にリアルタイムで送信する：</p>
+
+<pre class="diagram"><code>  Primary                                    Standby
+  ┌──────────────────────┐                  ┌──────────────────────┐
+  │                      │                  │                      │
+  │  Backend Process     │                  │  WAL Receiver        │
+  │  INSERT/UPDATE/...   │                  │  (B_WAL_RECEIVER)    │
+  │       │              │                  │       │              │
+  │       ▼              │                  │       ▼              │
+  │  WAL Buffer          │ ストリーミング    │  WAL ファイルに書込  │
+  │       │              │ レプリケーション   │       │              │
+  │       ▼              │ プロトコル        │       ▼              │
+  │  WAL Sender          │ ◄──────────────► │  Startup Process     │
+  │  (B_WAL_SENDER)      │                  │  WAL を継続的にリプレイ│
+  │                      │                  │       │              │
+  │  XLogSendPhysical()  │ ─── WAL データ ──►│       ▼              │
+  │  または               │                  │  データが Primary と │
+  │  XLogSendLogical()   │                  │  一致                │
+  └──────────────────────┘                  └──────────────────────┘</code></pre>
+
+            <h4>物理レプリケーション vs ロジカルレプリケーション</h4>
+
+            <table>
+                <thead>
+                    <tr><th></th><th>物理レプリケーション</th><th>ロジカルレプリケーション</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>送信内容</strong></td><td>生の WAL バイトストリーム</td><td>デコードされた論理的変更（INSERT row X）</td></tr>
+                    <tr><td><strong>送信関数</strong></td><td>XLogSendPhysical</td><td>XLogSendLogical</td></tr>
+                    <tr><td><strong>Standby 要件</strong></td><td>完全に同一の PG バージョンとプラットフォーム</td><td>異なるバージョンや異なるデータベースも可</td></tr>
+                    <tr><td><strong>粒度</strong></td><td>クラスタ全体</td><td>テーブルレベル、選択的にレプリケーション可能</td></tr>
+                    <tr><td><strong>用途</strong></td><td>高可用性、読み取りレプリカ</td><td>データ統合、バージョン間マイグレーション</td></tr>
+                </tbody>
+            </table>
+
+            <p>ロジカルレプリケーションのデコードプロセス：<code>XLogSendLogical</code> → <code>XLogReadRecord</code> で WAL レコードを読み取り → <code>LogicalDecodingProcessRecord</code> が対応するリソースマネージャの <code>rm_decode</code> 関数を呼び出す。例えば <code>DecodeInsert</code> が <code>XLOG_HEAP_INSERT</code> タイプの WAL レコードをロジカルレプリケーションが理解できる行変更イベントに解析する。</p>
+
+            <h4>Replication Slot と LSN</h4>
+
+            <p>Replication Slot は各サブスクライバーの消費進捗を追跡する：</p>
+            <ul>
+                <li><code>restart_lsn</code>：この slot が WAL を保持する必要のある開始位置――これより古い WAL は回収できない</li>
+                <li><code>confirmed_flush_lsn</code>：サブスクライバーが受信し処理済みの位置</li>
+            </ul>
+
+            <p>standby が長時間切断されると、<code>restart_lsn</code> が WAL 回収を阻止し、primary のディスクが満杯になる。これは本番環境でよくある障害シナリオである。</p>
+
+            <h4>Timeline：データベースのブランチ履歴</h4>
+
+            <p>Timeline は PG がデータベースの「ブランチ」を処理するメカニズムである。各 Timeline は一意の数字 ID を持ち、以下のシナリオで新しい Timeline が作成される：</p>
+
+            <ul>
+                <li><strong>PITR</strong>（Point-in-Time Recovery）：ある過去の時点からのリカバリ</li>
+                <li><strong>Standby Promotion</strong>：standby がマスターに昇格</li>
+                <li><strong>バックアップからのリストア</strong></li>
+            </ul>
+
+<pre class="diagram"><code>  Timeline 1: ════════════════════════╗
+                                      ║ Standby 昇格
+  Timeline 2:                         ╚═══════════════════
+                                            │
+                                    00000002.history ファイル
+                                    TL2 が TL1 のどの LSN から分岐したかを記録</code></pre>
+
+            <p>Timeline 履歴ファイル（例：<code>00000002.history</code>）は分岐ポイントを記録し、リカバリプロセスが正しい WAL ファイルを選択する助けとなる。</p>
+
+            <h3>PG プロセスの全体像</h3>
+
+            <p>最後に、本シリーズで登場したすべてのバックグラウンドプロセスをまとめる：</p>
+
+<pre class="diagram"><code>  postmaster (メインプロセス)
+  │
+  ├── Backend (B_BACKEND)           クライアントの SQL クエリを処理
+  │   └── WAL Sender (B_WAL_SENDER) レプリケーション接続昇格後に変化
+  │
+  ├── Background Writer (B_BG_WRITER)  定期的にダーティページをフラッシュし Checkpoint の負荷を軽減
+  ├── Checkpointer (B_CHECKPOINTER)    定期的に Checkpoint を実行
+  ├── WAL Writer (B_WAL_WRITER)        定期的に WAL バッファをディスクにフラッシュ
+  ├── Autovacuum Launcher              VACUUM 作業をスケジューリング
+  │   └── Autovacuum Worker            具体的な VACUUM を実行
+  ├── WAL Receiver (B_WAL_RECEIVER)    Standby 上で WAL を受信
+  ├── WAL Summarizer                   WAL サマリ（増分バックアップ用）
+  ├── Startup (B_STARTUP)              クラッシュリカバリ / Standby の継続的リプレイ
+  ├── Archiver (B_ARCHIVER)            古い WAL ファイルをアーカイブ
+  ├── IO Worker (B_IO_WORKER)          非同期 I/O ワーカースレッド
+  └── Syslogger (B_LOGGER)            ログ収集</code></pre>
+
+            <p>PG はマルチプロセスアーキテクチャで、各バックグラウンドプロセスが独立して動作し、共有メモリと Latch で通信する。利点は分離性が良いこと（1 つのプロセスがクラッシュしても他のプロセスを巻き込まない）とデバッグのしやすさ。代償はプロセス間通信がスレッド間通信より重いこと。</p>
+
+            <h3>まとめ</h3>
+
+            <p>覚えておくべき重要な直感：</p>
+
+            <ul>
+                <li><strong>WAL = シーケンシャルログ書き込み + データページの遅延書き込み</strong>：高コストなランダム I/O を安価なシーケンシャル I/O に変換する。トランザクションコミットは WAL フラッシュのみを確認すればよく、データページは非同期で書ける</li>
+                <li><strong>Write ≠ Flush</strong>：Write は OS キャッシュまで、Flush はディスクまで。COMMIT は永続性を保証するために Flush が必要</li>
+                <li><strong>WAL Writer と Backend は共有メモリ + Latch で通信</strong>：複数の Backend が WAL バッファに並行書き込みし、WAL Writer がフラッシュを担当する。書き込み失敗 → PANIC</li>
+                <li><strong>Checkpoint = ダーティページ全フラッシュ + リカバリポイント作成</strong>：クラッシュリカバリは直近の Checkpoint からのリプレイのみで、最初から始める必要はない。Checkpoint 以前の WAL は回収可能</li>
+                <li><strong>WAL はリカバリとレプリケーションの両方に対応</strong>：同じ WAL レコードが、クラッシュリカバリ時には Startup プロセスによりリプレイされ、ストリーミングレプリケーション時には WAL Sender により Standby に送信される</li>
+                <li><strong>物理 vs 論理</strong>：物理レプリケーションは生のバイトストリームを送信（シンプルで効率的）、ロジカルレプリケーションはリソースマネージャを通じて行変更イベントにデコード（柔軟だがより複雑）</li>
+            </ul>
+
+            <p>これで PostgreSQL ストレージエンジン三部作は完了である。Heap Page の 8KB 内部レイアウトから、Buffer Pool のページキャッシュ管理、インデックススキャンと MVCC の可視性判定、WAL の永続性保証と Checkpoint のリカバリ機構まで――これらの多層に入れ子になった抽象が、リレーショナルデータベースの最も核心的な骨格を構成している。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>
