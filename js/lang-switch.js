@@ -13,8 +13,8 @@
     currentLang = match[1];
   }
 
-  var nav = document.querySelector('header nav');
-  if (!nav) return;
+  var header = document.querySelector('header');
+  if (!header) return;
 
   var switcher = document.createElement('div');
   switcher.className = 'lang-switch';
@@ -37,5 +37,5 @@
     }
   });
 
-  nav.appendChild(switcher);
+  header.appendChild(switcher);
 })();

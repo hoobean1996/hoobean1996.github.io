@@ -19,20 +19,12 @@ header nav {
     align-items: center;
     padding: 20px 0;
     border-bottom: 1px solid #eee;
-    flex-wrap: wrap;
-    gap: 10px;
-}
-
-header nav h1 {
-    font-size: 1.3rem;
-    white-space: nowrap;
 }
 
 header nav ul {
     display: flex;
     list-style: none;
-    gap: 15px;
-    flex-wrap: wrap;
+    gap: 20px;
 }
 
 header nav a {
@@ -367,6 +359,8 @@ footer {
 /* Language Switcher */
 .lang-switch {
     font-size: 0.85rem;
+    text-align: right;
+    padding: 8px 0 0;
     white-space: nowrap;
 }
 
@@ -382,16 +376,4 @@ footer {
 .lang-switch .lang-current {
     color: #333;
     font-weight: 600;
-}
-
-@media (max-width: 600px) {
-    header nav {
-        flex-wrap: wrap;
-        gap: 10px;
-    }
-    .lang-switch {
-        order: -1;
-        width: 100%;
-        text-align: right;
-    }
 }
