@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>从确定性到不确定性：用 MDP 给后端系统重新建模 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>从确定性到不确定性：用 MDP 给后端系统重新建模</h2>
+            <time>2026-04-20</time>
+
+            <figure class="post-cover">
+                <img src="../../images/hokusai-great-wave.jpg" alt="The Great Wave off Kanagawa, Katsushika Hokusai, c. 1831">
+                <figcaption>葛饰北斋,《神奈川冲浪里》, c. 1831 — 渔夫驾着小舟在巨浪的阴影下划行，每一桨的结果都不完全由自己决定。海浪的高度、方向、破碎的时机是概率性的，但人仍要在每一个瞬间做出选择：向前、停桨、还是调整方向。这是 MDP 最古老的原型——不确定的世界里，不确定的行动带来不确定的结果，而策略（Policy）是人能把握的唯一东西</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：LLM 时代之前，我们追求的是"写对"——代码是确定的函数，输入 X 输出 Y，review 一遍就能兜住所有分支。但当 Copilot、Cursor、Claude Code 开始大量生产代码，review 的信噪比急剧下降，"确定性"本身变成了一种幻觉。与此同时，后端系统里很多问题——重试、熔断、缓存——被我们用状态机硬编码了多年，却一直没有最优解。本文的观点是：<strong>状态机只是概率状态机的一个退化特例</strong>。认识到这一点，就能用 MDP（Markov Decision Process）统一建模这一类"在不确定世界里做决策"的问题。文章从确定性崩塌讲起，梳理 6 种概率状态模型，然后用最朴素的过河问题把 MDP 讲清楚，最后落到重试、熔断、缓存这三个每个后端工程师都写过的场景。
+            </blockquote>
+
+            <h3>一、确定性的崩塌</h3>
+
+            <p>在 LLM 之前，写代码是一件非常确定的事。你写 <code>if x > 0 return 1 else return 0</code>，它在每一次运行里都按你想的那样执行。测试的本质是枚举输入空间的一个子集，证明代码在这些点上行为正确。Code review 的本质是人类大脑在运行一个小型的符号执行器，逐行验证你写下的每一个分支。</p>
+
+            <p>这套模型的前提是：<strong>代码是人一行一行写出来的，评审者有机会看到每一行</strong>。</p>
+
+            <p>2026 年的工程现场已经不是这样了。一个 PR 动辄几百上千行由 agent 生成的代码，review 者即使逐行看完，也很难在有限时间内建立起同样质量的心智模型。更常见的情况是：你 review 了主干逻辑，但错过了一个边角的 fallback 分支、一个被默默加进来的环境变量、一个没人注意的超时配置。</p>
+
+            <p>这不是 LLM 的锅——这是"软件规模 × 生产速度"早就预示过的趋势，LLM 只是把它加速了 10 倍。结果就是：</p>
+
+<pre class="diagram"><code>  以前的代码：                 现在的代码：
+  ┌──────────────┐            ┌──────────────┐
+  │  确定的函数   │            │  大部分确定   │
+  │  f(x) = y    │            │  少数角落     │
+  │              │            │  你并不真的   │
+  │  完全可预测  │            │  知道会发生啥 │
+  └──────────────┘            └──────────────┘
+        ↑                           ↑
+   代码即事实                  代码是"大概率如此"</code></pre>
+
+            <p>换句话说：<strong>代码本身变成了一个带噪声的分布</strong>。我们从"在确定世界里跑确定的程序"滑向了"在不确定世界里跑不完全确定的程序"。</p>
+
+            <p>这件事并不可怕——真正可怕的是我们用的建模工具还停留在确定性时代。</p>
+
+            <h3>二、状态机只是概率状态机的退化特例</h3>
+
+            <p>翻一翻任何一本后端架构的书，你会看到大量的有限状态机（FSM）：TCP 连接的 <code>SYN_SENT → ESTABLISHED → FIN_WAIT</code>，订单系统的 <code>CREATED → PAID → SHIPPED → COMPLETED</code>，熔断器的 <code>CLOSED → OPEN → HALF_OPEN</code>。</p>
+
+            <p>状态机是个好东西，它把混乱的业务逻辑画成了一张清清楚楚的图。但它有一个巨大的前提假设：<strong>状态之间的转移是确定的</strong>。在状态 S 下执行动作 A，一定会转移到状态 S'。</p>
+
+            <p>真实世界不是这样。真实世界里：</p>
+
+            <ul>
+                <li>下游服务可能超时，可能返回 500，可能返回 200 但数据是错的</li>
+                <li>缓存可能命中，可能 miss，miss 之后可能还能从副本捞到</li>
+                <li>用户可能支付成功，可能银行回调丢了，可能回调延迟 6 小时</li>
+            </ul>
+
+            <p>在状态 S 下执行动作 A，系统会以某个概率 <code>P(S' | S, A)</code> 转移到 S'。这就是<strong>概率状态机</strong>。</p>
+
+<pre class="diagram"><code>  确定性状态机：                          概率状态机：
+
+  ┌────┐   action a    ┌────┐            ┌────┐   action a    ┌────┐
+  │ S1 │ ────────────► │ S2 │            │ S1 │ ────0.8─────► │ S2 │
+  └────┘               └────┘            └────┘               └────┘
+   "在 S1 执行 a                            │
+    一定到 S2"                              └────0.2─────► ┌────┐
+                                                            │ S3 │
+                                                            └────┘
+                                           "在 S1 执行 a
+                                            80% 概率到 S2，20% 到 S3"</code></pre>
+
+            <p>任何一个确定性状态机都是概率状态机的特例——转移概率非 0 即 1。反过来说不成立：你不能用普通 FSM 正确表达"重试 3 次之后大概率能成功"这种事，你只能用阈值 + 硬编码近似它。</p>
+
+            <h3>三、概率状态模型的六种形式</h3>
+
+            <p>"概率状态机"不是一个单一模型，而是一族模型。根据<strong>时间是否离散</strong>、<strong>是否有决策者在施加动作</strong>、<strong>状态是否可观测</strong>这三个维度，可以切出 6 种典型形式：</p>
+
+            <table>
+                <thead>
+                    <tr><th>模型</th><th>时间</th><th>是否含动作</th><th>状态可观测</th><th>典型用途</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>DTMC</strong> Discrete-Time Markov Chain</td><td>离散</td><td>否</td><td>是</td><td>PageRank、排队系统稳态分析</td></tr>
+                    <tr><td><strong>CTMC</strong> Continuous-Time Markov Chain</td><td>连续</td><td>否</td><td>是</td><td>故障率建模、化学反应动力学</td></tr>
+                    <tr><td><strong>HMM</strong> Hidden Markov Model</td><td>离散</td><td>否</td><td>否</td><td>语音识别、基因序列、异常检测</td></tr>
+                    <tr><td><strong>MDP</strong> Markov Decision Process</td><td>离散</td><td>是</td><td>是</td><td>重试/熔断/缓存策略、强化学习</td></tr>
+                    <tr><td><strong>SMDP</strong> Semi-Markov Decision Process</td><td>连续</td><td>是</td><td>是</td><td>资源调度、期权定价</td></tr>
+                    <tr><td><strong>POMDP</strong> Partially Observable MDP</td><td>离散</td><td>是</td><td>否</td><td>机器人导航、故障诊断、对话系统</td></tr>
+                </tbody>
+            </table>
+
+            <p>它们之间的关系可以画成一棵树：</p>
+
+<pre class="diagram"><code>                        概率状态模型
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+          没有动作                         有动作（有决策者）
+          （系统自己演化）                  （你在做决策）
+              │                               │
+       ┌──────┴──────┐                 ┌─────┴─────┐
+       │             │                 │           │
+    全观测         部分观测           全观测      部分观测
+       │             │                 │           │
+   ┌───┴───┐         │            ┌────┴────┐      │
+   │       │         │            │         │      │
+ DTMC    CTMC       HMM          MDP      SMDP  POMDP
+ (离散)  (连续)    (离散)       (离散)   (连续) (离散)</code></pre>
+
+            <p>这 6 种模型的数学工具是一脉相承的——都围绕 Markov 性质（"未来只依赖当前"）展开，区别在于建模粒度。对后端工程师最有用的是 <strong>MDP</strong>：时间是离散的（每次请求/每个时钟滴答做一次决策），我们在做决策（retry 还是不 retry？走主链路还是 fallback？），状态基本可观测（我们有指标、有日志）。</p>
+
+            <p>接下来这篇文章只讲 MDP。</p>
+
+            <h3>四、最朴素的 MDP：过河问题</h3>
+
+            <p>想象你站在河的左岸，想走到右岸。河里有三块可以落脚的石头，每块石头上都有不同程度的青苔——踩上去可能稳稳站住，也可能滑一下：</p>
+
+<pre class="diagram"><code>  左岸                                                    右岸
+   │                                                       │
+   │   ┌──────┐      ┌──────┐      ┌──────┐               │
+   │   │ 石头 │      │ 石头 │      │ 石头 │               │
+   │   │  1   │      │  2   │      │  3   │               │
+   │   └──────┘      └──────┘      └──────┘               │
+   │                                                       │
+   └──────────────────── 河 ───────────────────────────────┘</code></pre>
+
+            <p>用 MDP 的五元组 <code>⟨S, A, P, R, γ⟩</code> 把这个问题形式化：</p>
+
+            <ul>
+                <li><strong>S（状态集合）</strong>：<code>{左岸, 石1, 石2, 石3, 右岸, 落水}</code></li>
+                <li><strong>A（动作集合）</strong>：<code>{跳下一块, 跳两块, 停在原地观察}</code></li>
+                <li><strong>P（转移概率）</strong>：在石 2 上执行"跳下一块"——90% 到石 3，10% 滑倒落水。停在原地观察——100% 留在原地</li>
+                <li><strong>R（奖励函数）</strong>：到达右岸 +100；每踩一块石头 -1（时间成本）；落水 -50</li>
+                <li><strong>γ（折扣因子）</strong>：0.9，越晚拿到的奖励越不值钱</li>
+            </ul>
+
+            <p>所谓"解 MDP"，就是找到一个<strong>策略（Policy）</strong> <code>π: S → A</code>，让未来累计折扣奖励的期望最大：</p>
+
+<pre><code>π* = argmax_π  E[ Σ γ^t · R_t | π ]</code></pre>
+
+            <p>直观来说：在每一个状态下应该选哪个动作？策略告诉你这件事。</p>
+
+            <p>过河问题里一个可能的最优策略大概是：</p>
+
+<pre class="diagram"><code>  状态 = 左岸   →  动作 = 跳一块 （进入石 1）
+  状态 = 石 1   →  动作 = 跳一块 （青苔少，成功率高）
+  状态 = 石 2   →  动作 = 停下观察（青苔多，先等水流稳定）
+  状态 = 石 2'  →  动作 = 跳两块 （直接跳到右岸，跳过最滑的石 3）
+  状态 = 石 3   →  动作 = 跳一块 （到达右岸）
+  状态 = 落水   →  动作 = 游回左岸重来</code></pre>
+
+            <p>这里有几个特别值得注意的点，正是 MDP 区别于状态机的核心：</p>
+
+            <ol>
+                <li><strong>策略是"状态到动作"的映射，而不是"路径"。</strong>它不告诉你该走哪一条具体的路径，而是告诉你在任何可能出现的状态下如何反应——包括你完全没预料到的"落水"状态</li>
+                <li><strong>好的策略会主动"对冲"不确定性。</strong>在石 2 上多观察一会儿，就是用时间成本换取更高的成功概率</li>
+                <li><strong>γ 控制了你多"短视"。</strong>γ → 0 时你只在乎立刻的奖励（贪心策略），γ → 1 时你愿意为遥远的大奖励付出很多眼前代价（长远策略）</li>
+            </ol>
+
+            <p>怎么求解？对于状态空间小的问题，Bellman 方程 + Value Iteration / Policy Iteration 就够了：</p>
+
+<pre><code>V*(s) = max_a [ R(s, a) + γ · Σ_s' P(s'|s,a) · V*(s') ]
+
+意思是：状态 s 的最大价值 = 选出那个让"即时奖励 + 折扣后续价值"最大的动作</code></pre>
+
+            <p>当状态空间巨大（比如整个线上服务的观测空间），就不再人工枚举——你用<strong>强化学习</strong>（Q-Learning、PPO 等）从数据里学出策略。本质上<strong>强化学习就是在解一个转移概率未知的 MDP</strong>。</p>
+
+            <h3>五、重试策略：MDP 视角下的经典问题</h3>
+
+            <p>几乎每个后端工程师都写过重试。最常见的代码长这样：</p>
+
+<pre><code>for attempt in range(MAX_RETRIES):
+    try:
+        return call_downstream()
+    except TimeoutError:
+        time.sleep(BACKOFF_BASE * (2 ** attempt))  # 指数退避
+raise ServiceUnavailable()</code></pre>
+
+            <p>这段代码把"重试"建模成了一个简单的 for 循环 + 固定策略。但仔细想想，每次重试都是在做一个<strong>决策</strong>：在当前失败次数、当前延迟、当前错误类型下，我是该立刻重试、退避重试、切换到 fallback、还是直接放弃？</p>
+
+            <p>用 MDP 重新建模：</p>
+
+<pre class="diagram"><code>  状态 S = (已重试次数 n, 最近一次错误类型 e, 当前累计延迟 l,
+            下游健康信号 h)
+
+  动作 A = { retry_now, retry_with_backoff_k, fallback_to_cache,
+             fallback_to_secondary, give_up }
+
+  转移 P = 取决于下游真实状态，通常通过观测学习得到
+          例如：在 (n=2, e=Timeout, l=200ms, h=降级) 下执行 retry_now
+                成功概率 ≈ 0.3（下游还没恢复，继续失败概率高）
+
+  奖励 R = {
+    success:       +100 - α·l              (减去累计延迟成本)
+    final_failure: -500                    (用户真的拿不到结果)
+    每次 retry:    -β                      (重试本身的资源成本)
+    fallback:      +50                     (给了降级结果)
+  }</code></pre>
+
+            <p>一旦写成 MDP，几个传统重试做不到的事情就自然浮现出来：</p>
+
+            <table>
+                <thead>
+                    <tr><th>传统指数退避</th><th>MDP 最优策略</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>在所有错误类型上用同一个策略</td><td>根据错误类型动态决策：5xx 可能值得重试，4xx 几乎一定不值得</td></tr>
+                    <tr><td>重试次数是超参，靠拍脑袋</td><td>重试次数由状态价值函数决定，累计延迟超过某阈值就 fallback</td></tr>
+                    <tr><td>下游刚恢复时重试和持续抖动时重试完全一样</td><td>引入 h（下游健康信号）做条件决策，利用跨请求的共享信息</td></tr>
+                    <tr><td>重试策略和 fallback 策略是两套独立逻辑</td><td>重试、fallback、放弃在同一个动作空间里统一权衡</td></tr>
+                </tbody>
+            </table>
+
+            <p>更进一步：<strong>自适应重试</strong>（Adaptive Retry）本质上就是在线学习 MDP 的策略。AWS SDK 里的 <code>AdaptiveRetryMode</code>、Envoy 里的 <code>Retry Budget</code>，它们的内核都是在用实时观测修正"当前状态下重试的期望收益"，只是没人称它们为 MDP 而已。</p>
+
+            <h3>六、熔断器：状态机 vs MDP 的经典对比</h3>
+
+            <p>Circuit Breaker 是后端最著名的有限状态机之一，标准三态模型：</p>
+
+<pre class="diagram"><code>                 失败率 > 阈值
+  ┌─────────┐ ──────────────────► ┌─────────┐
+  │ CLOSED  │                      │  OPEN   │
+  │ (正常)   │ ◄───── 探活成功 ──── │ (拒绝)  │
+  └─────────┘                      └─────────┘
+       ▲                                │
+       │                                │ 冷却时间 T
+       │    探活失败                    ▼
+       │ ┌─────────────────────── ┌─────────┐
+       └─┤                         │HALF_OPEN│
+         │                         │ (试探)   │
+         └────── 探活成功 ──────── └─────────┘</code></pre>
+
+            <p>这个模型被 Netflix Hystrix、Resilience4j、Sentinel 抄了无数遍。它能工作，但它在几个地方漏了假设：</p>
+
+            <ul>
+                <li><strong>"失败率 &gt; 阈值"中的阈值是拍出来的</strong>——50%？70%？用同一个阈值对待所有场景显然不对</li>
+                <li><strong>"冷却时间 T"也是拍出来的</strong>——不同故障恢复时间完全不同</li>
+                <li><strong>HALF_OPEN 放多少个探活请求是拍出来的</strong>——放 1 个太保守，放 10 个可能把刚缓过劲的下游又打挂了</li>
+            </ul>
+
+            <p>每个参数都是一个待调的超参，而且它们彼此纠缠：阈值设得低 → 更早熔断 → 冷却期间用户流量全打到 fallback → fallback 被打挂 → 冷却时间就得更长……</p>
+
+            <p>用 MDP 重新看这件事：</p>
+
+<pre class="diagram"><code>  状态 S = (近期成功率 p, 近期平均延迟 τ, 下游 QPS q,
+            上游 fallback 容量 c, 距上次熔断时间 t)
+
+  动作 A = {
+    allow_all,                // 全放行
+    rate_limit(ρ),            // 放行比例 ρ
+    shed(%),                  // 按优先级丢弃一部分
+    probe_n_requests,         // HALF_OPEN 放 n 个探活
+    block_all,                // 完全熔断
+  }
+
+  奖励 R = -latency_cost - error_cost - fallback_overload_penalty
+          + success_throughput</code></pre>
+
+            <p>区别在于：</p>
+
+            <ol>
+                <li>动作不再是粗粒度的"开/关/半开"，而是一个<strong>连续谱</strong>（放行比例 ρ）。这让熔断器可以做"软熔断"——下游有点喘不过气时先限 30% 流量，而不是二极管式地直接切断</li>
+                <li>奖励里显式把"fallback 被打挂"作为惩罚项，解决了前面说的"熔断过猛反而打垮上游"的连锁问题</li>
+                <li>策略可以从历史数据里学出来。你不用再拍阈值——你观测历史，让 Q-Learning 告诉你在 <code>(p=85%, τ=800ms, q=10k)</code> 下最优动作是什么</li>
+            </ol>
+
+            <p>这就是 Google Maglev 团队、Meta 自适应限流系统背后的基本思想。它们在外面看起来仍然像个"熔断器"，但底下是一个持续学习的 MDP 策略，而不是一套硬编码阈值。</p>
+
+            <h3>七、缓存策略：LRU/LFU 只是简陋的策略</h3>
+
+            <p>缓存替换算法是另一个被状态机思维统治的领域。LRU、LFU、ARC、2Q——每一个都是一套固定规则。但本质上，"缓存"就是一个 MDP：</p>
+
+<pre class="diagram"><code>  状态 S = (当前缓存里有哪些 key，每个 key 的元信息：
+            上次访问时间、访问频率、大小、回源成本 τ_k)
+
+  动作 A = 当一次请求到达、cache miss 需要写入时：
+          { 淘汰 key_1, 淘汰 key_2, ..., 不缓存本次结果 }
+
+  转移 P = 下一个请求会命中哪个 key ——由访问模式的分布决定
+          这就是 MDP 里"转移概率"在缓存场景的化身
+
+  奖励 R = {
+    命中:      +τ_k      (省下了一次昂贵的回源)
+    miss:      -τ_k      (付出了一次回源成本)
+    存储占用:  -α·size_k (内存/存储是有成本的)
+  }</code></pre>
+
+            <p>LRU 在这个视角下就是一个<strong>非常简单的启发式策略</strong>：无论回源成本 τ、无论访问频率、无论对象大小，一律按"最久未访问"淘汰。它的假设是未来访问模式和最近访问模式高度相关——这个假设在随机访问的场景下会被打脸。</p>
+
+            <table>
+                <thead>
+                    <tr><th>策略</th><th>本质</th><th>隐含假设</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>LRU</td><td>按最近访问时间淘汰</td><td>时间局部性强，所有 key 的回源成本相同</td></tr>
+                    <tr><td>LFU</td><td>按历史访问频率淘汰</td><td>访问频率稳定、不会漂移</td></tr>
+                    <tr><td>W-TinyLFU (Caffeine)</td><td>频率 + 新鲜度加权</td><td>前两者的线性组合近似</td></tr>
+                    <tr><td>MDP 最优策略</td><td>基于期望未来命中收益淘汰</td><td>依赖对未来访问分布的估计——实际中用学习</td></tr>
+                </tbody>
+            </table>
+
+            <p>这几年工业界开始出现"learned cache"相关工作（Meta 的 Cachelib 里的 ML replacement、Google CacheSack），核心套路都是：<strong>把缓存建模成 MDP，用观测数据学出一个比 LRU 更接近最优的替换策略</strong>。在命中率绝对值上通常能比 LRU 多拿 3–15%，在大规模系统里就是真金白银。</p>
+
+            <h3>八、什么时候不要用 MDP</h3>
+
+            <p>把每个后端问题都硬往 MDP 上套，是一种过度工程。MDP 适合的前提是：</p>
+
+            <ul>
+                <li><strong>决策是反复发生的</strong>：一次性决策用简单规则就够，不需要 MDP</li>
+                <li><strong>存在不确定性，且概率不是 0/1</strong>：如果系统几乎确定性，FSM 就够了</li>
+                <li><strong>有可度量的奖励</strong>：你得能对不同结果打分，否则无法优化</li>
+                <li><strong>状态基本可观测</strong>：如果大量关键状态看不见，你需要 POMDP（更复杂）而不是 MDP</li>
+            </ul>
+
+            <p>反例：</p>
+
+            <ul>
+                <li>订单状态流转（<code>CREATED → PAID → SHIPPED</code>）——业务规则驱动，不是决策问题，老老实实画 FSM</li>
+                <li>权限校验——确定性逻辑，MDP 只会让代码更复杂</li>
+                <li>幂等性保证——这是正确性问题，不是期望收益最大化问题</li>
+            </ul>
+
+            <h3>九、总结</h3>
+
+            <p>这篇文章其实讲了三件事：</p>
+
+            <ol>
+                <li><strong>LLM 时代，写出来的代码越来越像一个分布，而不是一个函数。</strong>确定性思维（FSM、硬编码分支、拍脑袋阈值）会让系统在真实噪声下暴露得比过去更多</li>
+                <li><strong>状态机只是概率状态机的退化情况。</strong>DTMC、CTMC、MDP、SMDP、HMM、POMDP 构成了一族模型，覆盖了"时间 × 动作 × 观测"的六种组合。MDP 是后端工程师最容易用上的那一种</li>
+                <li><strong>你每天写的重试、熔断、缓存，本质上都是 MDP。</strong>只是你在用硬编码阈值近似最优策略。真正把它们建模成 MDP 之后，自适应重试、软熔断、learned cache 就不再是玄学，而是同一个数学框架下的自然产物</li>
+            </ol>
+
+            <p>下一次你打算加一个 <code>if retry_count > 3 then give_up</code>、一个 <code>if error_rate > 0.5 then circuit_open</code>、一个 <code>if size > 1MB then don't cache</code> 的时候，停一秒问自己：这个阈值是哪里来的？它是对哪个"期望奖励"的近似？在观测数据下它是否仍然最优？</p>
+
+            <p>这个问题的答案，就是从确定性走向不确定性的第一步。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>
