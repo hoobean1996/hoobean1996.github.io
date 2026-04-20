@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用 MDP 思维设计 AI Agent：ReAct 与必须回答的四个问题 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>用 MDP 思维设计 AI Agent：ReAct 与必须回答的四个问题</h2>
+            <time>2026-04-20</time>
+
+            <figure class="post-cover">
+                <img src="../../images/baumgartner-cabinet.jpg" alt="Cabinet, Johann Georg Hainz / Baumgartner workshop, late 17th century">
+                <figcaption>17 世纪末的一座"奇物柜"（Wunderkammer）—— 一百个小抽屉，每个抽屉里躺着一件功能截然不同的器物：镊子、放大镜、天平、星盘、骨针。使用者面对一项任务时的第一个动作不是"干活"，而是"打开哪一个抽屉"。AI Agent 的工具调用在形式上几乎一模一样：一个离散动作空间、一个任务目标、一套关于"每件工具大概能做成什么事"的概率认知。区别只在于，今天做决策的是 LLM，而不是 17 世纪的那位学者</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：<a href="mdp-backend-modeling.html">上一篇</a>讲了"状态机只是概率状态机的退化特例"，并用 MDP 重新建模了重试、熔断、缓存。这篇把同一个视角推到 2026 年最热的事情上：AI Agent。核心论点是——<strong>ReAct 不是一种"提示词技巧"，它是一个跑在 MDP 上的最简策略</strong>。理解这个映射之后，设计 Agent 就有了一份非常朴素的核查清单：在动手写任何 prompt 和 tool 之前，先把四个问题答清楚——状态是什么？动作空间是什么？转移概率怎么处理？奖励函数怎么定义？这四个问题答不清楚，Agent 上线后遇到的所有问题——无限循环、调错工具、上下文爆炸、无法收敛——都不是"再调一调 prompt"能解决的。
+            </blockquote>
+
+            <h3>一、ReAct 的 30 秒速览</h3>
+
+            <p>先把 ReAct（Reason + Act）简化到最小：</p>
+
+<pre><code>while not done:
+    thought     = LLM("你现在知道什么？下一步应该做什么？", context)
+    action      = LLM("基于上面的思考，调用哪个工具？参数是什么？", context)
+    observation = execute(action)          # tool call / API / user
+    context.append(thought, action, observation)
+return LLM("总结给用户", context)</code></pre>
+
+            <p>就三步一循环：想 → 做 → 看结果 → 再想。所有当代 agent 框架（LangGraph、AutoGen、Claude Code、Cursor Agent）在核心循环上都是 ReAct 的一种变体，区别只在于细节：上下文怎么管理、工具怎么组织、循环怎么终止。</p>
+
+            <p>这个循环简单到让人误以为 ReAct 是一种 "prompt engineering pattern"。但如果你把它画出来：</p>
+
+<pre class="diagram"><code>
+   ┌──────────────────── 用户目标 g ───────────────────┐
+   │                                                    │
+   ▼                                                    │
+  ┌─────────┐    think    ┌─────────┐    act    ┌────────────┐
+  │  状态 s │ ──────────► │ 思考 τ  │ ───────►  │ 动作 a     │
+  │ (上下文) │              │         │           │ (tool call)│
+  └─────────┘              └─────────┘           └─────┬──────┘
+       ▲                                                │
+       │                                                │ execute
+       │        observation o (tool 结果)              │
+       └────────────────────────────────────────────────┘
+                      把 o 加入上下文，循环</code></pre>
+
+            <p>这张图骨架就是一个 MDP 的执行轨迹。思考 τ 只是动作 a 的"提案生成器"，真正改变世界的是 a 和它带来的 observation。</p>
+
+            <h3>二、ReAct 是 MDP 上的一种策略</h3>
+
+            <p>把 ReAct 形式化为 MDP <code>⟨S, A, P, R, γ⟩</code>：</p>
+
+            <table>
+                <thead>
+                    <tr><th>MDP 元素</th><th>ReAct Agent 中的对应物</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>状态 S</strong></td><td>到目前为止的完整上下文：用户目标、思考历史、动作历史、观测历史、外部记忆引用</td></tr>
+                    <tr><td><strong>动作 A</strong></td><td>所有可调用工具 × 所有合法参数 + 特殊动作 <code>finalize</code> / <code>ask_user</code> / <code>give_up</code></td></tr>
+                    <tr><td><strong>转移概率 P</strong></td><td>LLM 采样 + 工具执行的联合分布——执行 a 之后，observation 服从 <code>P(o | s, a)</code></td></tr>
+                    <tr><td><strong>奖励 R</strong></td><td>任务完成度 − 成本（token、tool 调用数、延迟）± 过程奖励（单步工具是否成功）</td></tr>
+                    <tr><td><strong>策略 π</strong></td><td>就是 LLM 本身：<code>π(a | s) = LLM(a | prompt(s))</code></td></tr>
+                </tbody>
+            </table>
+
+            <p>这里最关键的一句话是：<strong>ReAct 是一种"贪心一步前瞻"的策略</strong>。它在每一步只看当前状态 s，让 LLM 挑一个看起来最好的动作 a，不做任何向前搜索。这对应于 MDP 里的 <code>π(s) = argmax_a Q(s, a)</code>，而且 Q 函数还是 LLM 隐式估计的，既不保证准确也不保证稳定。</p>
+
+            <p>后面我们会看到，Tree of Thoughts、Reflexion、MCTS-based planning 等"更强"的 agent 技术，本质上就是在 ReAct 之上引入<strong>多步前瞻</strong>或<strong>价值函数学习</strong>——它们在 MDP 语言里都不是新东西。</p>
+
+            <p>现在进入正题：用 MDP 视角设计 Agent，必须回答的四个问题。</p>
+
+            <h3>三、问题 1 — 状态是什么？</h3>
+
+            <p>Agent 项目最常在这里翻车。很多团队的默认答案是："状态就是所有历史消息拼起来"。这在 demo 里可以工作，但在真实任务下会立刻暴露问题：</p>
+
+            <ul>
+                <li>Context 长度很快突破上下文窗口</li>
+                <li>噪音信息（重复的 tool 结果、冗长的 HTML）把关键信息淹没</li>
+                <li>LLM 对"靠前的信息"和"靠后的信息"注意力不均匀（U 型曲线）</li>
+                <li>每一次调用都在重算同样的前缀，token 成本线性增长</li>
+            </ul>
+
+            <p>正确的做法是把状态设计成一个<strong>显式的数据结构</strong>，而不是"消息数组"。工程上常见的几种状态形态：</p>
+
+            <table>
+                <thead>
+                    <tr><th>形态</th><th>内容</th><th>适合场景</th><th>风险</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>原始 transcript</strong></td><td>所有 think/action/observation 按时间拼接</td><td>短任务、demo</td><td>上下文爆炸、信号稀释</td></tr>
+                    <tr><td><strong>滑窗 + 摘要</strong></td><td>最近 N 轮原文 + 历史摘要</td><td>中等长度对话</td><td>摘要丢关键信息</td></tr>
+                    <tr><td><strong>结构化 workspace</strong></td><td>task、subgoals、scratchpad、findings 各占一个字段</td><td>长任务、code agent</td><td>设计 schema 本身有成本</td></tr>
+                    <tr><td><strong>外置记忆 + 检索</strong></td><td>把历史写进向量库/KV 存储，每步只检索相关片段</td><td>超长对话、知识任务</td><td>检索失败 = 决策失败</td></tr>
+                </tbody>
+            </table>
+
+            <p>一个被反复验证的经验法则："<strong>状态应当恰好包含做下一步决策所需的所有信息，且不包含更多</strong>"。这其实就是 MDP 的 Markov 性质——在 s 给定之后，未来不再依赖更早的历史。如果你发现 LLM 在上下文里翻找 10 轮之前的信息，说明你的"状态"没有把那条信息沉淀到正确的位置。</p>
+
+            <p>另一个常被忽略的事实：<strong>ReAct 场景严格来说是 POMDP 而不是 MDP</strong>。因为 Agent 并不能直接观测到"真实世界"，只能通过 tool 的 observation 间接窥探。比如你问 agent "PR 合并了吗？"——它看不到 GitHub 的真实状态，只能看到 <code>gh pr view</code> 的返回。工程实践中，我们把上下文当成"信念状态"（belief state），当成 MDP 来处理——这是一种可接受的近似。</p>
+
+            <h3>四、问题 2 — 动作空间是什么？</h3>
+
+            <p>动作空间就是 agent 可以做的所有事：工具调用 + 特殊动作 + 参数组合。这是 agent 设计里<strong>最容易失控</strong>的一个维度。</p>
+
+            <p>典型的失控模式有三种：</p>
+
+            <ol>
+                <li><strong>工具爆炸</strong>：为了"保险"塞进 50 个工具。LLM 在 prompt 里读完所有工具描述就已经消耗了几千 token，且容易在相似工具间混淆（<code>search_file</code> vs <code>find_file</code> vs <code>grep</code>？）</li>
+                <li><strong>参数泛滥</strong>：一个工具有 15 个可选参数。LLM 需要记住每个参数的语义，填错参数的概率随数量指数上升</li>
+                <li><strong>没有终止动作</strong>：agent 不知道"我现在该收尾了"，于是一直 loop 下去，直到被超时或 token limit 强杀</li>
+            </ol>
+
+            <p>MDP 视角下的设计原则非常朴素：</p>
+
+<pre class="diagram"><code>  好的动作空间                          坏的动作空间
+  ─────────────────                     ─────────────────
+  · 正交（工具之间语义无重叠）          · 相似工具一大堆
+  · 粒度一致（都是同一抽象层）          · 有的超细（read_line）
+  · 参数少且必填                        · 有的超粗（do_everything）
+  · 显式的 finish 动作                  · 无终止信号
+  · 显式的 ask_user 动作                · 只能瞎猜或硬答
+  · 每个工具都有幂等/回滚策略           · 副作用不清晰</code></pre>
+
+            <p>几条实操建议：</p>
+
+            <ul>
+                <li><strong>把工具当动作空间来审视</strong>：如果你的 agent 有 30 个工具，请问哪两个工具合起来能被第三个工具替代？能合并就合并</li>
+                <li><strong>显式加入 <code>finalize(answer)</code> 和 <code>ask_user(question)</code> 动作</strong>。这让"终止"和"澄清"变成可学/可提示的策略选择，而不是偶然出现的行为</li>
+                <li><strong>把"计划"也当动作</strong>：Claude Code 的 <code>ExitPlanMode</code>、LangGraph 的 planner node 本质上都是把"规划"显式化为一个动作，而不是隐式地混在 reasoning 里</li>
+                <li><strong>区分只读动作和写动作</strong>：只读动作可以放开，写动作（发 Slack、修数据库、推 git）单独审视其期望收益 vs 风险</li>
+            </ul>
+
+            <h3>五、问题 3 — 转移概率是什么？（错误处理）</h3>
+
+            <p>这个问题的潜台词是：<strong>你执行 a 之后，世界真的会按你预期变化吗？</strong></p>
+
+            <p>在确定性世界里，<code>action a → observation o</code> 是函数关系。在真实世界里，它是一个分布：</p>
+
+<pre class="diagram"><code>  调用一个 "search_github_issues" 动作：
+
+                   ┌── (75%) 返回相关 issue 列表     ← happy path
+                   │
+                   ├── (10%) rate limit → 429        ← 需要重试
+  execute(a)  ────►│
+                   ├── (8%)  返回空结果              ← 查询不对？需要改 query
+                   │
+                   ├── (5%)  网络超时                ← 可能重试成功
+                   │
+                   └── (2%)  返回看似正确但过时的结果 ← 最危险！</code></pre>
+
+            <p>第四类（返回看似正确但错误的结果）是最恶劣的——agent 没法通过状态判断自己被骗了，会基于错误信息继续推理。这也是 LLM agent 比传统程序更难调试的根本原因。</p>
+
+            <p>从 MDP 视角，这里你要做三件事：</p>
+
+            <h4>1. 显式建模每个工具的失败分布</h4>
+
+            <p>每个工具不只是返回"成功 or 失败"，而是一个多峰分布。设计工具签名时，把各种"失败类型"显式表达在返回值里，而不是吞到 exception 或者笼统的错误字符串里。让 LLM 能看懂"这次是 rate limit，我该等会再试"vs"这次是参数错误，我该改 query"。</p>
+
+            <h4>2. 在 agent 循环里实现四种错误恢复动作</h4>
+
+            <table>
+                <thead>
+                    <tr><th>恢复动作</th><th>适用情况</th><th>MDP 解释</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>retry</code></td><td>临时性错误（429、网络超时）</td><td>同一 a，期望下一次 <code>P(o|s,a)</code> 采样到 happy path</td></tr>
+                    <tr><td><code>fallback</code></td><td>工具不可用，但有备选</td><td>换一个动作 a'，期望 <code>E[R | s, a']</code> 虽低但可行</td></tr>
+                    <tr><td><code>ask_user</code></td><td>agent 不确定下一步</td><td>用 user 的观测填充 belief state</td></tr>
+                    <tr><td><code>abort</code></td><td>累计成本已超过任务收益</td><td>提前终止，避免 <code>Σγ^t·R_t</code> 继续变负</td></tr>
+                </tbody>
+            </table>
+
+            <h4>3. 检测并打破循环</h4>
+
+            <p>ReAct 最常见的故障模式是<strong>动作循环</strong>：agent 反复调用同一组工具、拿到同样的结果、再做同样的决策。在 MDP 语言里这是策略 π 陷入了一个低价值的自环——每步奖励接近 0，但又没有任何状态上的突破。实操中的解法：</p>
+
+            <ul>
+                <li>检测"最近 N 步动作序列重复" → 强制注入一段新的 instruction："你刚才在重复动作 X，请换个思路"</li>
+                <li>对"相同 action + 相同 tool args"计数，超过阈值自动降级为 <code>ask_user</code></li>
+                <li>整体轮次上限：超过 K 步没有进展就 abort，避免 agent 烧掉整个 token 预算</li>
+            </ul>
+
+            <p>另一个容易被忽略的问题：<strong>动作的幂等性</strong>。如果 agent 可能重试，它调用的工具必须是幂等的（或者你得在外层做去重）。一个典型 bug：agent 调了 <code>send_email</code>，工具超时重试，结果用户收到了两封同样的邮件。这不是模型的锅，这是你在设计动作空间时没把 Markov 转移和副作用分清楚。</p>
+
+            <h3>六、问题 4 — 奖励函数怎么设计？</h3>
+
+            <p>这是四个问题里<strong>最少被明确回答</strong>的一个。大部分 agent 项目不写奖励函数——他们写的是"prompt 要求 LLM 做对"，然后希望 LLM 自己知道什么叫"做对"。</p>
+
+            <p>但奖励函数无处不在，只是你没把它形式化：</p>
+
+            <ul>
+                <li>你为什么给 agent 加一个"token 预算警告"？因为 token 成本 = 负奖励</li>
+                <li>你为什么让 agent 收到 user 的"不对，再试一次"？那是 −100 的即时反馈</li>
+                <li>你为什么看 eval 上的 pass rate？那是终末奖励</li>
+            </ul>
+
+            <p>把它显式写出来就变成：</p>
+
+<pre class="diagram"><code>
+  R(trajectory) =
+        α_correct  · TaskCorrectness(final_output, ground_truth)   ← 终末：对不对
+      + α_helpful  · UserThumbsUp                                   ← 终末：用户满意吗
+      − α_tokens   · TokensUsed                                     ← 过程：贵不贵
+      − α_calls    · ToolCallsCount                                 ← 过程：折腾不折腾
+      − α_latency  · WallClockTime                                  ← 过程：快不快
+      − α_danger   · IrreversibleSideEffects                        ← 过程：搞坏东西没
+      + α_progress · PartialProgressSignal                          ← shaping：中间进度</code></pre>
+
+            <p>这不是要让你把所有 agent 都跑 RL——而是要你<strong>把评价函数写清楚</strong>。一旦写清楚：</p>
+
+            <ol>
+                <li>你立刻能量化不同 prompt / 不同工具组合的效果差异</li>
+                <li>你能做真正的 A/B 评估，而不是靠"感觉模型变聪明了"</li>
+                <li>如果将来要做 RLAIF / DPO / Reflexion，这就是现成的 reward signal</li>
+                <li>LLM-as-judge 也需要一个明确的打分维度，奖励函数就是它的 rubric</li>
+            </ol>
+
+            <p>奖励设计的两个经典陷阱：</p>
+
+            <h4>陷阱 1：奖励太稀疏</h4>
+
+            <p>只有任务做对（+100）和做错（−100）两种反馈，中间全是零。Agent 面对长链条任务完全不知道自己做得好不好。对策：加入<strong>过程奖励</strong>（process reward），比如"每次成功调用工具 +1"、"每推进一个 subgoal +5"。但过程奖励本身也可能被利用——就到了陷阱 2。</p>
+
+            <h4>陷阱 2：Reward Hacking</h4>
+
+            <p>Agent 学到"只要多调几次工具就能拿过程奖励"，于是疯狂调用但不真正解决问题。这和 RL 里 CoastRunners 论文里的经典例子（船不跑完赛道，就原地转圈刷分）是同一回事。对策：</p>
+
+            <ul>
+                <li>过程奖励必须和主奖励<strong>对齐</strong>——不能让 agent 通过牺牲主奖励来拿过程奖励</li>
+                <li>加入负向过程奖励（每多一次 tool call 减分），形成成本约束</li>
+                <li>定期用 held-out eval set 检查奖励函数本身是否还在衡量你真正关心的东西</li>
+            </ul>
+
+            <h3>七、ReAct 只是最简单的策略——MDP 视角下的进阶技术</h3>
+
+            <p>一旦把 Agent 写成 MDP，许多"看起来是新东西"的 agent 技术就都能归位：</p>
+
+            <table>
+                <thead>
+                    <tr><th>技术</th><th>MDP 视角下它在做什么</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><strong>ReAct</strong></td><td>贪心一步前瞻策略：<code>argmax_a Q(s,a)</code>，Q 由 LLM 估计</td></tr>
+                    <tr><td><strong>Tree of Thoughts</strong></td><td>多步前瞻搜索：展开若干候选轨迹，取 V 最大的那条</td></tr>
+                    <tr><td><strong>MCTS + LLM</strong></td><td>在大动作空间上用 UCB 采样，用 LLM 当 rollout policy 和 value network</td></tr>
+                    <tr><td><strong>Reflexion</strong></td><td>执行完一整条轨迹后用 LLM 自我评价 → 生成"经验"注入下次 prompt。本质是在线 reward shaping + memory-based 策略改进</td></tr>
+                    <tr><td><strong>RLHF / RLAIF</strong></td><td>从偏好数据里学一个显式的 reward model，然后用 PPO 优化策略 π</td></tr>
+                    <tr><td><strong>DPO</strong></td><td>跳过 reward model 直接用偏好数据端到端更新策略</td></tr>
+                    <tr><td><strong>Multi-Agent</strong></td><td>Multi-agent MDP / Markov Game：每个 agent 的最优动作取决于其他 agent 的策略</td></tr>
+                    <tr><td><strong>Agent with memory</strong></td><td>把 POMDP 的 belief state 显式化存储，跨会话维持</td></tr>
+                </tbody>
+            </table>
+
+            <p>换句话说：agent 领域目前的绝大多数"创新"，都能映射到强化学习过去三十年发展出来的一组经典工具。不是说这些技术不值得做——而是你能用一个统一的语言去比较它们，判断什么时候需要什么，而不是被每一篇 arxiv 新标题牵着走。</p>
+
+            <h3>八、四个问题的核查清单</h3>
+
+            <p>在动手写 agent 代码之前，请按这份清单逐项作答。答不出来就先别动 prompt。</p>
+
+<pre class="diagram"><code>  ┌─────────────────────────────────────────────────────────────┐
+  │ Q1. 状态是什么？                                              │
+  │  □ 状态用什么数据结构表示（transcript? workspace? memory?）  │
+  │  □ 每步决策需要的信息是否都在状态里？                         │
+  │  □ 是否有无关信息污染状态？                                   │
+  │  □ 长任务下状态如何压缩？谁负责压缩？                         │
+  │                                                               │
+  │ Q2. 动作空间是什么？                                          │
+  │  □ 列出所有工具，有没有语义重叠？                             │
+  │  □ 每个工具的参数是否最小化？                                 │
+  │  □ 有没有显式的 finalize / ask_user / give_up？               │
+  │  □ 有没有工具带副作用？是否幂等？                             │
+  │                                                               │
+  │ Q3. 转移概率 = 错误处理怎么做？                               │
+  │  □ 每个工具的失败模式有哪些？各自概率大致多少？               │
+  │  □ 针对临时错误、永久错误、错误但看似正确，各有什么策略？     │
+  │  □ 有没有循环检测？超过多少步 abort？                         │
+  │  □ 写动作是否可重入？                                         │
+  │                                                               │
+  │ Q4. 奖励函数是什么？                                          │
+  │  □ 终末奖励怎么定义？怎么量化？                               │
+  │  □ 有没有过程奖励？和终末奖励是否对齐？                       │
+  │  □ 成本项是否显式（token / tool call / latency）？            │
+  │  □ 是否有 eval set 能持续衡量奖励函数本身？                   │
+  └─────────────────────────────────────────────────────────────┘</code></pre>
+
+            <h3>九、总结</h3>
+
+            <p>从<a href="mdp-backend-modeling.html">上一篇</a>到这一篇，我们把同一个观点推到了两个尺度：</p>
+
+            <ul>
+                <li>小尺度上：重试、熔断、缓存——后端基础设施里的"决策点"都是 MDP</li>
+                <li>大尺度上：整个 AI Agent 的运行循环——也是 MDP</li>
+            </ul>
+
+            <p>ReAct 的优雅在于它把"在概率世界里做决策"这件事压缩成了三行伪代码：想一下 / 做一步 / 看结果。它的简陋也在这里——它是一个短视的、贪心的、Q 函数极其不稳定的策略。</p>
+
+            <p>要让 Agent 变得可靠、可控、可优化，你真正要做的不是堆更多 prompt 技巧，而是把那四个问题答清楚：<strong>状态、动作、转移、奖励</strong>。答清楚之后你会发现，prompt 是其中最不重要的一部分——它只是策略网络的一种表达方式，而策略网络只是 MDP 的其中一个组件。</p>
+
+            <p>在 LLM 让软件从"函数"变成"分布"的这一刻，MDP 是少数几个仍然成立的思考框架之一。它不是在提供新的答案，而是在提供一套<strong>把问题问对</strong>的语言。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>
