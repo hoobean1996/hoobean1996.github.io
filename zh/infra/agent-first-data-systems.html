@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>当 AI Agent 成为数据库的主要用户：从 Query 到 Probe 的 Agent-First 蓝图 - 雾海上的旅人</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>雾海上的旅人</h1>
+            <ul>
+                <li><a href="../index.html">Home</a></li>
+                <li><a href="../career.html">Career</a></li>
+                <li><a href="../performance/">Performance</a></li>
+                <li><a href="./">Infra</a></li>
+                <li><a href="../product/">Product</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <main>
+        <article class="post-content">
+            <h2>当 AI Agent 成为数据库的主要用户：从 Query 到 Probe 的 Agent-First 蓝图</h2>
+            <time>2026-06-01</time>
+
+            <figure class="post-cover">
+                <img src="../../images/piranesi-carceri.jpg" alt="Carceri d'invenzione (Imaginary Prisons), Giovanni Battista Piranesi, 1761">
+                <figcaption>Piranesi 1761 年蚀刻的《奇想监狱》系列里，巨大的拱顶、互不相连的楼梯、悬在半空的桥、看不到出口的回廊——所有元素都在物理上不可能、但在画面里同时存在。当 Berkeley 那群人讲"一支由 LLM agent 组成的军队向数据库发起几千个 speculative probe、分叉、回滚、再分叉"时，我脑子里浮起来的就是这张画。Agent 时代的数据库不再是一条单线程的执行轨迹，而是一座同时容纳成千上万个平行世界的建筑——传统数据库的隔离、索引、事务模型，都是为单线程世界设计的。</figcaption>
+            </figure>
+
+            <blockquote class="value-prop">
+            <strong>这篇文章的价值</strong>：拆解 UC Berkeley 团队 2025 年 9 月放出的一篇 vision paper —— <em>Supporting Our AI Overlords: Redesigning Data Systems to be Agent-First</em>（arXiv:2509.00997，作者包括 Ion Stoica、Matei Zaharia、Joe Gonzalez、Aditya Parameswaran 等）。这篇 paper 的核心论点是：<strong>当 LLM agent 成为数据库的主要 workload 时，几乎所有的数据库假设都要重新检查</strong>——查询接口、查询优化器、索引、存储布局、事务模型，没有一层能保持不变。文章给这种新 workload 起了个名字叫 <em>agentic speculation</em>，并指出它具有四个可被利用的性质：scale、heterogeneity、redundancy、steerability。这四个词构成了整个新架构的"势能"。我会按 paper 的脉络走一遍，但每一节都尝试把它和现实里你可能正在用的东西（你的 PG / ClickHouse / Snowflake、你正在写的 agent 框架）连起来，让 vision 不只是 vision。读完之后，你应该能回答这件事：<strong>如果你的下一个数据库用户是 agent 而不是人，你需要重新设计什么、可以复用什么</strong>。</blockquote>
+
+            <h3>一、问题：当 Agent 成为主要工作负载，数据库被打在了哪里</h3>
+
+            <p>过去 30 年的数据库设计假设了两件事：</p>
+
+            <ol>
+                <li><strong>查询是人发出的</strong>——所以 throughput 受限于人脑的延迟，每条 query 都"用心写过"，每条 query 都"值得跑完"。</li>
+                <li><strong>查询彼此独立</strong>——所以隔离级别、并发控制、索引选择都是按"独立请求"为单位优化的。</li>
+            </ol>
+
+            <p>这两个假设在 agent 时代同时失效。一个 LLM agent 可以以每秒数百上千次的速度发出请求，速度还会跟着 agent 数量线性扩展。但其中绝大多数请求<strong>不是"想得到答案"</strong>，而是"想搞清楚这个数据库里到底有什么、应该怎么查"。Paper 给这种"高吞吐、探索式、最终只服务一个用户任务的请求洪流"起了个名字：</p>
+
+            <blockquote>
+            <strong>Agentic speculation</strong>：高吞吐量、探索性的查询过程，agent 通过它来发现数据 / 元数据，提出部分解，再验证、迭代，最终收敛到一个完整解。
+            </blockquote>
+
+            <p>Paper 里有一个很形象的例子：让一支 agent 大军去找出"为什么 Berkeley 今年的咖啡豆销售利润比去年低"。一个人类分析师可能会写 5–10 条 SQL；一支 agent 大军可能会发出几千条 query——其中绝大部分是在做<strong>grounding</strong>（这个数据库长什么样？哪些表有 sales？哪个列是金额？是哪一年）。它们不是错，它们只是在"摸黑找路"。</p>
+
+            <p>另一个例子：在 Neon（一个 serverless Postgres）上，他们观察到 agent 创建的 branch 是人类用户的 <strong>20 倍</strong>，rollback 是 <strong>50 倍</strong>。Agent 在做 update 的时候，倾向于在多个"what-if"分支上同时尝试——这是 ReAct 循环天然行为，但传统数据库的 MVCC 完全不是为这种规模的"分叉 → 回滚"设计的。</p>
+
+            <p>所以问题不是"数据库慢了"，而是<strong>数据库一直在做一件错的事</strong>：它在把每一条 agent 发出的 query 当成"人写出来的、需要精确求解的"——但其中 80% 根本不需要精确求解，那 80% 只是 agent 在试探。</p>
+
+            <h3>二、Agentic Speculation：一个新名词与它的四个性质</h3>
+
+            <p>Paper 的高明之处在于：它不只是说"workload 变了，数据库要变"，它把新 workload 的<strong>四个可利用的性质</strong>拆出来，作为后面所有架构决策的依据。这四个性质是：</p>
+
+            <table>
+                <thead>
+                    <tr><th>性质</th><th>含义</th><th>给数据库设计的启示</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Scale</strong></td>
+                        <td>高 throughput——一个 agent 就能发几千条 query，agent 数量还会乘法增长</td>
+                        <td>不能再用"每条 query 都要跑完"的策略，要学会丢弃 / 近似 / 提前终止</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Heterogeneity</strong></td>
+                        <td>请求在性质上分阶段：粗粒度的 metadata 探索、partial 解、完整解、验证</td>
+                        <td>不同阶段的请求可以接受不同精度——探索期答个 sample 就行，求解期才需要精确</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Redundancy</strong></td>
+                        <td>大量请求在结构上重叠——相同子表达式、相同 join、相同 filter</td>
+                        <td>跨 query 共享计算（multi-query optimization）从"研究兴趣"变成"刚需"</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Steerability</strong></td>
+                        <td>探索本身是可被引导的——给一点提示，agent 立刻少走很多弯路</td>
+                        <td>数据库不只是"答问题"，可以反过来给 agent 喂 hint，让 agent 少问蠢问题</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>记住这四个词，下面整张架构图都是它们的衍生物。</p>
+
+            <h3>三、案例一：BIRD text2SQL —— 这一切是真实存在的</h3>
+
+            <p>Paper 不止 vision，它带了两组实验。第一组用 BIRD text2SQL benchmark：</p>
+
+            <p><strong>实验 A：增加 K，success rate 怎么变？</strong>用 GPT-4o-mini 和 Qwen2.5-Coder-7B，让 K 个 "field agent" 并行尝试同一个任务，再让一个 "agent-in-charge" 从 K 个解里挑一个。结果是：</p>
+
+            <ul>
+                <li>K 从 1 涨到 50，success rate 提升 <strong>14% 到 70%</strong>（不同模型不同任务范围）。</li>
+                <li>说明 agentic speculation 的"并行多试几次"本身就有效——这就是 Scale 的价值。</li>
+            </ul>
+
+            <p><strong>实验 B：同一个 agent 跑 N 个 turn，success rate 怎么变？</strong>结论类似——success rate 随 turn 数单调上升。"多想几轮"和"多试几次"都管用，但这两种 scale up 都给数据库带来了线性增长的 query 压力。</p>
+
+            <p><strong>实验 C（最关键）：跨 K 个 attempt 的 query 计划里，有多少独特子表达式？</strong>他们让 GPT-4o-mini 对每个任务生成 50 个 attempt，统计所有 query 计划里大小为 1–7+ 的 sub-plan 的<strong>总数 vs 独特数</strong>。结果：</p>
+
+            <ul>
+                <li>独特 sub-plan 占总数的比例普遍只有 <strong>10–20%</strong>。</li>
+                <li>大部分子表达式是同一个 join、同一个 filter、同一个 scan，被 50 个 attempt 反复用到。</li>
+            </ul>
+
+            <p>这是<strong>Redundancy</strong>的硬数据。它告诉我们："跨 query 共享计算"在 agent workload 下不是 nice-to-have，而是必须做——80–90% 的子计算是冗余的，传统数据库完全没在管这部分。</p>
+
+            <h3>四、案例二：跨数据库 + 多 turn —— Heterogeneity 与 Steerability</h3>
+
+            <p>第二组实验更复杂：让 OpenAI 的 o3 模型完成一个跨库任务——从 MongoDB 清洗 customer 信息，再 join 到 DuckDB 里的 user 行为数据，再用 Python 做计算。一共 22 个任务，每个跑 2 次，44 条 trace，手工标注每一步在做什么。</p>
+
+            <p>标注分四类：<strong>探索 metadata 和 sample 数据</strong>、<strong>探索列统计</strong>、<strong>尝试 query 的一部分</strong>、<strong>尝试完整 query</strong>。把所有 trace 按时间归一化叠在一起画成 heatmap，看到的形状是：</p>
+
+<pre class="diagram"><code>
+位置:        0.0    0.2    0.5    0.7    1.0
+            ┌──────────────────────────────────┐
+metadata    │ ████████░░░░░░░░░░░░░░░░░░░░░░░░ │
+columns     │ ░░░██████████░░░░░░░░░░░░░░░░░░░ │
+partial     │ ░░░░░░░░░░░░██████████████░░░░░░ │
+full        │ ░░░░░░░░░░░░░░░░░░░░░██████████░ │
+            └──────────────────────────────────┘
+</code></pre>
+
+            <p>四个阶段大致按顺序出现，但<strong>每个阶段都贯穿整条 trace</strong>。Agent 在写完整 query 的时候还会回去探索 metadata；在做 metadata 探索的时候也会偶尔尝试 partial query。这就是 <strong>Heterogeneity</strong>：请求的信息需求差别巨大，但混在同一条 trace 里。</p>
+
+            <p>更有意思的是 <strong>Steerability</strong> 实验：他们给每个任务额外提供"人类专家的 hint"（哪个列是什么意思、应该 join 哪两张表），重跑一次。结果对比：</p>
+
+            <table>
+                <thead>
+                    <tr><th>活动</th><th>无 hint 平均次数</th><th>有 hint 平均次数</th><th>降低</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>探索表</td><td>3.44</td><td>2.95</td><td>−14.2%</td></tr>
+                    <tr><td>探索特定列</td><td>3.56</td><td>2.57</td><td><strong>−27.7%</strong></td></tr>
+                    <tr><td>尝试部分 query</td><td>4.28</td><td>2.71</td><td><strong>−36.6%</strong></td></tr>
+                    <tr><td>尝试完整 query</td><td>1.26</td><td>1.05</td><td>−16.6%</td></tr>
+                    <tr><td><strong>所有 SQL query</strong></td><td><strong>12.67</strong></td><td><strong>10.38</strong></td><td><strong>−18.1%</strong></td></tr>
+                </tbody>
+            </table>
+
+            <p>只给一点点关于"列含义"和"表关系"的 hint，agent 就少发 18% 的 query。这是后面"sleeper agent"那一节的硬数据基础——<strong>数据库主动 steer，比单纯被动答问题，可以省下相当一部分 workload</strong>。</p>
+
+            <h3>五、Agent-First 数据系统：一张架构图</h3>
+
+            <p>四个性质 + 两组实验得出来的架构是这样的（按 paper 的 Figure 4 重画）：</p>
+
+<pre class="diagram"><code>
+                  ┌───────────────────────────────┐
+                  │      LLM Agent Army           │
+                  │  (field agents + planner)     │
+                  └────────────┬──────────────────┘
+                               │ Probes
+                               │ (= SQL + Brief + 多操作语义)
+                               ▼
+   ┌─────────────────────────────────────────────────────┐
+   │              Agentic Interpreter                    │
+   │   (probe 解析 / NL 理解 / brief 提取 / 阶段识别)    │
+   └────────────┬─────────────────────────┬──────────────┘
+                │                         │
+                ▼                         ▼
+   ┌──────────────────────┐    ┌──────────────────────┐
+   │   Probe Optimizer    │    │   Sleeper Agents     │
+   │ (satisfice / 跨 probe│    │ (主动 grounding /    │
+   │  共享 / 近似 / 终止) │    │  cost feedback /     │
+   └──────────┬───────────┘    │  related tables)     │
+              │                └──────────┬───────────┘
+              │                           │
+              ▼                           ▼
+   ┌─────────────────────────────────────────────────────┐
+   │                Storage Layer                        │
+   │  ┌──────────────────┐   ┌─────────────────────────┐ │
+   │  │  Heap / Index    │   │  Agentic Memory Store   │ │
+   │  │  (传统数据)      │   │ (semantic cache,        │ │
+   │  │                  │   │  probe-level grounding) │ │
+   │  └──────────────────┘   └─────────────────────────┘ │
+   │  ┌─────────────────────────────────────────────────┐│
+   │  │   Shared Transaction Manager                    ││
+   │  │  (multi-world isolation, branched updates)      ││
+   │  └─────────────────────────────────────────────────┘│
+   └─────────────────────────────────────────────────────┘
+</code></pre>
+
+            <p>每一层对应原来一个传统数据库组件的"agent 化"版本：</p>
+
+            <ul>
+                <li><strong>Probe</strong>替代了 Query——多了 brief、阶段、近似预算、终止条件这些"为什么这么问"的元信息。</li>
+                <li><strong>Probe Optimizer</strong>替代了 Query Optimizer——目标不是"算完每条 query"，是"让 agent 能做出下一步决定"。这是一个非常关键的目标函数转变。</li>
+                <li><strong>Sleeper Agent</strong>是个全新的组件——数据库内部跑的 agent，主动给外部 agent 喂 hint。</li>
+                <li><strong>Agentic Memory Store</strong>替代了 cache / materialized view——但它存的是"agent grounding"，不是"查询结果"。</li>
+                <li><strong>Shared Transaction Manager</strong>替代了 MVCC——管理上千个 near-identical 分支。</li>
+            </ul>
+
+            <p>下面把这几层一个个拆开。</p>
+
+            <h3>六、接口革命（一）：从 Query 到 Probe</h3>
+
+            <p>Paper 故意不再叫 "query"，叫 "probe"。为什么？因为传统 query 接口是"我准确地告诉你怎么算，你返回准确结果"——这是 SQL 的契约。但 agent 发出的请求里包含的信息远比 SQL 多得多：</p>
+
+            <ul>
+                <li><strong>为什么问</strong>（task goal）</li>
+                <li><strong>处于哪一阶段</strong>（metadata 探索 / partial 解 / 验证）</li>
+                <li><strong>能接受多少近似</strong>（探索期可以非常粗，验证期需要精确）</li>
+                <li><strong>跨 query 的偏好</strong>（这一批 query 里有的更重要，先答哪个）</li>
+                <li><strong>提前终止条件</strong>（如果 partial 结果已经满足某个 predicate，提前停）</li>
+            </ul>
+
+            <p>这些信息在 SQL 里完全无法表达。Paper 提出的方案：一个 probe 由两部分组成——</p>
+
+<pre><code>Probe := {
+  queries: [SQL₁, SQL₂, ..., SQLₙ],     # 一批可能相关的查询
+  brief:   NaturalLanguage,             # 这批 query 的"意图说明书"
+}</code></pre>
+
+            <p>Brief 是个自由格式的自然语言段落，描述 goal、phase、approximation 需求、跨 query 偏好。它由<strong>数据库里的另一个 agent（probe interpreter）</strong>解释，再决定怎么执行。</p>
+
+            <p>这件事乍看像是"把 NL2SQL 反过来做"——但本质不一样。NL2SQL 是"用户用自然语言问，系统转成 SQL"；Probe Brief 是"用户已经写好 SQL，但额外用自然语言告诉系统'这批 SQL 的弹性在哪里'"。SQL 仍然是精确的执行单元，brief 是给优化器的<strong>松弛度声明</strong>。</p>
+
+            <p>Probe 还支持几种"超越 SQL 的操作"：</p>
+
+            <ul>
+                <li><strong>跨表语义搜索</strong>："找出所有内容语义上接近 electronics 的 table / column / row"——这是 SQL 完全做不了的，需要数据库内置向量索引。</li>
+                <li><strong>K-of-N</strong>："给我这 N 条 query 里任意 K 条的答案，数据库自己挑哪 K 条最划算"——把"k 选 n"的决策权下放给优化器。</li>
+                <li><strong>函数式终止条件</strong>："对 partial 结果跑这个 UDF，如果 true 就停"——把 early termination 写成可执行表达式而不是常数 LIMIT。</li>
+            </ul>
+
+            <p>有 OCaml effect system 文章背景的读者会立刻看出来一个事情：<strong>brief 本质上是在给 SQL 加 effect handler</strong>。SQL 是"我要的结果是什么"（perform），brief 是"在什么前提下、用什么精度、什么时候放弃"（handler）。这个解耦的方向完全一样：让请求的"逻辑层"和"执行策略层"分开演化。</p>
+
+            <h3>七、接口革命（二）：Brief 与 Sleeper Agent —— 数据库反过来 steer agent</h3>
+
+            <p>前面是"agent → 数据库"的接口。Paper 论点里更激进的一半是"<strong>数据库 → agent</strong>"——数据库不只回答问题，还主动给 agent 喂信息。负责干这件事的是<strong>sleeper agent</strong>：</p>
+
+            <ul>
+                <li><strong>辅助信息</strong>：sleeper agent 看到一个 probe，会主动找"相关但 agent 没问到"的东西。比如发现 agent 在查 sales 表但用错了列编码（"CA" vs "California"），它直接在 side channel 告诉 agent："你的 filter 不匹配，因为列里存的是全称"——这是 paper 里类比的 <em>why-not provenance</em>。</li>
+                <li><strong>相关表发现</strong>：sleeper agent 发现 agent 正在 join A 和 B，但 C 表里有更新更完整的同类数据，就提示 agent 考虑 C。</li>
+                <li><strong>成本预估反馈</strong>：在 probe 真正跑之前估算 cost。如果某个 probe 比预期贵 100×，sleeper agent 提示 agent："要不要把范围缩小到加州？"——给 agent 改 probe 的机会。</li>
+                <li><strong>跨 agent 共享</strong>：如果 agent A 5 分钟前问过类似问题，sleeper agent 把那次的答案 / 缓存直接喂给 agent B。</li>
+            </ul>
+
+            <p>这是一个非常深的设计反转。传统数据库是<strong>纯被动的</strong>——你问什么它答什么，从不主动开口。Paper 的论点是：当用户是 agent 时，<strong>主动是有价值的</strong>，因为 agent 是可以听 hint 的（前面 Table 1 已经量化过：hint 让 query 数下降 18%）。</p>
+
+            <p>而且 sleeper agent 自身也是 LLM agent——它可以理解 brief、可以跨 turn 累计上下文、可以基于历史做预测。这是数据库内部出现"主动智能体"的开始。这个方向在传统 RDBMS 圈子里几乎没人在做，但在 ML4DB（learned indexes、learned query optimizers）的延长线上是合理的下一步。</p>
+
+            <h3>八、查询处理：把目标从"答完"换成"够用"（Satisfice）</h3>
+
+            <p>Paper 反复强调一个新目标函数：</p>
+
+            <blockquote>
+            不是优化吞吐，不是优化每条 query 的延迟，<strong>而是让 agent 能在最少的 wall-clock 时间内做出"下一步该干什么"的决定</strong>。
+            </blockquote>
+
+            <p>这个目标在英文里被称作 <em>satisfice</em>——satisfy + suffice 的合成词，由 Herbert Simon 提出，意思是"够用就好"，不追求最优。在 agent 数据库里，satisfice 体现在好几层：</p>
+
+            <p><strong>1. Intra-Probe：单个 probe batch 内部</strong></p>
+
+            <ul>
+                <li><strong>决定要不要跑</strong>。优化器先看 brief，判断每条 query 在当前 phase 是否真的相关。Probe 里很多 query 是 agent 没把握、"顺手发一下"的——优化器可以基于 brief + 列语义判断"这条 query 不会给 agent 提供新信息"，直接 drop。</li>
+                <li><strong>决定精度</strong>。探索期接受 sample / approximate；solution formulation 期才需要 exact。</li>
+                <li><strong>跨 query 剪枝</strong>。两个 query P 和 P' 如果"P' 相对 P 多返回的那些行 agent 大概率用不上"，那么直接答 P 就够了。这其实是 visualization recommendation 那条线（SeeDB 等）的延伸，只不过这次是用在 agent 的探索流上。</li>
+            </ul>
+
+            <p><strong>2. Inter-Probe：跨 turn / 跨 agent 的全局调度</strong></p>
+
+            <p>Probe 不是孤立的——同一 agent 的 turn₁ probe 和 turn₂ probe 高度相关，多个 agent 在做同一任务时也是相关的。优化器可以：</p>
+
+            <ul>
+                <li><strong>消除冗余</strong>。turn₁ 已经答过的，turn₂ 类似 probe 直接复用。这与 incremental view maintenance 有相似之处，但要更宽松——不要求结果"等价"，只要求"够用于 agent 决策"。</li>
+                <li><strong>预先 materialize</strong>。如果优化器从历史 probe 中识别出"agent 接下来大概率会 join X 和 Y"，就预先把 join 算好。</li>
+                <li><strong>Exploration vs Exploitation</strong>。Paper 一句话非常有意思："the database can sometimes prioritize exploration of underexplored solution spaces"——优化器本身有 bandit 行为，偶尔给 agent 一些它没问到、但可能价值很高的"额外答案"。</li>
+            </ul>
+
+            <p><strong>3. 中途 re-plan</strong></p>
+
+            <p>传统优化器一旦生成 plan 就执行到底。Agent 数据库的优化器可以在执行过程中——基于 partial 结果不断重新决定"还要不要继续 / 要不要换精度 / 要不要扔掉某条 query"。这非常像<strong>反应式控制器</strong>，而不是传统的"静态优化 + 执行"。</p>
+
+            <h3>九、Inter-Probe 优化：跨轮、跨 agent 的全局调度</h3>
+
+            <p>把上一节那条"Inter-Probe"再拎出来单独讲一下，因为它是整个 vision 里最有"未来感"的部分。</p>
+
+            <p>传统数据库的工作单位是"一条 query"——优化器以 query 为粒度做选择，执行器以 query 为粒度切计算。Multi-query optimization（MQO）是研究界做过的方向，但工业界基本没落地，因为人类用户每秒发不出几条 query，MQO 的收益小于复杂度。</p>
+
+            <p>Agent workload 把这个 trade-off 完全翻转。一个 agent task 可能在几秒内发出几百条 query，这些 query 之间高度相关（同样的源表、同样的 filter、同样的 metric）。如果数据库能在<strong>一个 task 的整个生命周期</strong>这个粒度上看 query，可以做很多很离谱的事情：</p>
+
+            <ul>
+                <li><strong>整个 task 的 sub-plan dictionary</strong>。在 task 开始的时候建一个共享的 plan fragment 字典，每条新 probe 进来先去 dict 里找"我能不能复用别人的子计算"。Paper 的实验数据（独特子表达式只占 10–20%）告诉你这件事的潜在 ROI 是 5–10×。</li>
+                <li><strong>跨 agent 共享</strong>。如果同一台数据库同时跑着 N 个用户的 N 支 agent 大军，且任务相似（都在分析"今年 vs 去年的销售"），跨用户的 probe 也可以共享子计算。当然这里有 access control 的复杂性（paper 第 6 节也提到了）。</li>
+                <li><strong>Task-aware 成本预算</strong>。优化器可以根据 task brief 推测"这个 task 大概需要 100 条 query 才能收敛"，然后在 query 1 的时候就 budget aware 地选 plan。这跟单 query 视角下永远做不出来。</li>
+            </ul>
+
+            <p>这块的关键技术 enabler 是<strong>把 brief 作为 first-class metadata</strong>——优化器不再只看 query，还看 brief。Brief 告诉优化器 task 的形状、阶段、预算，让长时优化变得可能。</p>
+
+            <h3>十、存储：Agentic Memory Store 作为"伪索引"</h3>
+
+            <p>Agent 反复在做一件事：探索这个数据库有什么。这件事的答案是<strong>慢变的</strong>——同一张表，agent A 探索完知道"列 <code>state</code> 存的是全称而不是缩写"，agent B 半小时后再次探索这张表，应该不用重新发现这件事。</p>
+
+            <p>Paper 提出的 <strong>Agentic Memory Store</strong>：一个 persistent、queryable 的<strong>semantic cache</strong>，存的不是"查询结果"，而是"agent 关于数据的 grounding"。具体内容：</p>
+
+            <ul>
+                <li><strong>表 / 列 / 行级的语义注释</strong>。列 <code>state</code> 编码格式、缺失值规则、时间粒度、地理粒度。</li>
+                <li><strong>过往 probe 的结果与 partial 解</strong>。"上次 agent 怎么查到这个数据的"、"哪些 join 路径有效"。</li>
+                <li><strong>失败案例</strong>。"上次有人查 sales by state 但用了缩写匹配，返回空集"——下次别人犯同样错误时，sleeper agent 可以提前提示。</li>
+                <li><strong>跨任务的通用 hint</strong>。"这个数据库的命名约定是 snake_case"、"主键模式是 <code>id</code> 而不是 <code>{table}_id</code>"。</li>
+            </ul>
+
+            <p>Memory store 的实现 paper 也说得很坦诚——它是个"<strong>伪索引</strong>"（pseudo-index）：表面像传统索引（你查一个东西，它快速返回相关条目），但内部是混合的：</p>
+
+            <ul>
+                <li>结构化部分（表 / 列的固定 annotation）直接和元数据一起存，跟着 schema 走。</li>
+                <li>开放式部分（probe 历史、失败案例、跨任务 hint）用 vector index + embedding 做语义检索。</li>
+                <li>更新策略复杂：schema 变了，相关的 memory 是否失效？两个用户的 agent 问类似问题，能不能共享 memory？跨用户共享有隐私问题（agent A 学到的可能反映了 A 的查询模式）。</li>
+            </ul>
+
+            <p>这一层有点像把<strong>"在 Slack / Wiki 里搜公司过去怎么用这个数据库"</strong>那件事内嵌进数据库本身。也很像 Microsoft 的 Sandstorm、Snowflake 的 Cortex、各种企业知识图谱产品试图做的事——但这次它是为 agent 而不是为人设计，所以索引粒度、更新频率、查询接口都不一样。</p>
+
+            <h3>十一、事务：从单线程隔离到多世界隔离</h3>
+
+            <p>整张 paper 我个人最感兴趣的是这一节，因为它跟我之前讲的 OCaml effect 文章里"<strong>discard continuation = abandon branch</strong>"的视角是完全一致的。</p>
+
+            <p>传统事务模型基于一个假设："执行是一条线"——所有并发 transaction 在逻辑上彼此独立，物理上靠隔离级别（read-committed / repeatable-read / serializable）调节性能与正确性。但 agent 不这么用数据库——agent 倾向于：</p>
+
+            <ol>
+                <li>Fork 一个 branch（"我假设这个 update 通过"）</li>
+                <li>在 branch 上跑 partial work</li>
+                <li>大概率发现这条路不通，rollback</li>
+                <li>Fork 另一个 branch，重复</li>
+            </ol>
+
+            <p>Neon 的数据说话：agent 创建 branch 是人类用户的 20×，rollback 是 50×。这种"高分叉、高回滚"workload 在传统 OLTP 上跑会原地爆炸——每个 branch 都是一份独立 snapshot，存储开销线性增长；rollback 在传统 ARIES 里也不是设计来"每秒几千次"的。</p>
+
+            <p>Paper 提出的方向是 <strong>multi-world isolation</strong>：</p>
+
+            <ul>
+                <li>每个 branch 在<strong>逻辑上</strong>独立——agent 看到的世界是一致的。</li>
+                <li>在<strong>物理上</strong>大量共享——大部分 branch 之间 90% 数据是一样的，应该 copy-on-write。</li>
+                <li>支持<strong>多 agent 间的 merge</strong>——不只是 branch 和 mainline 合，是 N 个并发 branch 之间互相 reconcile（这部分远远超出现有版本化数据库能力）。</li>
+                <li><strong>超快 rollback</strong>——传统数据库优化 commit path，agent 数据库要优化 abort path，因为"绝大多数 branch 都会 abort"。</li>
+            </ul>
+
+            <p>这个方向上现有 industrial work 已经有了一些苗头：Neon、Aurora 的 copy-on-write、Tardis 的 branch-and-merge 一致性、Bauplan 的 agentic lakehouse。但 paper 准确指出：这些方案都没有处理"<strong>多个 agent 同时分叉 + 互相 reconcile + 大规模 abort</strong>"这一组组合需求。</p>
+
+            <p>类比一下：传统 MVCC 是"<strong>给定一条线性时间，多个观察者怎么看到一致的快照</strong>"；agent 时代要的是"<strong>给定一棵分叉树，多个观察者怎么各自走自己的世界又能在合适时机合并</strong>"。后者更接近 git 而不是数据库——而且是<strong>每秒几千次分叉的 git</strong>。</p>
+
+            <h3>十二、这张蓝图与我们现在的 stack 差在哪里</h3>
+
+            <p>Paper 是一篇 vision——它说的事情大部分还没人实现。但拆开来看，每一块都不是天上掉下来的，每一块都有先驱：</p>
+
+            <table>
+                <thead>
+                    <tr><th>新组件</th><th>已有的先驱 / 邻居</th><th>需要新做的事</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Probe / Brief 接口</td>
+                        <td>SQL/MED、SQL/PSM、NL2SQL、Snowflake Cortex</td>
+                        <td>把"松弛度声明"做成 first-class，让优化器认得它</td>
+                    </tr>
+                    <tr>
+                        <td>Sleeper Agent</td>
+                        <td>Query advisor、index advisor、auto-tuner、proactive data system 那条线</td>
+                        <td>把它变成会用 LLM、能跨 turn 累积上下文的 in-DB agent</td>
+                    </tr>
+                    <tr>
+                        <td>Satisfice 优化器</td>
+                        <td>Approximate query processing、BlinkDB、Multi-query optimization</td>
+                        <td>目标函数从 throughput 改成"agent decision time"</td>
+                    </tr>
+                    <tr>
+                        <td>Agentic Memory Store</td>
+                        <td>Vector DB、Materialized view、Knowledge graph、Cortex Search</td>
+                        <td>语义粒度、跨 agent 共享、自动更新</td>
+                    </tr>
+                    <tr>
+                        <td>Multi-world Isolation</td>
+                        <td>Neon branches、Aurora、Tardis、ORPHEUSDB</td>
+                        <td>多 agent 间 reconcile、超快 abort、海量并发 fork</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p>所以这不是"另起炉灶"。它是把过去 20 年研究界 / 工业界已有的东西，<strong>按 agentic speculation 的四个性质重新组装</strong>。每一块技术都有人做过，但没人按这个组合做过——因为之前没有这种 workload 把所有这些技术同时变成"必需品"。</p>
+
+            <p>对我们这些写 agent 框架的人来说，这篇 paper 有一个很实际的提示：你今天看到的 agent 工程问题——"上下文管理"、"工具结果太长塞不下"、"agent 反复问同样的问题"、"branch 多了之后 state 管理一团乱"——很大一部分根源不在 agent 框架本身，而是<strong>底下的数据库不为 agent 设计</strong>。把这些问题往应用层堆是堆不平的，它们最终会推动数据库本身变形。</p>
+
+            <h3>十三、总结</h3>
+
+            <p>这篇 paper 在 2025 年底放出来不是偶然——它差不多正好踩在两件事的交叉点上：</p>
+
+            <ol>
+                <li>LLM 推理在变得便宜和快——单 agent 每秒发几百次 query 已经是事实，不是预测。</li>
+                <li>Agent 框架在变得标准化——ReAct、tool calling、planner-executor 这些模式已经定型，可以稳定预测 agent 会怎么用底层 stack。</li>
+            </ol>
+
+            <p>这两件事一旦发生，数据库就开始被一种"<strong>它从来没见过</strong>"的 workload 撞击。Paper 给这种 workload 起了一个准确的名字——<strong>agentic speculation</strong>——并指出它具有四个可被利用的性质：scale、heterogeneity、redundancy、steerability。</p>
+
+            <p>从这四个性质推出来的架构调整是系统性的：</p>
+
+            <ul>
+                <li><strong>接口</strong>：Query → Probe（SQL + Brief）。让"为什么问"和"问什么"分开。</li>
+                <li><strong>优化器</strong>：Throughput → Satisfice。目标是 agent 决策时间，不是 query 完成时间。</li>
+                <li><strong>主动性</strong>：被动答 → 主动 steer。Sleeper agent 给外部 agent 喂 hint，整体省下两位数百分比的 query。</li>
+                <li><strong>存储</strong>：传统 cache → Agentic Memory Store。语义粒度的"伪索引"，沉淀 agent 学到的 grounding。</li>
+                <li><strong>事务</strong>：单线程隔离 → 多世界隔离。每秒几千次的 fork + abort + cross-branch reconcile。</li>
+            </ul>
+
+            <p>这些事没有一件是 paper 的作者已经做完的——这是一篇 <em>research vision</em>，不是 product announcement。但每一件都建立在工业界已有的脚印之上：Neon 的 branching、Snowflake 的 Cortex、ORPHEUSDB 的版本化、approximate query processing 那一长串经典 paper。Paper 的贡献是把"<strong>这些东西需要被同时拉到 agent 这一侧重新组装</strong>"这件事讲清楚。</p>
+
+            <p>读完这篇 paper，回头看自己手里的东西，会有几个非常具体的反馈：</p>
+
+            <ul>
+                <li>如果你在写 agent 框架，下次设计 tool API 时，<strong>给 tool 调用加一个 "brief" 字段</strong>——让 agent 告诉 tool 自己处在哪一阶段、能接受多少近似、什么时候放弃。这件事 paper 在数据库层提，在 agent harness 层做更便宜。</li>
+                <li>如果你在做 data agent 产品（text2SQL、agent BI），<strong>开始把"sleeper agent"做成第一公民</strong>——一个在后台跑、专门 watch 用户 agent 行为、主动喂 hint 的 LLM。这件事可以独立于数据库本身实现，先做出来再说。</li>
+                <li>如果你在做基础设施，<strong>把 branch / fork / rollback 当成与 commit 同等重要的事</strong>来设计。传统数据库优化的是"commit path"，agent 时代要优化"abort path"。这是工程目标函数的反转。</li>
+                <li>所有人都该开始<strong>记录 agent 与系统交互的 trace</strong>——agent 探索哪些列、卡在哪里、问几次才能问到位。这些 trace 是未来 sleeper agent 的训练数据，也是判断你系统"对 agent 友好度"的客观指标。</li>
+            </ul>
+
+            <p>下一篇我想接着这个方向写一下，把 paper 提的 Probe / Brief 这套抽象映射到我自己写的 agent runtime 里——具体来说，<a href="ocaml-effect-agent-harness.html">wombat 的 effect handler 栈</a>里 <code>Llm_complete</code> 和 <code>Tool_calls</code> 这两个 effect 完全可以扩展成"带 brief 的 probe effect"，然后让 handler 层做 satisfice / sleeper agent / branched isolation。<strong>Effect handler 自然就是数据库与 agent 之间的那个 agentic interpreter</strong>——把它写出来应该很有意思。</p>
+
+            <p>原文：<a href="https://arxiv.org/abs/2509.00997">arXiv:2509.00997</a>。值得读，尤其是第 2 节的实验数据和第 6 节的 multi-world isolation——这两块在十年内会变成工程问题，不只是研究问题。</p>
+
+        </article>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 hoobean1996. All rights reserved.</p>
+    </footer>
+    <script src="../../js/toc.js"></script>
+    <script src="../../js/lang-switch.js"></script>
+</body>
+</html>
